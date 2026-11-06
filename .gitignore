@@ -1,0 +1,16 @@
+# macOS / Xcode
+.DS_Store
+build/
+DerivedData/
+*.xcarchive
+*.ipa
+
+# XcodeGen 生成物
+OpenGate.xcodeproj/
+OpenGate.xcworkspace/
+project.pbxproj
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

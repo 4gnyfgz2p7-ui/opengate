@@ -1,0 +1,87 @@
+name: build-unsigned-ipa
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Install XcodeGen
+        run: |
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Archive (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project OpenGate.xcodeproj \
+            -scheme OpenGate \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/OpenGate.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            archive
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP_PATH="build/OpenGate.xcarchive/Products/Applications/OpenGate.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "未找到 $APP_PATH"
+            find build/OpenGate.xcarchive -maxdepth 4 -name "*.app"
+            exit 1
+          fi
+          rm -rf build/Payload build/OpenGate.ipa
+          mkdir -p build/Payload
+          cp -R "$APP_PATH" build/Payload/
+          cd build
+          zip -qry OpenGate.ipa Payload
+          ls -lh OpenGate.ipa
+          unzip -l OpenGate.ipa | head -20
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenGate-unsigned-ipa
+          path: build/OpenGate.ipa
+          retention-days: 30
+
+      - name: Publish rolling release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest build/OpenGate.ipa \
+            --title "OpenGate 最新构建" \
+            --notes "未签名 IPA。用 SideStore 签名安装；无需本地 Mac。" \
+            --latest
