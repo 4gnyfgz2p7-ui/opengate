@@ -98,8 +98,9 @@ enum EncoderProbe {
             codecType: codec,
             encoderSpecification: nil,
             imageBufferAttributes: attributeDict as CFDictionary,
-            compressedVideoOutputCallback: outputCallback,
-            outputCallbackRefCon: refCon,
+            compressedDataAllocator: nil,
+            outputCallback: outputCallback,
+            refcon: refCon,
             compressionSessionOut: &session
         )
         result.sessionCreateStatus = createStatus
@@ -115,18 +116,18 @@ enum EncoderProbe {
             result.profileSetStatus = VTSessionSetProperty(
                 session,
                 key: kVTCompressionPropertyKey_ProfileLevel,
-                propertyValue: profileLevel
+                value: profileLevel
             )
         }
         result.realTimeSetStatus = VTSessionSetProperty(
             session,
             key: kVTCompressionPropertyKey_RealTime,
-            propertyValue: kCFBooleanTrue
+            value: kCFBooleanTrue
         )
         VTSessionSetProperty(
             session,
             key: kVTCompressionPropertyKey_AllowFrameReordering,
-            propertyValue: kCFBooleanFalse
+            value: kCFBooleanFalse
         )
 
         var readback: CFTypeRef?
@@ -252,7 +253,7 @@ enum EncoderProbe {
 
             let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
             input.expectsMediaDataInRealTime = true
-            result.canApplySettings = input.canApply(outputSettings: settings, forMediaType: .video)
+            result.canApplySettings = writer.canApply(outputSettings: settings, forMediaType: .video)
 
             if writer.canAdd(input) {
                 writer.add(input)
