@@ -5,8 +5,9 @@ import SwiftUI
 /// 只有手动档才需要常驻滑块——自动档没有可拖的量。所以默认只占一行，
 /// 选「手动」之后才展开，避免和曝光、白平衡抢垂直空间。
 ///
-/// 滑块刻度就是焦距本身：0 = 无限远，1 = 最近。`lensPosition` 的单位是
-/// 屈光度（1/米），天然是"近处变化快、远处变化慢"的物理刻度，不再二次映射。
+/// 滑块刻度就是焦距本身：左端「近」、右端「∞」。按 Apple 文档，
+/// `lensPosition` 的 **0.0 是最近、1.0 是最远**（1.0 不等于严格无限远），
+/// 且不对应确定的物理距离，所以读数只给位置值，不换算成米。
 struct FocusStrip: View {
 
     @ObservedObject var focus: FocusController
@@ -33,11 +34,12 @@ struct FocusStrip: View {
                     .foregroundStyle(.white.opacity(0.85))
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
+                    .frame(width: 34, alignment: .trailing)
             }
 
             if focus.mode == .manual && focus.supportsManualFocus {
                 HStack(spacing: 8) {
-                    Text("∞")
+                    Text("近")
                         .font(.system(size: 10))
                         .foregroundStyle(.white.opacity(0.42))
                         .frame(width: 30, alignment: .leading)
@@ -45,18 +47,21 @@ struct FocusStrip: View {
                     Slider(
                         value: Binding(
                             get: { draft ?? focus.sliderPosition },
-                            set: { draft = $0 }
+                            // 拖动过程中就写进设备。对焦是「看着画面找焦点」，
+                            // 松手才生效等于盲拖——曝光条那样延后提交在这一档行不通。
+                            set: { value in
+                                draft = value
+                                focus.sliderPosition = value
+                            }
                         ),
                         in: 0...1,
                         onEditingChanged: { editing in
-                            guard !editing, let value = draft else { return }
-                            focus.sliderPosition = value
-                            draft = nil
+                            if !editing { draft = nil }
                         }
                     )
                     .tint(accent)
 
-                    Text("近")
+                    Text("∞")
                         .font(.system(size: 10))
                         .foregroundStyle(.white.opacity(0.42))
                         .frame(width: 18, alignment: .trailing)
@@ -65,14 +70,18 @@ struct FocusStrip: View {
         }
     }
 
-    /// 只在手动档显示距离。
+    /// 手动档显示目标位置；自动档显示**实时**位置。
     ///
-    /// 自动对焦期间 `lensPosition` 由系统按场景反推，不是镜头的确定位置，
-    /// 拿它当读数会让人以为"对上了但实际没有"。手动档的位置是用户给的，才可信。
+    /// 自动档这串数字会随场景跳动，这本身就是"AF 在不在工作"的证据——
+    /// 一直不动就是没在对焦，比任何提示都直接。
     private var readout: String {
-        guard focus.mode == .manual else { return "" }
-        guard focus.supportsManualFocus else { return "锁定" }
-        return focus.distanceText(Float(draft ?? focus.sliderPosition))
+        switch focus.mode {
+        case .manual:
+            guard focus.supportsManualFocus else { return "锁定" }
+            return focus.positionText(Float(draft ?? focus.sliderPosition))
+        case .continuous:
+            return focus.positionText(focus.liveLensPosition)
+        }
     }
 
     private func chip(_ mode: FocusController.Mode) -> some View {

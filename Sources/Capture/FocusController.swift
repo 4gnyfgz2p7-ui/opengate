@@ -13,10 +13,11 @@ import Combine
 /// - `.continuous` → `continuousAutoFocus`，系统持续跟踪
 /// - `.manual`     → `setFocusModeLocked(lensPosition:)`，由滑块直接给位置
 ///
-/// `lensPosition` 的单位是**屈光度倒数**（1/米），不是 0–1 的百分比：
-/// 0 表示无限远，1.0 表示 1 米，越接近 1 越近。设备能走多远由
-/// `isLockingFocusWithCustomLensPositionSupported` 决定，不支持时
-/// 只能退回 `.locked`（冻结当前位置），此时手动条不呈现。
+/// **`lensPosition` 的方向**（Apple 文档原文）：范围 0.0–1.0，
+/// **0.0 是镜头能对上的最近距离，1.0 是最远，且 1.0 并不等于无限远**，
+/// 默认值 1.0。文档同时明确「同一个位置值不对应确定的物理距离，
+/// 换设备也不可比」——所以界面上不给"多少米"这种假读数，
+/// 只给位置值本身，左端标「近」、右端标「∞」。
 @MainActor
 final class FocusController: ObservableObject {
 
@@ -49,8 +50,11 @@ final class FocusController: ObservableObject {
         didSet { if mode != oldValue { applyMode() } }
     }
 
-    /// 手动焦距位置。0 = 无限远，1 ≈ 最近对焦距离。
-    @Published var lensPosition: Float = 0 {
+    /// 手动焦距位置。**0 = 最近，1 = 最远（≈∞）**，默认 1。
+    ///
+    /// 初值必须给 1：0 在这个 API 里是「贴到最近」，一进手动档
+    /// 就会把镜头拉到底，看起来像"对焦坏了"。
+    @Published var lensPosition: Float = 1 {
         didSet {
             if mode == .manual && lensPosition != oldValue { applyManual() }
         }
@@ -58,7 +62,7 @@ final class FocusController: ObservableObject {
 
     // MARK: - 回读
 
-    @Published private(set) var liveLensPosition: Float = 0
+    @Published private(set) var liveLensPosition: Float = 1
     /// 设备是否支持按位置锁定焦距。不支持时手动档给不出效果。
     @Published private(set) var supportsManualFocus = false
 
@@ -74,7 +78,7 @@ final class FocusController: ObservableObject {
         supportsManualFocus = device.isLockingFocusWithCustomLensPositionSupported
 
         // 接管当前设备的真实位置，等于「手动档一进来就是现在这个焦点」，
-        // 不会因为滑块初值是 0 而突然拉到无限远
+        // 不会因为滑块初值把镜头拽走
         if supportsManualFocus {
             lensPosition = min(max(device.lensPosition, 0), 1)
             liveLensPosition = lensPosition
@@ -166,37 +170,32 @@ final class FocusController: ObservableObject {
 
     // MARK: - 展示
 
-    /// 手动档滑块位置 = 焦距本身（0…1 直接对应 ∞…近）。
+    /// 手动档滑块位置 = 焦距位置本身，左端「近」→ 右端「∞」。
     ///
-    /// 不做对数映射：lensPosition 已经是屈光度，天然是"近处变化快、远处变化慢"
-    /// 的物理刻度，再套一层对数会把中远景挤成一团。
+    /// 不做映射：这个量本来就是镜头马达的归一化位置，中段如何分布由
+    /// 镜头自己决定，再套一层曲线只会让手感脱离真实行程。
     var sliderPosition: Double {
         get { Double(lensPosition) }
         set { lensPosition = Float(min(max(newValue, 0), 1)) }
     }
 
-    /// 把屈光度换算成人能读的距离文本。
-    ///
-    /// `lensPosition` 的定义是 1/米，所以距离 = 1 / position，位置 0 即无限远。
-    func distanceText(_ position: Float) -> String {
-        guard position > 0.001 else { return "∞" }
-        let meters = 1.0 / Double(position)
-        if meters >= 10 {
-            return String(format: "%.0f m", meters)
-        }
-        if meters >= 1 {
-            return String(format: "%.1f m", meters)
-        }
-        return String(format: "%.0f cm", meters * 100)
+    /// 位置读数。**不换算成米**——Apple 明确说位置值不对应确定的物理距离，
+    /// 换设备也不可比，换算出来的数字会比不给更误导。
+    func positionText(_ position: Float) -> String {
+        if position >= 0.985 { return "∞" }
+        if position <= 0.015 { return "最近" }
+        return String(format: "%.2f", position)
     }
 
     /// 当前实际焦距的描述，界面常驻用
     var liveFocusSummary: String {
         switch mode {
         case .continuous:
-            return "自动"
+            // 自动档给实时位置：数字在动就说明 AF 在工作，
+            // 这是"到底有没有在自动对焦"最直接的证据
+            return positionText(liveLensPosition)
         case .manual:
-            return supportsManualFocus ? distanceText(lensPosition) : "锁定"
+            return supportsManualFocus ? positionText(lensPosition) : "锁定"
         }
     }
 }
