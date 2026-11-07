@@ -173,7 +173,7 @@ struct RecorderView: View {
 
         scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { error in
             Task { @MainActor in
-                RotationMonitor.shared.noteRequestResult(error?.localizedDescription)
+                RotationMonitor.shared.noteRequestResult(error.localizedDescription)
             }
         }
     }
