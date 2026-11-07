@@ -193,7 +193,18 @@ final class MovieRecorder {
         stateLock.lock()
         let alreadyFinished = finished
         stateLock.unlock()
-        guard !alreadyFinished, writer.status == .writing else { return false }
+        guard !alreadyFinished, writer.status == .writing else {
+            // 写入器自身失败（磁盘/编码器初始化）也要留现场，
+            // 否则界面上只剩一句笼统的"未接受该画面格式"。
+            if writer.status == .failed {
+                stateLock.lock()
+                if firstAppendFailure == nil {
+                    firstAppendFailure = writer.error?.localizedDescription ?? "写入器状态失败"
+                }
+                stateLock.unlock()
+            }
+            return false
+        }
 
         guard videoInput.isReadyForMoreMediaData else {
             stateLock.lock(); droppedVideoFrames += 1; stateLock.unlock()

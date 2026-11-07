@@ -414,10 +414,10 @@ final class RecordingEngine: ObservableObject {
     /// 判据刻意做得保守：三秒内**一帧都没转换出来**才算失败。
     /// 降级后分辨率为 4032×3024（真 4:3），但录制能出片——
     /// 比留一个打不开的 0 字节文件有用。
-    private func recoverPipelineIfNeeded() async {
+    private func recoverPipelineIfNeeded(force: Bool = false) async {
         guard !recovering, captureConfiguration?.isBayer == true else { return }
         let snap = stats.snapshot
-        guard snap.converted == 0 else { return }
+        guard force || snap.converted == 0 else { return }
 
         recovering = true
         pipelineNote = "全幅转换未出帧（收帧 \(snap.delivered)），已切到系统 ISP"
@@ -603,7 +603,16 @@ final class RecordingEngine: ObservableObject {
                             let snap = self.stats.snapshot
                             let detail = recorder.appendFailureDescription ?? "编码器未接受该画面格式"
                             self.autoStopReason = "画面未能写入（收帧 \(snap.delivered) · 转换 \(snap.converted) · 写入 \(snap.appended)）：\(detail)"
+                            let needsFallback = self.captureConfiguration?.isBayer == true && snap.appended == 0
                             self.stopRecording()
+                            // 全幅通路写不进去：这次收尾之后直接换成系统 ISP，
+                            // 下一次按录制键就能出片，而不是再失败一遍。
+                            if needsFallback {
+                                Task { [weak self] in
+                                    try? await Task.sleep(nanoseconds: 800_000_000)
+                                    await self?.recoverPipelineIfNeeded(force: true)
+                                }
+                            }
                             return
                         }
                     }
