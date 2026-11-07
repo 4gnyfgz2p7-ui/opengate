@@ -136,8 +136,10 @@ final class RecordingEngine: ObservableObject {
             box.get()?.appendVideo(buffer)
 
             // 波形采样同队列串行执行（约 1.3 万次读取），
-            // 只有产出新图时才跳回主线程，避免每帧都触发一次线程切换
-            if let image = sampler.process(buffer) {
+            // 只有产出新图时才跳回主线程，避免每帧都触发一次线程切换。
+            // 采样器要的是像素缓冲，需从 sample buffer 里取出图像平面。
+            if let pixelBuffer = CMSampleBufferGetImageBuffer(buffer),
+               let image = sampler.process(pixelBuffer) {
                 Task { @MainActor in
                     self?.waveformImage = image
                 }

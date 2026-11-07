@@ -278,7 +278,9 @@ final class CaptureController: NSObject {
         }
 
         let output = AVCaptureAudioDataOutput()
-        output.audioSettings = AudioSettings.captureSettings
+        // 注意：AVCaptureAudioDataOutput.audioSettings 在 iOS 上不可用（macOS 专属），
+        // 音频交付格式由设备的音频连接决定。要 48 kHz / 16-bit LPCM 落盘，
+        // 由 AVAssetWriterInput 的 outputSettings 完成格式转换——见 AudioSettings.writerSettings。
         guard session.canAddOutput(output) else {
             result.notes.append("会话拒绝音频输出")
             return false

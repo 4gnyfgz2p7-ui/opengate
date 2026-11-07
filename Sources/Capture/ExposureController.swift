@@ -182,9 +182,8 @@ final class ExposureController: ObservableObject {
             if device.isExposureModeSupported(.continuousAutoExposure) {
                 device.exposureMode = .continuousAutoExposure
             }
-            if device.isExposureTargetBiasSupported(ev) {
-                device.setExposureTargetBias(ev, completionHandler: nil)
-            }
+            // iOS 没有 isExposureTargetBiasSupported，支持范围由 min/maxExposureTargetBias 给出
+            device.setExposureTargetBias(clampBias(ev, on: device), completionHandler: nil)
             device.unlockForConfiguration()
             return
         }
@@ -197,9 +196,7 @@ final class ExposureController: ObservableObject {
             // custom 模式必须同时给 duration 与 ISO，
             // "自动"的那一维先取当前实时值，随后由闭环接管
             device.setExposureModeCustom(duration: duration, iso: targetISO, completionHandler: nil)
-            if device.isExposureTargetBiasSupported(ev) {
-                device.setExposureTargetBias(ev, completionHandler: nil)
-            }
+            device.setExposureTargetBias(clampBias(ev, on: device), completionHandler: nil)
         }
         device.unlockForConfiguration()
 
@@ -230,9 +227,7 @@ final class ExposureController: ObservableObject {
         // 自动与手动/混合模式都要写 target bias：
         // 前者直接改变系统测光目标，后者改变闭环的收敛目标（offset → 0 即命中新目标）
         try? device.lockForConfiguration()
-        if device.isExposureTargetBiasSupported(clamped) {
-            device.setExposureTargetBias(clamped, completionHandler: nil)
-        }
+        device.setExposureTargetBias(clampBias(clamped, on: device), completionHandler: nil)
         device.unlockForConfiguration()
     }
 
@@ -324,6 +319,13 @@ final class ExposureController: ObservableObject {
 
     func clampISO(_ value: Float) -> Float {
         min(max(value, isoRange.lowerBound), isoRange.upperBound)
+    }
+
+    /// EV 的物理上限由设备的 target bias 范围给出。
+    /// 超出范围时 `setExposureTargetBias` 不是报错而是被静默忽略，
+    /// 所以必须先自己夹住。
+    private func clampBias(_ value: Float, on device: AVCaptureDevice) -> Float {
+        min(max(value, device.minExposureTargetBias), device.maxExposureTargetBias)
     }
 
     func clampDuration(_ seconds: Double) -> CMTime {

@@ -70,7 +70,7 @@ final class WhiteBalanceController: ObservableObject {
         self.device = device
 
         // 接管时把设备当前估算值读进滑块，避免一进来就跳色
-        let current = device.getTemperatureAndTintValues(for: device.deviceWhiteBalanceGains)
+        let current = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains)
         if current.temperature.isFinite, current.temperature > 0 {
             temperature = min(max(current.temperature, Self.temperatureRange.lowerBound), Self.temperatureRange.upperBound)
         }
@@ -126,7 +126,7 @@ final class WhiteBalanceController: ObservableObject {
             temperature: min(max(temperature, Self.temperatureRange.lowerBound), Self.temperatureRange.upperBound),
             tint: min(max(tint, Self.tintRange.lowerBound), Self.tintRange.upperBound)
         )
-        var gains = device.getWhiteBalanceGains(for: values)
+        var gains = device.deviceWhiteBalanceGains(for: values)
 
         // 增益必须落在 [1, maxWhiteBalanceGain]，超出会被系统直接拒绝
         let upper = device.maxWhiteBalanceGain
@@ -149,7 +149,7 @@ final class WhiteBalanceController: ObservableObject {
                 guard let self = self, !Task.isCancelled else { return }
                 await MainActor.run {
                     guard let device = self.device else { return }
-                    let values = device.getTemperatureAndTintValues(for: device.deviceWhiteBalanceGains)
+                    let values = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains)
                     if values.temperature.isFinite {
                         self.liveTemperature = values.temperature
                     }
