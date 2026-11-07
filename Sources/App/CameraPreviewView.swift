@@ -60,11 +60,37 @@ struct CameraPreviewView: UIViewRepresentable {
 /// 波形示波器。
 ///
 /// 横轴对应画面从左到右，纵轴是亮度（底 0、顶 100）。
-/// 三根参考线分别对应 25% / 50% / 75% 亮度。
+///
+/// 这里唯一的判读用途是**曝光**，所以顶和底不是普通参考线：
+/// - 登顶 = 该列有像素落到编码范围上限，信号已被削平，后期救不回
+/// - 触底 = 该列有像素落到 0，暗部已被压死，同样救不回
+/// - 没登顶也没触底 = 高光与暗部都还在范围内，正常
+///
+/// 这个口径与色彩管线无关：换到 Apple Log 2 后，顶依然是"撞到天花板"那一格，
+/// 只是 log 把更多高光压进了范围内，登顶会更晚发生。
 struct WaveformView: View {
 
     let image: CGImage?
     let accent: Color
+    var reading: WaveformSampler.Reading = .empty
+
+    private var topClipped: Bool { reading.isHighlightClipped }
+    private var bottomClipped: Bool { reading.isShadowClipped }
+
+    private var statusText: String {
+        switch (topClipped, bottomClipped) {
+        case (true, true): return "过曝 · 死黑"
+        case (true, false): return "过曝"
+        case (false, true): return "死黑"
+        case (false, false): return "正常"
+        }
+    }
+
+    private var statusColor: Color {
+        if topClipped { return Color.red }
+        if bottomClipped { return Color(red: 0.45, green: 0.68, blue: 1.0) }
+        return Color(red: 0.45, green: 0.85, blue: 0.6)
+    }
 
     var body: some View {
         ZStack {
@@ -77,28 +103,49 @@ struct WaveformView: View {
                     .interpolation(.low)
                     .aspectRatio(contentMode: .fill)
                     .colorMultiply(accent)
-                    .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
-            } else {
-                Text("波形待机")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.white.opacity(0.3))
             }
 
             GeometryReader { geometry in
                 ForEach([0.25, 0.5, 0.75], id: \.self) { fraction in
                     Rectangle()
-                        .fill(Color.white.opacity(0.12))
+                        .fill(Color.white.opacity(0.10))
                         .frame(height: 0.5)
                         .position(
                             x: geometry.size.width / 2,
                             y: geometry.size.height * (1 - fraction)
                         )
                 }
+
+                Rectangle()
+                    .fill(topClipped ? Color.red : Color.white.opacity(0.20))
+                    .frame(height: topClipped ? 2 : 1)
+                    .position(x: geometry.size.width / 2, y: 1.5)
+
+                Rectangle()
+                    .fill(bottomClipped ? Color(red: 0.45, green: 0.68, blue: 1.0) : Color.white.opacity(0.20))
+                    .frame(height: bottomClipped ? 2 : 1)
+                    .position(x: geometry.size.width / 2, y: geometry.size.height - 1.5)
             }
             .allowsHitTesting(false)
 
+            VStack {
+                HStack {
+                    Text(statusText)
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(statusColor)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1.5)
+                        .background(Capsule().fill(Color.black.opacity(0.6)))
+                    Spacer(minLength: 0)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(3)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-        }
+        )
     }
 }

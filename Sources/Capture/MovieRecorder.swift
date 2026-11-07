@@ -185,12 +185,20 @@ final class MovieRecorder {
         if index < 0 { index = 0 }
 
         stateLock.lock()
-        // 真实帧率可能略低于标称值，四舍五入会撞到同一格；强制单调递增
-        if index <= lastVideoFrameIndex {
-            index = lastVideoFrameIndex + 1
+        // 按 24 Hz 网格抽取：落在已写格点上的帧直接丢弃。
+        //
+        // 不能像早先那样"撞格就 +1 强行推进"——设备实际可能以 60 fps 供帧
+        // （会话启动会把 activeVideoMinFrameDuration 改回默认），
+        // 强行推进等于把 1 秒素材写成 2.5 秒慢动作，音轨也会整段错位。
+        let isDuplicateGrid = index <= lastVideoFrameIndex
+        if isDuplicateGrid {
+            droppedVideoFrames += 1
+        } else {
+            lastVideoFrameIndex = index
         }
-        lastVideoFrameIndex = index
         stateLock.unlock()
+
+        if isDuplicateGrid { return }
 
         let targetPTS = CMTime(value: index, timescale: Self.frameTimescale)
 

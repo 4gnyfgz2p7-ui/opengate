@@ -187,6 +187,10 @@ final class CaptureController: NSObject {
 
         session.commitConfiguration()
 
+        // commit 会把设备帧时长改回默认值（实测变回 60 fps），
+        // 必须在 commit 之后重新钉一次，否则记录到的实际帧率与标称不符。
+        enforceFrameRate(device: device)
+
         // 帧率回读要在 commit 之后，此时 activeFormat 已生效
         let duration = device.activeVideoMinFrameDuration
         result.width = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription).width
@@ -296,6 +300,35 @@ final class CaptureController: NSObject {
     func start() {
         guard !session.isRunning else { return }
         session.startRunning()
+
+        // startRunning 也可能重置帧时长，跑起来之后再钉一次
+        if let device = videoDevice {
+            enforceFrameRate(device: device)
+        }
+    }
+
+    /// 把设备帧时长钉到 1/24，并返回是否成功。
+    ///
+    /// 会话的 commit 与 startRunning 都会把 `activeVideoMinFrameDuration`
+    /// 还原成格式默认值（实测回到 60 fps）。探针数据已证实：
+    /// 只在配置前设置一次，回读虽是 1/24，实际到达的帧仍是 60 fps。
+    @discardableResult
+    private func enforceFrameRate(device: AVCaptureDevice) -> Bool {
+        let target = CMTime(value: 1, timescale: CMTimeScale(VideoSettingsBuilder.frameRate))
+        let supported = device.activeFormat.videoSupportedFrameRateRanges.contains {
+            Double($0.minFrameRate) <= 24.001 && Double($0.maxFrameRate) >= 23.999
+        }
+        guard supported else { return false }
+
+        do {
+            try device.lockForConfiguration()
+            device.activeVideoMinFrameDuration = target
+            device.activeVideoMaxFrameDuration = target
+            device.unlockForConfiguration()
+            return true
+        } catch {
+            return false
+        }
     }
 
     func stop() {

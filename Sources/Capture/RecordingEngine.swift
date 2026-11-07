@@ -68,7 +68,6 @@ final class RecordingEngine: ObservableObject {
             if state.isBusy && tier != oldValue {
                 tier = oldValue
             }
-            refreshStorageNote()
         }
     }
 
@@ -81,9 +80,6 @@ final class RecordingEngine: ObservableObject {
     @Published private(set) var lastLocationDegraded = false
     @Published private(set) var history: [MovieRecorder.Outcome] = []
     @Published private(set) var sessionReady = false
-
-    /// 当前档位下还能录多久（秒）。空间读不到时为 0。
-    @Published private(set) var remainingSeconds: Double = 0
     /// 录制中被空间逼停的原因，用于界面提示
     @Published private(set) var autoStopReason: String?
 
@@ -101,6 +97,8 @@ final class RecordingEngine: ObservableObject {
 
     /// 波形图。6 Hz 更新，不是每帧。
     @Published private(set) var waveformImage: CGImage?
+    /// 与波形图同批更新的削波读数：登顶＝高光已削平，触底＝暗部压死。
+    @Published private(set) var waveformReading: WaveformSampler.Reading = .empty
 
     /// 波形开关。关掉后连采样都不做，省电而不只是省绘制。
     @Published var waveformEnabled = true {
@@ -146,8 +144,10 @@ final class RecordingEngine: ObservableObject {
             // 采样器要的是像素缓冲，需从 sample buffer 里取出图像平面。
             if let pixelBuffer = CMSampleBufferGetImageBuffer(buffer),
                let image = sampler.process(pixelBuffer) {
+                let reading = sampler.currentReading()
                 Task { @MainActor in
                     self?.waveformImage = image
+                    self?.waveformReading = reading
                 }
             }
         }
@@ -269,7 +269,6 @@ final class RecordingEngine: ObservableObject {
                 self.state = .failed(spaceError.localizedDescription)
                 return
             }
-            self.remainingSeconds = MovieRecorder.remainingSeconds(tier: selectedTier)
 
             // ---- 步骤 3：建 writer 并写入元数据 ----
             self.state = .preparing("正在准备编码器…")
@@ -362,7 +361,6 @@ final class RecordingEngine: ObservableObject {
                         self.droppedFrames = recorder.liveDroppedFrames
                     }
                     self.refreshWrittenBytes()
-                    self.refreshStorageNote()
 
                     // 空间见底时主动收尾，而不是让 writer 在半路失败：
                     // 正常收尾能保住文件与 moov，失败只会留下无法播放的残片。
@@ -388,11 +386,6 @@ final class RecordingEngine: ObservableObject {
         } else if let last = history.first {
             writtenBytes = last.fileSize
         }
-    }
-
-    /// 剩余可录时长。每 0.5 秒重算一次，代价只有一次 resourceValues 查询。
-    private func refreshStorageNote() {
-        remainingSeconds = MovieRecorder.remainingSeconds(tier: tier)
     }
 
     // MARK: - 派生信息

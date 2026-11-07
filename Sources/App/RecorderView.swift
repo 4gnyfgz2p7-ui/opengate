@@ -166,11 +166,6 @@ struct RecorderView: View {
                     .font(.system(size: 20, weight: .medium, design: .monospaced))
                     .foregroundStyle(.white)
                     .monospacedDigit()
-                if engine.droppedFrames > 0 {
-                    Text("掉 \(engine.droppedFrames)")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.orange.opacity(0.9))
-                }
             }
             .padding(.top, 6)
 
@@ -270,7 +265,7 @@ struct RecorderView: View {
     @ViewBuilder
     private var waveform: some View {
         if engine.waveformImage != nil {
-            WaveformView(image: engine.waveformImage, accent: accent)
+            WaveformView(image: engine.waveformImage, accent: accent, reading: engine.waveformReading)
                 .frame(width: 132, height: 78)
                 .background(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -724,7 +719,7 @@ struct SettingsSheet: View {
             row("分辨率", engine.captureConfiguration?.resolutionText ?? "未配置")
             row("帧率", String(format: "%.3f fps", Double(VideoSettingsBuilder.frameRate)))
             row("音频", "LPCM 48 kHz / 16-bit / 2 ch")
-            row("色彩管线", "系统 ISP（SDR）· Apple Log 2 待接入 Metal")
+            row("色彩管线", "系统 ISP · SDR · 未启用 Log")
             row("定位", engine.lastLocationText)
             if let note = engine.thermalNote {
                 row("机身温度", note)

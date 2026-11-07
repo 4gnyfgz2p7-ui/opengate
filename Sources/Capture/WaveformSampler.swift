@@ -20,6 +20,29 @@ final class WaveformSampler {
     static let columns = 48
     static let levels = 96
 
+    /// 一次波形读数。
+    ///
+    /// 判定口径刻意取"是否真的登顶/触底"，而不是 90%、95% 这类经验阈值：
+    /// 波形的顶就是编码范围的上限，信号一旦落在这里就已经被削平，
+    /// 后期没有任何余量可拉回；没登顶就说明高光还在范围内，可以救。
+    /// 这个口径换成 Apple Log 2 后依然成立——log 只是把更多高光压进范围内，
+    /// 顶依然是"已经撞到天花板"的那一格。
+    struct Reading: Equatable {
+        var columns: Int = WaveformSampler.columns
+        /// 有像素登顶的列数（高光被削平）
+        var highlightColumns: Int = 0
+        /// 有像素触底的列数（暗部被压死）
+        var shadowColumns: Int = 0
+
+        static let empty = Reading()
+
+        var isHighlightClipped: Bool { highlightColumns > 0 }
+        var isShadowClipped: Bool { shadowColumns > 0 }
+        var isClean: Bool { !isHighlightClipped && !isShadowClipped }
+    }
+
+    private(set) var reading = Reading()
+
     /// 每多少帧产出一张新图。24 fps / 6 = 4 Hz，肉眼仍算连续。
     var decimation = 6
 
@@ -34,7 +57,14 @@ final class WaveformSampler {
         if !enabled {
             // 逐元素清零，不依赖 UnsafeMutableBufferPointer 的较新 API
             for index in bins.indices { bins[index] = 0 }
+            reading = .empty
         }
+    }
+
+    /// 线程安全的读数快照
+    func currentReading() -> Reading {
+        lock.lock(); defer { lock.unlock() }
+        return reading
     }
 
     /// 采样一帧。返回 nil 表示这一帧不产出（未到抽帧间隔、波形关闭、或格式不支持）。
@@ -81,10 +111,35 @@ final class WaveformSampler {
         lock.lock()
         bins = local
         let emit = shouldEmit
+        if emit {
+            reading = Self.analyze(local)
+        }
         lock.unlock()
 
         guard emit else { return nil }
         return makeImage()
+    }
+
+    /// 逐列检查是否登顶 / 触底。48 列 × 96 级 = 4608 次比较，代价可忽略。
+    private static func analyze(_ local: [UInt32]) -> Reading {
+        var result = Reading()
+        let top = levels - 1
+        let bottom = 0
+
+        for col in 0..<columns {
+            let base = col * levels
+            var clippedTop = false
+            var clippedBottom = false
+
+            for level in 0..<levels where local[base + level] > 0 {
+                if level == top { clippedTop = true }
+                if level == bottom { clippedBottom = true }
+            }
+
+            if clippedTop { result.highlightColumns += 1 }
+            if clippedBottom { result.shadowColumns += 1 }
+        }
+        return result
     }
 
     /// 生成灰度位图。用 CGImage 而不是 SwiftUI Canvas：
