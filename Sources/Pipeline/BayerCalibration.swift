@@ -69,29 +69,21 @@ final class BayerCalibration {
         [1, 2, 0, 1],   // GBRG
     ]
 
+    /// btp2 的解包：每 8 个像素 12 字节，前 8 字节是高 8 位，后 4 字节是低 4 位。
     private static func unpack(
         _ base: UnsafeMutableRawPointer,
         _ rowBytes: Int,
         _ x: Int,
-        _ y: Int,
-        _ mode: Int
+        _ y: Int
     ) -> Double {
-        let row = base.advanced(by: y * rowBytes).assumingMemoryBound(to: UInt8.self)
-        let index = (x >> 1) * 3
-        let b0 = Double(row[index])
-        let b1 = Double(row[index + 1])
-        let b2 = Double(row[index + 2])
-        switch mode {
-        case 0:
-            return (x & 1) == 0 ? (b0 * 16 + floor(b1 / 16))
-                                : ((b1 - floor(b1 / 16) * 16) * 256 + b2)
-        case 1:
-            return (x & 1) == 0 ? (b0 + (b1 - floor(b1 / 16) * 16) * 256)
-                                : (floor(b1 / 16) + b2 * 16)
-        default:
-            return (x & 1) == 0 ? (floor(b0 / 16) * 256 + b1)
-                                : ((b0 - floor(b0 / 16) * 16) * 256 + b2)
-        }
+        let group = x >> 3
+        let k = x & 7
+        let block = base.advanced(by: y * rowBytes + group * 12)
+            .assumingMemoryBound(to: UInt8.self)
+        let hi = Double(block[k])
+        let loByte = Double(block[8 + (k >> 1)])
+        let nib = (k & 1) == 0 ? floor(loByte / 16) : (loByte - floor(loByte / 16) * 16)
+        return hi * 16 + nib
     }
 
     static func run(
@@ -111,7 +103,7 @@ final class BayerCalibration {
         let blackValue = Double(black)
 
         func value(_ mode: Int, _ x: Int, _ y: Int) -> Double {
-            max(0.0, (unpack(base, rowBytes, x, y, mode) - blackValue) * invRange)
+            max(0.0, (unpack(base, rowBytes, x, y) - blackValue) * invRange)
         }
 
         // ---- 第一关：排法 ----
@@ -161,7 +153,7 @@ final class BayerCalibration {
         while rawY + 4 < height {
             var rawX = 0
             while rawX + 4 < width {
-                let sample = unpack(base, rowBytes, rawX, rawY, bestMode)
+                let sample = unpack(base, rowBytes, rawX, rawY)
                 if sample < rawMin { rawMin = sample }
                 if sample > rawMax { rawMax = sample }
                 rawSum += sample
@@ -229,18 +221,14 @@ final class BayerCalibration {
             }
         }
 
-        // 相位：设备通过 ProResRAW_BayerPattern 给的值优先。
-        // 标定的绿点差分离度有 157 倍，所以只在设备没给、或设备值明显错（差 3 倍以上）时才接管。
-        var chosenPattern = bestPattern
+        // 相位：以标定结果为准。
+        //
+        // 解包方式改正之后，「一格两个绿点之差」的分离度实测 157 倍
+        //（正确 0.0015 / 错误 0.235），比 ProRAW 附件给的 BayerPattern 更可信——
+        // 0.5.12 的实测就是设备说 GBRG、标定说 BGGR，两者冲突。
+        // 设备值仍然记进诊断串，两者不一致时能从文件里看到。
+        let chosenPattern = bestPattern
         let preferred = Int(preferredPattern)
-        if preferred >= 0, preferred < 4 {
-            if let preferredPair = greenPairs[preferred],
-               bestGreenPair * 3.0 < preferredPair {
-                chosenPattern = bestPattern
-            } else {
-                chosenPattern = preferred
-            }
-        }
 
         var outcome = Outcome()
         outcome.unpackMode = Int32(bestMode)
