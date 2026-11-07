@@ -188,15 +188,16 @@ final class MovieRecorder {
 
     /// 视频帧。时间戳按真实经过时间折算到 24 时基，既保证时基纯净，
     /// 又不累积偏差。
-    func appendVideo(_ sampleBuffer: CMSampleBuffer) {
+    @discardableResult
+    func appendVideo(_ sampleBuffer: CMSampleBuffer) -> Bool {
         stateLock.lock()
         let alreadyFinished = finished
         stateLock.unlock()
-        guard !alreadyFinished, writer.status == .writing else { return }
+        guard !alreadyFinished, writer.status == .writing else { return false }
 
         guard videoInput.isReadyForMoreMediaData else {
             stateLock.lock(); droppedVideoFrames += 1; stateLock.unlock()
-            return
+            return false
         }
 
         let realPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -226,7 +227,7 @@ final class MovieRecorder {
         }
         stateLock.unlock()
 
-        if isDuplicateGrid { return }
+        if isDuplicateGrid { return false }
 
         let targetPTS = CMTime(value: index, timescale: Self.frameTimescale)
 
@@ -236,7 +237,7 @@ final class MovieRecorder {
             duration: CMTime(value: 1, timescale: Self.frameTimescale)
         ) else {
             stateLock.lock(); droppedVideoFrames += 1; stateLock.unlock()
-            return
+            return false
         }
 
         if videoInput.append(retimed) {
@@ -244,6 +245,7 @@ final class MovieRecorder {
             writtenVideoFrames += 1
             lastPTS = targetPTS
             stateLock.unlock()
+            return true
         } else {
             stateLock.lock()
             droppedVideoFrames += 1
@@ -255,6 +257,7 @@ final class MovieRecorder {
                 firstAppendFailure = reason
             }
             stateLock.unlock()
+            return false
         }
     }
 

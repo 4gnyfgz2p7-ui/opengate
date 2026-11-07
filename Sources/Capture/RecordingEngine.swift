@@ -55,6 +55,38 @@ final class RecorderBox {
     }
 }
 
+/// 采集通路的计数快照。
+///
+/// 出问题时把「收帧 / 转换 / 写入」三个数字直接写在界面上，
+/// 一眼就能分清是没收到帧、转换失败，还是编码器拒收。
+final class FrameStats {
+    struct Snapshot {
+        var delivered = 0
+        var converted = 0
+        var appended = 0
+    }
+
+    private let lock = NSLock()
+    private var delivered = 0
+    private var converted = 0
+    private var appended = 0
+
+    func markDelivered() { lock.lock(); delivered += 1; lock.unlock() }
+    func markConverted() { lock.lock(); converted += 1; lock.unlock() }
+    func markAppended() { lock.lock(); appended += 1; lock.unlock() }
+
+    func reset() {
+        lock.lock()
+        delivered = 0; converted = 0; appended = 0
+        lock.unlock()
+    }
+
+    var snapshot: Snapshot {
+        lock.lock(); defer { lock.unlock() }
+        return Snapshot(delivered: delivered, converted: converted, appended: appended)
+    }
+}
+
 /// Bayer 转换很贵（19 MB 拷贝 + 1270 万像素 demosaic），
 /// 源却按 60 fps 送帧。这里按 30 fps 放行，写入端再按 24 帧网格去重。
 final class FrameGate {
@@ -133,6 +165,11 @@ final class RecordingEngine: ObservableObject {
     /// 全幅 Bayer 直出的唯一出路。初始化失败（Metal 不可用）时为 nil，
     /// 采集层会据此降级到系统 ISP 格式，而不是硬录出一个 0 字节文件。
     private let bayerConverter = BayerConverter()
+    private let stats = FrameStats()
+    private var recovering = false
+
+    /// 管线降级说明，显示在设置页
+    @Published private(set) var pipelineNote: String?
 
     /// 定位等待上限（秒）。够拿到冷启动首次定位的概率不高，
     /// 但配合 60 秒内的缓存足以覆盖连续拍摄场景。
@@ -159,6 +196,7 @@ final class RecordingEngine: ObservableObject {
         let sampler = waveform
         let converter = bayerConverter
         let gate = FrameGate()
+        let statsBox = stats
 
         capture.onVideoSample = { [weak self] buffer in
             let recorder = box.get()
@@ -167,6 +205,7 @@ final class RecordingEngine: ObservableObject {
                 return
             }
 
+            statsBox.markDelivered()
             var monitorable = imageBuffer
 
             // 全幅格式只吐 Bayer：先 demosaic 成 10-bit YUV 再交给编码器。
@@ -185,12 +224,13 @@ final class RecordingEngine: ObservableObject {
                 ) else { return }
 
                 monitorable = converted
+                statsBox.markConverted()
                 if let rebuilt = RecordingEngine.replacingImageBuffer(of: buffer, with: converted) {
-                    recorder?.appendVideo(rebuilt)
+                    if recorder?.appendVideo(rebuilt) == true { statsBox.markAppended() }
                 }
             } else {
                 // 编码写入必须在采集队列上同步完成，不能异步延后
-                recorder?.appendVideo(buffer)
+                if recorder?.appendVideo(buffer) == true { statsBox.markAppended() }
             }
 
             // 波形采样同队列串行执行（约 1.3 万次读取），
@@ -352,6 +392,13 @@ final class RecordingEngine: ObservableObject {
                 self.whiteBalance.attach(to: device)
             }
             self.prepareTask = nil
+
+            // 三秒后自查一次：全幅 Bayer 通路要是连一帧都转换不出来，
+            // 立刻换系统 ISP 格式，而不是让用户录出一个 0 字节文件。
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                await self?.recoverPipelineIfNeeded()
+            }
         }
     }
 
@@ -360,6 +407,40 @@ final class RecordingEngine: ObservableObject {
         whiteBalance.detach()
         capture.stop()
         sessionReady = false
+    }
+
+    /// 全幅通路没跑通时自动降级到系统 ISP。
+    ///
+    /// 判据刻意做得保守：三秒内**一帧都没转换出来**才算失败。
+    /// 降级后分辨率为 4032×3024（真 4:3），但录制能出片——
+    /// 比留一个打不开的 0 字节文件有用。
+    private func recoverPipelineIfNeeded() async {
+        guard !recovering, captureConfiguration?.isBayer == true else { return }
+        let snap = stats.snapshot
+        guard snap.converted == 0 else { return }
+
+        recovering = true
+        pipelineNote = "全幅转换未出帧（收帧 \(snap.delivered)），已切到系统 ISP"
+        capture.stop()
+        exposure.detach()
+        whiteBalance.detach()
+
+        let config = capture.configure(
+            path: .systemProcessed,
+            audioEnabled: true,
+            canProcessBayer: false
+        )
+        captureConfiguration = config
+        capture.start()
+        if let device = capture.videoDevice {
+            exposure.attach(to: device)
+            whiteBalance.attach(to: device)
+        }
+        sessionReady = capture.isRunning
+        stats.reset()
+        recovering = false
+        if !state.isBusy { state = .idle }
+        autoStopReason = pipelineNote
     }
 
     /// 回到前台时重新拉起采集。
@@ -519,7 +600,9 @@ final class RecordingEngine: ObservableObject {
                         // 两秒还没有一帧落进写入器 = 编码器拒收画面。
                         // 继续计时只会得到一个 0 字节文件，不如立刻收手并说明原因。
                         if self.elapsed > 2.0, recorder.liveWrittenFrames == 0 {
-                            self.autoStopReason = "画面未能写入：\(recorder.appendFailureDescription ?? "编码器未接受该画面格式")"
+                            let snap = self.stats.snapshot
+                            let detail = recorder.appendFailureDescription ?? "编码器未接受该画面格式"
+                            self.autoStopReason = "画面未能写入（收帧 \(snap.delivered) · 转换 \(snap.converted) · 写入 \(snap.appended)）：\(detail)"
                             self.stopRecording()
                             return
                         }

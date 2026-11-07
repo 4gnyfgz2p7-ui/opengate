@@ -106,6 +106,10 @@ final class CaptureController: NSObject {
         var result = Configuration()
         result.path = path
 
+        // 可重入：降级换格式时会再调一次，旧输入输出必须先拆干净，
+        // 否则 canAddInput 会被拒（会话已经有一份同样的输入）。
+        removeExistingIO()
+
         session.beginConfiguration()
         session.sessionPreset = .inputPriority
 
@@ -230,6 +234,21 @@ final class CaptureController: NSObject {
 
         configuration = result
         return result
+    }
+
+    /// 拆掉现有输入输出，让 `configure` 可以重跑
+    private func removeExistingIO() {
+        guard !session.inputs.isEmpty || !session.outputs.isEmpty else { return }
+        if session.isRunning { session.stopRunning() }
+
+        session.beginConfiguration()
+        for input in session.inputs { session.removeInput(input) }
+        for output in session.outputs { session.removeOutput(output) }
+        session.commitConfiguration()
+
+        videoInput = nil
+        audioInput = nil
+        videoDevice = nil
     }
 
     /// 换一个能吐 YUV 的格式。
