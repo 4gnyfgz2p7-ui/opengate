@@ -14,7 +14,6 @@ struct RecorderView: View {
 
     @StateObject private var engine = RecordingEngine()
     @State private var showSettings = false
-    @State private var previewFillsScreen = true
 
     var onShowProbe: () -> Void
 
@@ -39,8 +38,7 @@ struct RecorderView: View {
 
                 CameraPreviewView(
                     session: engine.capture.session,
-                    rotationDegrees: engine.rotationDegrees,
-                    fill: previewFillsScreen
+                    rotationDegrees: engine.rotationDegrees
                 )
                 .ignoresSafeArea()
 
@@ -61,7 +59,6 @@ struct RecorderView: View {
         .sheet(isPresented: $showSettings) {
             SettingsSheet(
                 engine: engine,
-                previewFillsScreen: $previewFillsScreen,
                 onShowProbe: onShowProbe
             )
         }
@@ -683,7 +680,6 @@ struct WhiteBalanceStrip: View {
 struct SettingsSheet: View {
 
     @ObservedObject var engine: RecordingEngine
-    @Binding var previewFillsScreen: Bool
     var onShowProbe: () -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -771,17 +767,6 @@ struct SettingsSheet: View {
 
     private var displaySection: some View {
         section("显示") {
-            Toggle(isOn: $previewFillsScreen) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("取景器铺满屏幕")
-                        .font(.system(size: 13))
-                    Text("关闭则显示全幅边界（两侧留黑）")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .tint(accent)
-
             Toggle(isOn: $engine.waveformEnabled) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("波形监看")

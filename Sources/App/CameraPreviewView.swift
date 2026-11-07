@@ -3,33 +3,26 @@ import AVFoundation
 
 /// 取景器。
 ///
-/// 默认 `resizeAspectFill`：拍摄时画面优先撑满屏幕，UI 叠在上面。
-/// 全幅不裁切由**成片**保证——`AVAssetWriterInput.transform` 只标记方向、不裁剪像素，
-/// 所以取景器放大填满不会影响录到的画面内容；构图以边缘可见为准时，
-/// 可在设置里切回 `resizeAspect` 看全幅边界。
+/// 固定 `resizeAspect`：画面按比例贴合屏幕短边，宽或高总有一边撑满，
+/// 多出来的部分留黑，**不裁切任何像素**。
+/// 这样取景框里看到的就是最终成片的全部内容，构图不会在录制后才多出东西。
 struct CameraPreviewView: UIViewRepresentable {
 
     let session: AVCaptureSession
     /// 顺时针旋转角度，取值来自 `CaptureRotation.degrees`
     let rotationDegrees: CGFloat
-    /// true = 铺满（可能裁边，构图更直观）；false = 完整显示全幅
-    var fill: Bool = true
 
     func makeUIView(context: Context) -> PreviewContainerView {
         let view = PreviewContainerView()
         view.backgroundColor = .black
         view.previewLayer.session = session
-        view.previewLayer.videoGravity = fill ? .resizeAspectFill : .resizeAspect
+        view.previewLayer.videoGravity = .resizeAspect
         return view
     }
 
     func updateUIView(_ uiView: PreviewContainerView, context: Context) {
         if uiView.previewLayer.session !== session {
             uiView.previewLayer.session = session
-        }
-        let gravity: AVLayerVideoGravity = fill ? .resizeAspectFill : .resizeAspect
-        if uiView.previewLayer.videoGravity != gravity {
-            uiView.previewLayer.videoGravity = gravity
         }
         applyRotation(to: uiView)
     }
