@@ -201,12 +201,39 @@ enum ProbeEngine {
             recorder.log("\(check.label)：canApply \(check.canApplySettings)，startWriting \(check.startWriting)")
         }
 
-        // 6. 结论
+        // 6. Phase 2：真机实测（精确 24fps、btp2 真实帧结构、RAW 元数据、帧到达率）
+        var frameRateCheck: FrameRateCheck?
+        var liveCapture: LiveCaptureResult?
+
+        if let targetFormat = targetFormat {
+            recorder.log("Phase 2：锁定 24fps 并采集真实帧")
+            let liveProbe = LiveCaptureProbe()
+            let liveResult = liveProbe.run(device: device, format: targetFormat)
+            frameRateCheck = liveResult.rate
+            liveCapture = liveResult.capture
+
+            if let rate = liveResult.rate {
+                recorder.log("帧率回读：\(rate.setStatus)（\(rate.actualValue)/\(rate.actualTimescale)）")
+            }
+            recorder.log("采集结束：收到 \(liveResult.capture.framesReceived) 帧，实测 \(liveResult.capture.measuredFPS) fps")
+            if let structure = liveResult.capture.structure {
+                recorder.log("帧结构：\(structure.width)x\(structure.height) \(structure.pixelFormat) bytesPerRow=\(structure.bytesPerRow) 期望=\(structure.expectedBytesPerRowFor12Bit)")
+            }
+            if !liveResult.capture.sampleBufferAttachmentKeys.isEmpty {
+                recorder.log("RAW 元数据键 \(liveResult.capture.sampleBufferAttachmentKeys.count) 个")
+            }
+        } else {
+            recorder.log("Phase 2 跳过：没有可用的目标格式")
+        }
+
+        // 7. 结论
         let verdicts = buildVerdicts(
             formats: formats,
             pixelProbe: pixelProbe,
             encoderChecks: encoderChecks,
             writerChecks: writerChecks,
+            frameRateCheck: frameRateCheck,
+            liveCapture: liveCapture,
             captureWidth: captureWidth,
             captureHeight: captureHeight
         )
@@ -223,6 +250,8 @@ enum ProbeEngine {
             pixelFormatProbe: pixelProbe,
             encoderChecks: encoderChecks,
             writerChecks: writerChecks,
+            frameRateCheck: frameRateCheck,
+            liveCapture: liveCapture,
             verdicts: verdicts,
             steps: recorder.steps
         )
@@ -235,6 +264,8 @@ enum ProbeEngine {
         pixelProbe: PixelFormatProbe,
         encoderChecks: [EncoderCheck],
         writerChecks: [WriterCheck],
+        frameRateCheck: FrameRateCheck?,
+        liveCapture: LiveCaptureResult?,
         captureWidth: Int32,
         captureHeight: Int32
     ) -> [Verdict] {
@@ -282,14 +313,28 @@ enum ProbeEngine {
             )
         }
 
-        // 10-bit 采集
+        // 采集位深：Bayer 路线的位深高于任何 YUV 格式，不能只查 YUV 四字符码
+        let bayerBitDepth = pixelProbe.bayerFormats
+            .compactMap { FourCC.bayerBitDepth(FourCC.code($0)) }
+            .max()
+        let hasHighBitDepth = pixelProbe.has10Bit420 || bayerBitDepth != nil
+        let depthDescription: String = {
+            var parts: [String] = []
+            if let depth = bayerBitDepth {
+                parts.append("Bayer \(depth)-bit")
+            }
+            if pixelProbe.has10Bit420 {
+                parts.append("YUV 10-bit 4:2:0")
+            }
+            return parts.joined(separator: " + ")
+        }()
         verdicts.append(
             Verdict(
-                key: "10bit-capture",
-                level: pixelProbe.has10Bit420 ? .pass : .fail,
-                message: pixelProbe.has10Bit420
-                    ? "支持 10-bit 4:2:0 视频采集"
-                    : "不支持 10-bit 视频采集，Apple Log 管线的输入位深不足"
+                key: "bit-depth",
+                level: hasHighBitDepth ? .pass : .fail,
+                message: hasHighBitDepth
+                    ? "输入位深充足：\(depthDescription)"
+                    : "无 10-bit 以上采集格式，Apple Log 管线位深不足"
             )
         )
 
@@ -386,6 +431,78 @@ enum ProbeEngine {
                     : (stabilizationOff! ? "目标格式支持关闭视频防抖" : "目标格式可能不支持关闭防抖，需实测画面裁切")
             )
         )
+
+        // Phase 2：精确 24fps 回读
+        if let rate = frameRateCheck {
+            if rate.isExact24 {
+                verdicts.append(
+                    Verdict(
+                        key: "fps-24-exact",
+                        level: .pass,
+                        message: "回读帧时长 \(rate.actualValue)/\(rate.actualTimescale)，精确 24.000 fps"
+                    )
+                )
+            } else if rate.isNTSC23976 {
+                verdicts.append(
+                    Verdict(
+                        key: "fps-24-exact",
+                        level: .fail,
+                        message: "设备把 1/24 改成了 1001/24000（23.976），不是精确 24.000"
+                    )
+                )
+            } else {
+                verdicts.append(
+                    Verdict(
+                        key: "fps-24-exact",
+                        level: .fail,
+                        message: "请求 1/24，回读为 \(rate.actualValue)/\(rate.actualTimescale)（\(rate.actualSeconds) 秒）"
+                    )
+                )
+            }
+        }
+
+        // Phase 2：btp2 真实帧结构与 RAW 元数据
+        if let live = liveCapture {
+            if let structure = live.structure {
+                verdicts.append(
+                    Verdict(
+                        key: "bayer-frame-structure",
+                        level: structure.matchesExpectedLayout ? .pass : .warn,
+                        message: "\(structure.width)x\(structure.height) \(structure.pixelFormat)，bytesPerRow \(structure.bytesPerRow)，12-bit 期望 \(structure.expectedBytesPerRowFor12Bit)\(structure.matchesExpectedLayout ? "，布局吻合" : "，布局不符需重新解包")"
+                    )
+                )
+            } else {
+                verdicts.append(
+                    Verdict(
+                        key: "bayer-frame-structure",
+                        level: .fail,
+                        message: "未取到真实帧：\(live.note)"
+                    )
+                )
+            }
+
+            let metadataCount = live.sampleBufferAttachmentKeys.count + live.pixelBufferAttachmentKeys.count
+            verdicts.append(
+                Verdict(
+                    key: "raw-metadata",
+                    level: metadataCount > 0 ? .pass : .warn,
+                    message: metadataCount > 0
+                        ? "RAW 元数据可得：sampleBuffer \(live.sampleBufferAttachmentKeys.count) 项、pixelBuffer \(live.pixelBufferAttachmentKeys.count) 项"
+                        : "未读到 RAW 元数据附件，黑白电平与 WB 需另寻来源"
+                )
+            )
+
+            if live.framesReceived > 1 {
+                let inRange = live.measuredFPS > 23.0 && live.measuredFPS < 25.0
+                verdicts.append(
+                    Verdict(
+                        key: "capture-rate",
+                        level: inRange ? .pass : .warn,
+                        message: "实测 \(live.measuredFPS) fps，帧间隔 \(live.intervalMinMS)–\(live.intervalMaxMS) ms（均值 \(live.intervalAvgMS) ms）"
+                    )
+                )
+            }
+        }
 
         return verdicts
     }

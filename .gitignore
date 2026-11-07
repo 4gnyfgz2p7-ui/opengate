@@ -14,3 +14,10 @@ project.pbxproj
 .vscode/
 .idea/
 *.swp
+
+# 本地凭据，绝不提交
+.token
+*.token
+
+# 本地装机工具与产物，体积大且不入库
+_local/

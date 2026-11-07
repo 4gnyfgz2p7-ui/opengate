@@ -108,6 +108,7 @@ struct ContentView: View {
 
                         deviceCard(report)
                         encoderCard(report)
+                        liveCard(report)
                         formatCard(report)
                     }
 
@@ -118,7 +119,7 @@ struct ContentView: View {
                 .padding(16)
             }
             .background(Color.black.ignoresSafeArea())
-            .navigationTitle("OpenGate 探针")
+            .navigationTitle("A camera")
             .navigationBarTitleDisplayMode(.inline)
         }
     }
@@ -209,12 +210,55 @@ struct ContentView: View {
 
     // MARK: 格式
 
+    private func liveCard(_ report: ProbeReport) -> some View {
+        Card(title: "Phase 2 实测") {
+            VStack(alignment: .leading, spacing: 6) {
+                if let rate = report.frameRateCheck {
+                    KeyValueRow(key: "帧率回读", value: rate.setStatus)
+                } else {
+                    Text("未执行帧率实测")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let live = report.liveCapture {
+                    KeyValueRow(key: "收到帧数", value: "\(live.framesReceived)")
+                    KeyValueRow(key: "实测帧率", value: String(format: "%.3f fps", live.measuredFPS))
+                    KeyValueRow(
+                        key: "帧间隔",
+                        value: String(format: "%.2f – %.2f ms", live.intervalMinMS, live.intervalMaxMS)
+                    )
+                    if let structure = live.structure {
+                        KeyValueRow(
+                            key: "帧格式",
+                            value: "\(structure.width)x\(structure.height) \(structure.pixelFormat)"
+                        )
+                        KeyValueRow(
+                            key: "bytesPerRow",
+                            value: "\(structure.bytesPerRow)（期望 \(structure.expectedBytesPerRowFor12Bit)）"
+                        )
+                    }
+                    KeyValueRow(
+                        key: "元数据键",
+                        value: "sample \(live.sampleBufferAttachmentKeys.count) · pixel \(live.pixelBufferAttachmentKeys.count)"
+                    )
+                    if !live.note.isEmpty && live.note != "正常" {
+                        Text(live.note)
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+    }
+
     private func formatCard(_ report: ProbeReport) -> some View {
         let candidates = report.formats
-            .filter { $0.isVideoCapable && $0.is4x3 }
+            .filter { $0.isVideoCapable }
             .sorted { $0.megapixels > $1.megapixels }
 
-        return Card(title: "4:3 视频格式（前 8 项）") {
+        return Card(title: "视频格式（按面积，前 8 项）") {
             VStack(alignment: .leading, spacing: 8) {
                 if candidates.isEmpty {
                     Text("未发现 4:3 视频格式")
@@ -229,8 +273,12 @@ struct ContentView: View {
                                 .frame(width: 108, alignment: .leading)
                             Text(format.pixelFormat)
                                 .font(.caption2.monospaced())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(format.isOpenGateCandidate ? .green : .secondary)
                                 .frame(width: 44, alignment: .leading)
+                            Text(format.isOpenGateCandidate ? "OG" : (format.is4x3 ? "4:3" : "—"))
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(format.isOpenGateCandidate ? .green : .secondary)
+                                .frame(width: 30, alignment: .leading)
                             Text(format.supports24 ? "24fps ✓" : "—")
                                 .font(.caption2)
                                 .foregroundStyle(format.supports24 ? .green : .secondary)

@@ -1,32 +1,42 @@
-# OpenGate
+# A camera
 
-iPhone 全传感器 4:3、Apple Log 2、锁 24fps 四档录制的自用相机 App。
+iPhone 全传感器 Open Gate、Apple Log 2、锁 24fps 四档录制的自用相机 App。
 
-当前阶段：**能力探针**（Probe）。在写任何录制管线之前，先在真机上回答六个待验证点，避免整条工程建立在错误前提上。
+当前阶段：**能力探针**。在写录制管线之前，先用真机把关键前提验完。
 
-## 为什么先做探针
+## 真机实测结论（iPhone 17 Pro Max / iOS 27.2）
 
-任务书把「四档」的核心不确定性收敛到两个问题：
+第一轮探针已在 `iPhone18,2` 上跑通，几个关键事实与初始假设不同：
 
-1. 4224×3024 的 **视频采集格式** 对第三方 App 是否可见（Apple 只在 Final Cut Camera 里开放了 Open Gate）。
-2. 硬件 HEVC 编码器吃到 12.77 MP 时，是接受、拒建，还是**静默改小**。
+| 结论 | 实测 |
+|---|---|
+| 全传感器采集格式 | **存在**。`4224×3024 'btp2'`，最高 60 fps |
+| `btp2` 是什么 | `kCVPixelFormatType_96VersatileBayerPacked12`，**12-bit packed Bayer**，即 ProRes RAW 的采集格式 |
+| 画幅比例 | **4224/3024 = 1.397:1，不是 4:3**。真正的 4:3 是 `4032×3024` |
+| HEVC 12.77MP | **通过**。会话创建成功，回读分辨率 4224×3024 未被改小，Main10 |
+| ProRes HQ / LT | **通过**。会话与 `AVAssetWriter` 均接受 4224×3024 |
+| Bayer 直出 | **可得**。sample buffer 携带 Bayer pattern、黑白电平、WB 倍率、Camera RGB→XYZ D65 矩阵 |
 
-第三个问题是 Bayer：`AVCaptureVideoDataOutput` 是否暴露 Bayer 像素格式，决定前端是「真 RAW 直出」还是「10-bit YUV 起步」。
-
-这三条不验证就写管线，失败点会出现在几千行代码之后，而且是静默失败。
+由此，「2 档稳过 + 2 档待验证」的判断可以上调为：**四档技术路径全部成立，且 RAW 通路可用**。
 
 ## 探针测什么
 
-| 编号 | 项目 | 判决依据 |
-| --- | --- | --- |
-| 1 | 格式枚举 | `AVCaptureDevice.formats` 全量导出，标记 4224×3024 / 4:3 / 视频可用 / 支持 24fps |
-| 2 | 像素格式 | 配置会话后读 `availableVideoPixelFormatTypes`，筛 Bayer 四字符码 |
-| 3 | HEVC 天花板 | `VTCopySupportedPropertyDictionaryForEncoder` + 真实建会话 |
-| 4 | 静默改尺寸 | 真实编码一帧，从输出 `CMFormatDescription` 回读实际宽高 |
-| 5 | ProRes | `kCMVideoCodecType_AppleProRes422HQ/LT` 会话 + `AVAssetWriter` 接受度 |
-| 6 | 环境 | 热状态、低电量、可用空间 |
+Phase 1（静态能力）：
 
-第 4 项是唯一能证明「有没有被偷偷改小」的证据，不能靠会话创建成功来推断。
+1. 全量枚举 `AVCaptureDevice.formats`，标记尺寸、像素格式、帧率范围
+2. 读 `availableVideoPixelFormatTypes`，识别 Bayer 四字符码
+3. `VTCopySupportedPropertyDictionaryForEncoder` 预问编码器支持性
+4. 真实建 `VTCompressionSession` 并编码一帧，回读实际输出宽高
+5. `AVAssetWriter` 对 ProRes / HEVC 输出设置的接受度
+
+Phase 2（真机实测）：
+
+6. 锁定 `1/24` 后回读 `activeVideoMinFrameDuration`，区分精确 24.000 与 23.976
+7. 真开相机采 btp2 帧，读 `bytesPerRow` 验证 12-bit 打包布局（4224 宽应为 6336 字节/行）
+8. 打印 sample buffer / pixel buffer 的 RAW 元数据键名
+9. 统计 30 帧的实际帧率与间隔抖动
+
+第 4 项与第 7 项是唯一能证明「没被偷偷改小」「打包格式对得上」的证据，不能靠推断。
 
 ## 工程结构
 
@@ -35,7 +45,9 @@ OpenGate/
 ├── project.yml                     XcodeGen 工程定义
 ├── .github/workflows/build.yml     云端出未签名 IPA
 └── Sources/
-    ├── Info.plist
+    ├── Info.plist                  显示名 A camera
+    ├── Assets.xcassets/
+    │   └── AppIcon.appiconset/     1024×1024 图标
     ├── App/
     │   ├── OpenGateApp.swift
     │   └── ContentView.swift
@@ -43,10 +55,13 @@ OpenGate/
     │   ├── Models.swift            报告数据模型
     │   ├── DeviceProbe.swift       格式枚举 + 像素格式
     │   ├── EncoderProbe.swift      VideoToolbox + AVAssetWriter
+    │   ├── LiveCaptureProbe.swift  Phase 2 真机采集实测
     │   └── ProbeEngine.swift       编排 + 结论生成
     └── Support/
         └── ReportWriter.swift      JSON / 文本报告
 ```
+
+工程名与二进制名仍是 `OpenGate`，主屏显示名为 `A camera`。改二进制名会影响 CI 打包路径，暂不动。
 
 ## 构建
 
@@ -59,29 +74,29 @@ xcodegen generate
   → 上传 artifact + 发布滚动 release
 ```
 
-下载地址固定为：
+下载地址固定：
 
 ```
-https://github.com/<账号>/<仓库>/releases/download/latest/OpenGate.ipa
+https://github.com/4gnyfgz2p7-ui/opengate/releases/download/latest/OpenGate.ipa
 ```
 
-公开仓库的 macOS runner 不计费；私有仓库按 10 倍分钟计，单次构建约 5–8 分钟。
+公开仓库的 macOS runner 不计费。
 
 ## 装机
 
-1. iPhone 安装 SideStore，首次配对需一台装了 Apple 设备的 Windows 电脑（一次性）。
-2. 用免费 Apple ID 签名上述 IPA。
-3. 开启「开发者模式」。
-4. 打开 App，授权相机，点「运行探测」。
-5. 点「导出 JSON 报告」，把文件发回来做判定。
+1. Windows 装 iTunes（官网 .exe 版，非 Store 版）+ Apple 设备驱动
+2. 用 [iloader](https://iloader.app)（v2.3.8+，已修复 anisette 503）登录 Apple ID 并导入 IPA
+3. 手机信任开发者证书：设置 → 通用 → VPN 与设备管理
+4. 开启开发者模式：设置 → 隐私与安全性 → 开发者模式 → 重启
+5. 打开 App，授权相机，运行探测，导出 JSON
+
+后续自动续签用 SideStore + 回环 VPN：**首次**可借电脑，日常续签纯手机。注意 SideStore 自身也是 7 天签名，超过 7 天不续会失去手机端全部自签能力，必须配快捷指令定时自动化。
 
 ## 报告怎么读
 
-每项结论三级：`通过` / `注意` / `不通过`。
+每项结论三级：`通过` / `注意` / `不通过`。关键几条：
 
-关键看两条：
-
-- `opengate-format`：不通过 → 全幅需求本身要重估，四档讨论失去意义。
-- `hevc-ceiling`：不通过且 `实际输出` 与 4224×3024 不等 → 档 2 / 档 3 不可用，退回两档 ProRes。
-
-`bayer-video` 为「注意」不致命：前端改成 10-bit YUV 仍可完成 Apple Log 2 管线，只是失去 RAW 元数据的还原余量。
+- `opengate-format`：不通过 → 全幅需求本身要重估
+- `hevc-ceiling`：不通过且实际输出与 4224×3024 不等 → 档 2 / 档 3 作废
+- `fps-24-exact`：显示 `1001/24000` → 设备把 24 改成了 23.976
+- `bayer-frame-structure`：`bytesPerRow` 不等于 6336 → 12-bit 打包方式与预期不同，解包 kernel 要改

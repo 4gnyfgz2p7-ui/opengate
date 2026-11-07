@@ -67,17 +67,41 @@ enum ReportWriter {
         lines.append("Bayer：\(report.pixelFormatProbe.bayerFormats.isEmpty ? "无" : report.pixelFormatProbe.bayerFormats.joined(separator: " "))")
         lines.append("")
 
-        lines.append("五、4:3 视频格式（按面积排序）")
-        let candidates = report.formats
-            .filter { $0.isVideoCapable && $0.is4x3 }
-            .sorted { $0.megapixels > $1.megapixels }
-        for format in candidates.prefix(20) {
-            let ranges = format.ranges.map { "\(round($0.min))-\(round($0.max))" }.joined(separator: "|")
-            lines.append("\(format.width)x\(format.height)  \(format.pixelFormat)  \(ranges) fps  防抖可关=\(format.stabilizationOffSupported)")
+        lines.append("五、Phase 2 实测")
+        if let rate = report.frameRateCheck {
+            lines.append("帧率请求：1/24 秒")
+            lines.append("实际回读：\(rate.actualValue)/\(rate.actualTimescale) = \(rate.actualSeconds) 秒 -> \(rate.setStatus)")
+            lines.append("支持范围：\(rate.rangeMin)–\(rate.rangeMax) fps")
+        } else {
+            lines.append("帧率实测：未执行")
+        }
+        if let live = report.liveCapture {
+            lines.append("收到帧数：\(live.framesReceived)，实测 \(live.measuredFPS) fps")
+            lines.append("帧间隔：\(live.intervalMinMS)–\(live.intervalMaxMS) ms（均值 \(live.intervalAvgMS)）")
+            if let structure = live.structure {
+                lines.append("帧结构：\(structure.width)x\(structure.height) \(structure.pixelFormat) 平面数 \(structure.planeCount)")
+                lines.append("bytesPerRow：\(structure.bytesPerRow)（12-bit 期望 \(structure.expectedBytesPerRowFor12Bit)，吻合 \(structure.matchesExpectedLayout)）")
+                lines.append("数据大小：\(structure.dataSizeBytes) 字节")
+            }
+            lines.append("sampleBuffer 元数据键：\(live.sampleBufferAttachmentKeys.joined(separator: ", "))")
+            lines.append("pixelBuffer 元数据键：\(live.pixelBufferAttachmentKeys.joined(separator: ", "))")
+            lines.append("格式描述扩展键：\(live.formatDescriptionExtensionKeys.joined(separator: ", "))")
+            lines.append("备注：\(live.note)")
         }
         lines.append("")
 
-        lines.append("六、环境")
+        lines.append("六、视频格式（按面积排序，前 20 项）")
+        let candidates = report.formats
+            .filter { $0.isVideoCapable }
+            .sorted { $0.megapixels > $1.megapixels }
+        for format in candidates.prefix(20) {
+            let ranges = format.ranges.map { "\(round($0.min))-\(round($0.max))" }.joined(separator: "|")
+            let shape = format.isOpenGateCandidate ? "OpenGate" : (format.is4x3 ? "4:3" : "其他")
+            lines.append("\(format.width)x\(format.height)  \(format.pixelFormat)  \(ranges) fps  \(shape)  防抖可关=\(format.stabilizationOffSupported)")
+        }
+        lines.append("")
+
+        lines.append("七、环境")
         lines.append("热状态：\(report.environment.thermalState)  低电量模式：\(report.environment.lowPowerMode)")
         let free = Double(report.environment.availableDiskBytes) / 1_073_741_824
         lines.append(String(format: "可用空间：%.1f GB", free))

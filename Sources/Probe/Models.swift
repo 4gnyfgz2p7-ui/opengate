@@ -122,8 +122,52 @@ struct ProbeReport: Codable {
     var pixelFormatProbe: PixelFormatProbe
     var encoderChecks: [EncoderCheck]
     var writerChecks: [WriterCheck]
+    var frameRateCheck: FrameRateCheck? = nil
+    var liveCapture: LiveCaptureResult? = nil
     var verdicts: [Verdict]
     var steps: [String]
+}
+
+// MARK: - Phase 2：真机实测
+
+struct FrameRateCheck: Codable {
+    var requestedSeconds: Double
+    var actualValue: Int64
+    var actualTimescale: Int32
+    var actualSeconds: Double
+    var isExact24: Bool
+    var isNTSC23976: Bool
+    var setStatus: String
+    var rangeMin: Double
+    var rangeMax: Double
+    var rangeMinDurationSeconds: Double
+}
+
+struct FrameStructure: Codable {
+    var width: Int
+    var height: Int
+    var bytesPerRow: Int
+    var planeCount: Int
+    var pixelFormat: String
+    var dataSizeBytes: Int
+    var expectedBytesPerRowFor12Bit: Int
+    var matchesExpectedLayout: Bool
+    var bayerBitDepth: Int?
+}
+
+struct LiveCaptureResult: Codable {
+    var sessionStarted: Bool
+    var framesReceived: Int
+    var captureWallSeconds: Double
+    var measuredFPS: Double
+    var intervalMinMS: Double
+    var intervalMaxMS: Double
+    var intervalAvgMS: Double
+    var structure: FrameStructure?
+    var sampleBufferAttachmentKeys: [String]
+    var pixelBufferAttachmentKeys: [String]
+    var formatDescriptionExtensionKeys: [String]
+    var note: String
 }
 
 // MARK: - 工具
@@ -153,7 +197,22 @@ enum FourCC {
 
     static func isBayer(_ code: FourCharCode) -> Bool {
         let s = string(code).lowercased()
+        // btp2 = kCVPixelFormatType_96VersatileBayerPacked12（ProRes RAW 采集格式，12-bit packed）
+        // bp16 = kCVPixelFormatType_16VersatileBayer
+        // bp64 = kCVPixelFormatType_64RGBA_DownscaledProResRAW
+        if s == "btp2" || s == "bp16" || s == "bp64" { return true }
         return s.hasSuffix("ba") || s.contains("bayer") || s.hasSuffix("b4")
+    }
+
+    static func bayerBitDepth(_ code: FourCharCode) -> Int? {
+        switch string(code).lowercased() {
+        case "btp2": return 12
+        case "bp16": return 16
+        case "14ba": return 14
+        case "12ba": return 12
+        case "10ba": return 10
+        default: return nil
+        }
     }
 
     static func is10Bit(_ code: FourCharCode) -> Bool {
