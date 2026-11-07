@@ -3,6 +3,8 @@ import SwiftUI
 @main
 struct OpenGateApp: App {
 
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     init() {
         // 必须最早安装：AVFoundation 抛的是 ObjC 异常，Swift 接不住，
         // 只有在进程终止前把原因写进文件，下次打开才有据可查。
@@ -14,6 +16,25 @@ struct OpenGateApp: App {
             RootView()
                 .preferredColorScheme(.dark)
         }
+    }
+}
+
+/// 界面方向的唯一裁决点。
+///
+/// 运行期支持的方向永远只有一个——当前拍摄方向对应的那个；
+/// Info.plist 仍声明四个方向，作为运行期可申请的超集。
+/// 没有这层锁，物理转机身会触发系统自转，与方向键的
+/// `requestGeometryUpdate` 互相打架，旋转动画被打断后
+/// 根视图 transform 卡死，整层控件横躺（实测截图里的 90° 错乱来源）。
+final class AppDelegate: NSObject, UIApplicationDelegate {
+
+    static var supportedMask: UIInterfaceOrientationMask = .portrait
+
+    func application(
+        _ application: UIApplication,
+        supportedInterfaceOrientationsFor window: UIWindow?
+    ) -> UIInterfaceOrientationMask {
+        Self.supportedMask
     }
 }
 

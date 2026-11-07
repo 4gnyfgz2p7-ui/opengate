@@ -38,21 +38,30 @@ struct RecorderView: View {
             let zones = layoutZones(size: size)
             let landscape = size.width > size.height
 
+            // 方向键按下后、窗口转过去之前的一瞬，布局分支（看窗口尺寸）
+            // 与拍摄画幅（看 degrees）必然互相矛盾——旧版截图里
+            // 「横屏里竖长条预览」正是这一瞬被定格的结果。
+            // 此时只画黑底，等窗口转到与拍摄方向一致再出界面。
+            let captureLandscape = engine.rotationDegrees == 0 || engine.rotationDegrees == 180
+            let inSync = landscape == captureLandscape
+
             // 界面跟着「拍摄方向」按钮走：按一下让窗口本身转过去，
             // 而不是把内容层转 90°（那会把取景和控件各转一次，画面压成一条）。
             ZStack(alignment: .topLeading) {
                 Color.black
 
-                previewPane(rect: zones.preview, degrees: engine.rotationDegrees)
+                if inSync {
+                    previewPane(rect: zones.preview, degrees: engine.rotationDegrees)
 
-                // 横屏：时间码与波形都在镜头那一侧的竖轨上，不压画面
-                if let lens = zones.lens {
-                    lensRail(rect: lens)
-                } else {
-                    topBarPane(rect: zones.bar, landscape: false)
+                    // 横屏：时间码与波形都在镜头那一侧的竖轨上，不压画面
+                    if let lens = zones.lens {
+                        lensRail(rect: lens)
+                    } else {
+                        topBarPane(rect: zones.bar, landscape: false)
+                    }
+
+                    controlsPane(rect: zones.controls, landscape: landscape)
                 }
-
-                controlsPane(rect: zones.controls, landscape: landscape)
             }
             .frame(width: size.width, height: size.height)
         }
@@ -94,29 +103,40 @@ struct RecorderView: View {
             .keyWindow?.safeAreaInsets ?? UIEdgeInsets(top: 59, left: 0, bottom: 34, right: 0)
     }
 
-    /// 把窗口转到与拍摄方向一致。角度即 `CaptureRotation.degrees`。
+    /// 拍摄方向 → 窗口方向。三个量必须严格同轴：
+    /// `degrees`、`AVCaptureConnection.videoRotationAngle`、窗口 interface orientation，
+    /// 即 90→portrait、0→landscapeRight、180→landscapeLeft、270→portraitUpsideDown。
+    ///
+    /// （旧映射把 180 与 270 写反：横拍 B 被塞进倒竖屏、倒置被塞进横屏，
+    /// 布局分支与画幅同时错位——「一转就乱」的主根因。）
     private func forceInterface(_ degrees: CGFloat) {
+        let mask: UIInterfaceOrientationMask
+        switch Int(degrees.rounded()) {
+        case 0:   mask = .landscapeRight
+        case 180: mask = .landscapeLeft
+        case 270: mask = .portraitUpsideDown
+        default:  mask = .portrait
+        }
+        // 先收紧支持面再申请几何：运行期支持的方向永远只有一个，
+        // 物理转机身不再触发系统自转，方向键申请的落点不会被抢走。
+        AppDelegate.supportedMask = mask
+
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let scene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
         guard let scene = scene else { return }
 
-        let mask: UIInterfaceOrientationMask
-        switch Int(degrees.rounded()) {
-        case 0:   mask = .landscapeRight
-        case 180: mask = .portraitUpsideDown
-        case 270: mask = .landscapeLeft
-        default:  mask = .portrait
-        }
         scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { _ in }
     }
 
-    /// 三块互不重叠的矩形：顶栏、取景、控件。
+    /// 三块互不重叠的矩形：顶栏（或镜头侧竖轨）、取景、控件。
     ///
-    /// 取景按**真实画幅**算尺寸（4224:3024），短边方向贴满；
+    /// 取景按**真实画幅**算尺寸（4224:3024），并且**贴着镜头侧**：
+    /// 镜头侧留 12pt（波形轨 / 顶栏），富余黑区全部留在参数侧。
     /// 黑边只出现在几何上必然出现的那一侧，控件永远落在黑区里。
     private func layoutZones(size: CGSize) -> Zones {
         let insets = windowInsets
         let margin: CGFloat = 12
+        let lensGap: CGFloat = 12
         let left = max(margin, insets.left + margin)
         let right = max(margin, insets.right + margin)
         let bottom = max(8, insets.bottom)
@@ -145,18 +165,19 @@ struct RecorderView: View {
                 height: height
             )
 
-            let innerLeft = min(lens.maxX, controls.maxX) + 10
-            let innerRight = max(lens.minX, controls.minX) - 10
-            let freeWidth = max(80, innerRight - innerLeft)
+            // 取景贴镜头侧 12pt，参数侧只留 10pt 分隔
+            let minX = lensOnLeading ? lens.maxX + lensGap : controls.maxX + 10
+            let maxX = lensOnLeading ? controls.minX - 10 : lens.minX - lensGap
+            let freeWidth = max(80, maxX - minX)
 
-            var previewHeight = height
-            var previewWidth = previewHeight * aspect
-            if previewWidth > freeWidth {
-                previewWidth = freeWidth
-                previewHeight = previewWidth / aspect
+            var previewWidth = min(height * aspect, freeWidth)
+            var previewHeight = previewWidth / aspect
+            if previewHeight > height {
+                previewHeight = height
+                previewWidth = previewHeight * aspect
             }
             let preview = CGRect(
-                x: innerLeft + (freeWidth - previewWidth) / 2,
+                x: lensOnLeading ? minX : maxX - previewWidth,
                 y: top + (height - previewHeight) / 2,
                 width: previewWidth,
                 height: previewHeight
@@ -164,14 +185,18 @@ struct RecorderView: View {
             return Zones(preview: preview, bar: .zero, controls: controls, lens: lens)
         }
 
-        let top = max(insets.top - 6, 6)
+        // ---- 竖屏：先按「镜头在顶部」算，倒置（270°）再整体垂直镜像 ----
+        // 镜头/灵动岛那一条短边永远留给顶栏（波形+状态），控件在对面。
+        let island = max(insets.top, insets.bottom)
+        let other = min(insets.top, insets.bottom)
+        let top = max(island - 6, 6)
         let barHeight: CGFloat = 44
-        let bar = CGRect(x: left, y: top, width: size.width - left - right, height: barHeight)
+        var bar = CGRect(x: left, y: top, width: size.width - left - right, height: barHeight)
 
         let controlsHeight: CGFloat = 224
-        let controls = CGRect(
+        var controls = CGRect(
             x: 0,
-            y: size.height - controlsHeight - max(0, bottom - 18),
+            y: size.height - controlsHeight - max(0, other - 18),
             width: size.width,
             height: controlsHeight
         )
@@ -187,12 +212,23 @@ struct RecorderView: View {
             width = height * aspect
         }
 
-        let preview = CGRect(
+        // 上贴镜头侧（竖拍镜头在机顶），富余黑区留在控件侧
+        var preview = CGRect(
             x: (size.width - width) / 2,
-            y: freeTop + (freeHeight - height) / 2,
+            y: freeTop,
             width: width,
             height: height
         )
+
+        // 倒置握持时镜头落到窗口底部：顶栏、控件、取景一起翻到对应侧
+        if Int(engine.rotationDegrees.rounded()) == 270 {
+            func flipY(_ r: CGRect) -> CGRect {
+                CGRect(x: r.minX, y: size.height - r.maxY, width: r.width, height: r.height)
+            }
+            bar = flipY(bar)
+            controls = flipY(controls)
+            preview = flipY(preview)
+        }
         return Zones(preview: preview, bar: bar, controls: controls, lens: nil)
     }
 

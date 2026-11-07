@@ -48,9 +48,9 @@ F:\OpenGate\
 ├─ ISSUES.md                         全量问题备忘（含画面问题，仅作背景）
 ├─ Sources\
 │  ├─ App\
-│  │  ├─ RecorderView.swift          ★ 界面主体，1033 行，本次工作的主战场
+│  │  ├─ RecorderView.swift          ★ 界面主体，1069 行，本次工作的主战场
 │  │  ├─ CameraPreviewView.swift     取景层封装 + WaveformView 波形绘制
-│  │  └─ OpenGateApp.swift           入口
+│  │  └─ OpenGateApp.swift           入口 + AppDelegate 方向锁
 │  ├─ Capture\
 │  │  ├─ CaptureController.swift     会话配置、格式选择、锁 4224×3024
 │  │  ├─ CaptureSettings.swift       QualityTier 四档定义
@@ -108,18 +108,18 @@ F:\OpenGate\
 
 | # | 现象 | 期望 | 位置 | 状态 |
 |---|---|---|---|---|
-| A1 | 横拍时只有画面转了，控件还是竖的 | 整套 UI 跟着拍摄方向一起转 | `forceInterface(_:)` + `Info.plist` 方向声明 + `UIApplicationSceneManifest` | 半修：已加场景清单与 `requestGeometryUpdate`，实测仍不对 |
-| A2 | 竖着拿手机时看到一屏**横躺**的控件 | 界面永远正着；只有取景框随画幅变形 | 曾经整层 `rotationEffect` 转过，现已删；确认没有残留 | 半修 |
-| A3 | 取景被转了两次，压成中间一条 | 只转一层 | 同上 | 半修 |
-| A4 | 按"切换方向"按钮后画面立刻变黑、无法录制 | 切方向不重建预览 UIView，会话不中断 | `previewPane` 的 `CameraPreviewView` 身份要稳定；`layoutZones` 只改 frame | 半修：已改单一 ZStack，实测仍黑 |
-| A5 | 四个方向（竖/横A/横B/倒置）表现不一致 | 四个方向都要正确，包括黑边与控件落点 | `layoutZones` 的 `landscape` 分支只区分横竖，没区分 0/180 | 待办 |
+| A1 | 横拍时只有画面转了，控件还是竖的 | 整套 UI 跟着拍摄方向一起转 | `forceInterface(_:)` + `Info.plist` 方向声明 + `UIApplicationSceneManifest` | 已改待实测：真根因 = 180/270 映射写反 + 无运行期方向锁，见 §5b |
+| A2 | 竖着拿手机时看到一屏**横躺**的控件 | 界面永远正着；只有取景框随画幅变形 | 曾经整层 `rotationEffect` 转过，现已删；确认没有残留 | 已改待实测：横躺真因是旋转打架后根视图 transform 卡死（0802 截图，EXIF=1），加方向锁后不再打架 |
+| A3 | 取景被转了两次，压成中间一条 | 只转一层 | 同上 | 已改待实测：同 A2，锁方向后两个旋转源消失 |
+| A4 | 按"切换方向"按钮后画面立刻变黑、无法录制 | 切方向不重建预览 UIView，会话不中断 | `previewPane` 的 `CameraPreviewView` 身份要稳定；`layoutZones` 只改 frame | 半修：`CameraPreviewView` 已有重新入窗再挂 session 的兜底；方向锁减少窗口抖动次数 |
+| A5 | 四个方向（竖/横A/横B/倒置）表现不一致 | 四个方向都要正确，包括黑边与控件落点 | `layoutZones` 的 `landscape` 分支只区分横竖，没区分 0/180 | 已改待实测：映射修正（180→landscapeLeft、270→portraitUpsideDown），270° 竖屏整组垂直镜像 |
 
-**A 组最重要**。用户明确说"每个方向都有问题"。建议做法：
+**A 组最重要**。用户明确说"每个方向都有问题"。0.5.14 的做法（详见 §5b）：
 
-- 不要靠 SwiftUI 的 `rotationEffect` 转内容层。让**窗口**转（`requestGeometryUpdate(.iOS(interfaceOrientations:))`），SwiftUI 自然拿到新的 `geometry.size`。
-- `Info.plist` 必须四个方向全开（含 `PortraitUpsideDown`），并有 `UIApplicationSceneManifest` 与 `UIRequiresFullScreen`。
-- 预览层要保证切方向时 `UIView` 不被销毁重建：`CameraPreviewView` 用固定 `id`，或用 `ZStack` 单一层级只改 frame（现在是这么做的，但要验证）。
-- 关键：`AVCaptureVideoPreviewLayer.connection.videoRotationAngle` 与窗口方向要**互补**，不能叠加成双重旋转。旋转后坐标里画面是竖的，`videoRotationAngle` 要补 90°。
+- 运行期支持方向恒等于拍摄方向（`AppDelegate.supportedMask`），物理旋转不再自转；
+- `degrees`、`videoRotationAngle`、窗口 interface orientation 三个量严格同轴；
+- 窗口未转到位的一瞬只画黑底（`inSync` 判断），不渲染矛盾布局；
+- 取景贴镜头侧 12pt（横拍贴轨、竖拍上贴），270° 顶栏随镜头侧落到窗口底部。
 
 ### B. 画面位置与裁剪（用户原话：「画面没1侧顶满，镜头方向空间不够」「是靠近不是紧贴」）
 
@@ -127,7 +127,7 @@ F:\OpenGate\
 |---|---|---|---|---|
 | B1 | 取景短边没顶满，两侧留黑 | 短边方向贴满，黑边只出现在几何上必然的那一侧 | `layoutZones` 里 `preview` 的计算 | 半修 |
 | B2 | 镜头侧空间不够，波形挤 | 镜头侧要留出足够宽给波形栏 | 横屏 `railWidth: 104`、`controlsWidth: min(300, w*0.30)` 需要重算 | 待办 |
-| B3 | 取景没靠近镜头侧 | 靠近但不紧贴（12–14pt） | `layoutZones` 的定位逻辑 | 半修 |
+| B3 | 取景没靠近镜头侧 | 靠近但不紧贴（12–14pt） | `layoutZones` 的定位逻辑 | 已改待实测：横拍贴轨 12pt、竖拍上贴、270° 随镜头侧 |
 | B4 | 用了 `resizeAspectFill` 裁切 | 只允许 `resizeAspect`（等比完整显示，可留黑边），不许裁切 | `CameraPreviewView` 的 `videoGravity` | 已修：`resizeAspect` |
 
 画幅比例不要写死，用 `engine.captureAspect`（真实 4224:3024 = 1.397）。
@@ -139,7 +139,30 @@ F:\OpenGate\
 | C1 | 曝光/白平衡滑块压住画面 | 滑块永远在画面外的黑区 | `layoutZones` 的 `controls` 矩形 | 半修 |
 | C2 | 顶栏压住画面顶部 | 顶栏独立成行，不与画面重叠 | `topBarPane` + `bar` 矩形 | 半修 |
 | C3 | 横屏时控件区太窄，内容挤成一列 | 横屏控件区宽度按内容需要给（320–360），不要 `w*0.30` | `layoutZones` 横屏分支 | 待办 |
-| C4 | **横屏时录制时间和波形在上面** | 放**镜头一侧的竖轨**（横拍 A 在左，横拍 B 在右） | `lensRail` | 半修：已实现，实测仍在上方 |
+| C4 | **横屏时录制时间和波形在上面** | 放**镜头一侧的竖轨**（横拍 A 在左，横拍 B 在右） | `lensRail` | 已改待实测：轨已实现，此前被 180/270 映射错乱掩盖（0801 实为倒置档），映射修正后四方向各归其位 |
+
+### 5b、0.5.14 改动（方向重做，本机模拟验证后落地）
+
+只动了 `Sources/App/OpenGateApp.swift` 与 `Sources/App/RecorderView.swift`，管线与录制未碰：
+
+1. **方向锁**：`OpenGateApp` 挂 `AppDelegate`（`UIApplicationDelegateAdaptor`），
+   `application(_:supportedInterfaceOrientationsFor:)` 恒返回 `AppDelegate.supportedMask`。
+   `forceInterface` 先写 mask 再 `requestGeometryUpdate`——运行期永远只允许当前拍摄方向，
+   物理转机身不再自转，两个旋转源打架（0802 整层横躺的根因）消除。
+2. **映射修正**（旧版 180/270 写反）：
+   `0→landscapeRight、90→portrait、180→landscapeLeft、270→portraitUpsideDown`，
+   与 `AVCaptureConnection.videoRotationAngle` 常量严格同轴，预览层无需补角。
+3. **过渡保护**：`body` 里 `inSync = (窗口横竖 == degrees 横竖)`，不同步时只画黑底，
+   不渲染矛盾布局（0801「横屏竖长条预览」的一瞬定格不再出现）。
+4. **贴镜头侧**：横拍取景贴轨 12pt、参数侧 10pt；竖拍预览上贴；
+   270° 顶栏/控件/取景整组 `flipY`（倒置握持时镜头在窗口底部，波形条跟着过去）。
+5. **本机验证**：`og-layout-sim/`（工作区）与 `layoutZones` 同构的 Python 模拟器——
+   旧逻辑复现 0801（倒置→横窗竖预览）与 180（竖窗横预览）两个故障态；
+   新逻辑 4 方向 × 待机/录制 6 场景全过：互不重叠、预览形状与窗口方向一致、
+   轨在镜头侧、贴边 12pt。模拟器复现值与实机截图实测差 <3%。
+6. 版本 0.5.13/11 → **0.5.14/12**（0.5.12/13 被中间会话占用但无落地产物）。
+7. 状态：**待装机实测**。装机后按 §8 清单逐项打勾，重点：四方向各截一张、
+   连续切两次方向画面不黑、倒置档顶栏在镜头侧。
 
 ### D. 控件设计（用户原话见 §6）
 
