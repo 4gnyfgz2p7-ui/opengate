@@ -31,74 +31,101 @@ struct RecorderView: View {
 
     var body: some View {
         GeometryReader { geometry in
-            let isLandscape = geometry.size.width > geometry.size.height
+            let physical = geometry.size
+            let physicalLandscape = physical.width > physical.height
+
+            // 采集方向已是横拍、但窗口仍竖着（这台机器上窗口不会自己转）：
+            // 把**整层内容**一起转 90°，取景与控件才不会一个横一个竖。
+            let rotateAll = engine.rotation.isLandscape && !physicalLandscape
+            let contentSize = rotateAll
+                ? CGSize(width: physical.height, height: physical.width)
+                : physical
+            let angle = rotateAll ? Double(engine.rotation.degrees) - 90 : 0
+            let contentLandscape = contentSize.width > contentSize.height
+
+            // 整层转过之后，预览层自己的方向要补回去，否则画面是歪的
+            let previewDegrees: CGFloat = rotateAll ? 90 : engine.rotationDegrees
+            // 旋转后的坐标里画面是竖的 3:4，转回去正好铺成横的 4:3
+            let aspect: CGFloat = rotateAll
+                ? 3.0 / 4.0
+                : (engine.rotation.isLandscape ? 4.0 / 3.0 : 3.0 / 4.0)
 
             ZStack {
-                Color.black.ignoresSafeArea()
+                Color.black
 
-                CameraPreviewView(
-                    session: engine.capture.session,
-                    rotationDegrees: engine.rotationDegrees
+                previewView(
+                    available: contentSize,
+                    physicalLandscape: contentLandscape,
+                    aspect: aspect,
+                    degrees: previewDegrees
                 )
-                .ignoresSafeArea()
 
-                // 上下压暗带：只为让浮层文字可读，不遮挡画面中部
-                scrims(landscape: isLandscape)
-
-                if isRecording {
-                    recordingOverlay(landscape: isLandscape)
-                } else {
-                    standbyOverlay(landscape: isLandscape, size: geometry.size)
-                }
+                controls(landscape: contentLandscape, size: contentSize)
+                    .frame(width: contentSize.width, height: contentSize.height)
             }
+            .frame(width: contentSize.width, height: contentSize.height)
+            .rotationEffect(.degrees(angle))
+            .frame(width: physical.width, height: physical.height)
         }
+        .ignoresSafeArea()
         .onAppear { engine.prepareSession() }
         .preferredColorScheme(.dark)
         .statusBarHidden(isRecording)
         .persistentSystemOverlays(.hidden)
         .sheet(isPresented: $showSettings) {
-            SettingsSheet(
-                engine: engine,
-                onShowProbe: onShowProbe
-            )
+            SettingsSheet(engine: engine, onShowProbe: onShowProbe)
         }
     }
 
-    // MARK: - 压暗带
+    // MARK: - 取景
 
-    private func scrims(landscape: Bool) -> some View {
-        VStack(spacing: 0) {
-            LinearGradient(
-                colors: [.black.opacity(0.55), .black.opacity(0.0)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .frame(height: isRecording ? 90 : 110)
-
-            Spacer(minLength: 0)
-
-            LinearGradient(
-                colors: [.black.opacity(0.0), .black.opacity(landscape ? 0.55 : 0.72)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .frame(height: landscape ? 180 : 320)
+    /// 取景画面贴向镜头模组一侧：竖持贴顶、横持贴左。
+    /// 居中会让两侧黑边对半分，参数面板反而没地方放；
+    /// 贴边之后另一侧自然形成一整块可用区域。
+    private func previewView(
+        available: CGSize,
+        physicalLandscape: Bool,
+        aspect: CGFloat,
+        degrees: CGFloat
+    ) -> some View {
+        var width = available.width
+        var height = width / aspect
+        if height > available.height {
+            height = available.height
+            width = height * aspect
         }
-        .ignoresSafeArea()
-        .allowsHitTesting(false)
+
+        return CameraPreviewView(
+            session: engine.capture.session,
+            rotationDegrees: degrees
+        )
+        .frame(width: width, height: height)
+        .frame(
+            maxWidth: .infinity,
+            maxHeight: .infinity,
+            alignment: physicalLandscape ? .leading : .top
+        )
     }
 
-    // MARK: - 待机布局
+    // MARK: - 控件层
 
-    private func standbyOverlay(landscape: Bool, size: CGSize) -> some View {
+    @ViewBuilder
+    private func controls(landscape: Bool, size: CGSize) -> some View {
+        if isRecording {
+            recordingControls(landscape: landscape)
+        } else {
+            standbyControls(landscape: landscape, size: size)
+        }
+    }
+
+    private func standbyControls(landscape: Bool, size: CGSize) -> some View {
         Group {
             if landscape {
+                // 横屏：一边塞波形，另一边放参数与录制
                 HStack(alignment: .top, spacing: 12) {
                     VStack(alignment: .leading, spacing: 10) {
                         statusChip
-                        if engine.waveformEnabled {
-                            waveform
-                        }
+                        waveform
                         Spacer(minLength: 0)
                     }
 
@@ -111,7 +138,7 @@ struct RecorderView: View {
                         WhiteBalanceStrip(whiteBalance: engine.whiteBalance, accent: accent)
                         recordBar
                     }
-                    .frame(width: min(330, size.width * 0.36))
+                    .frame(width: min(340, size.width * 0.34))
                 }
                 .padding(14)
             } else {
@@ -119,15 +146,11 @@ struct RecorderView: View {
                     HStack(alignment: .top) {
                         VStack(alignment: .leading, spacing: 8) {
                             statusChip
-                            if engine.waveformEnabled {
-                                waveform
-                            }
+                            waveform
                         }
-                        Spacer()
+                        Spacer(minLength: 0)
                         topActions
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.top, 4)
 
                     Spacer(minLength: 0)
 
@@ -143,17 +166,16 @@ struct RecorderView: View {
                         WhiteBalanceStrip(whiteBalance: engine.whiteBalance, accent: accent)
                         recordBar
                     }
-                    .padding(.horizontal, 14)
                 }
+                .padding(.horizontal, 14)
+                .padding(.top, 4)
                 .padding(.bottom, 6)
             }
         }
     }
 
-    // MARK: - 录制布局
-
     /// 录制中只保留：监看画面、时间码、曝光、停止键。
-    private func recordingOverlay(landscape: Bool) -> some View {
+    private func recordingControls(landscape: Bool) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Circle()
@@ -163,29 +185,25 @@ struct RecorderView: View {
                     .font(.system(size: 20, weight: .medium, design: .monospaced))
                     .foregroundStyle(.white)
                     .monospacedDigit()
+                Spacer(minLength: 0)
             }
+            .padding(.horizontal, 16)
             .padding(.top, 6)
 
             Spacer(minLength: 0)
 
             if landscape {
                 HStack(alignment: .bottom, spacing: 12) {
-                    if engine.waveformEnabled {
-                        waveform
-                            .frame(width: 120)
-                    }
+                    waveform
                     Spacer(minLength: 0)
                     ExposureStrip(exposure: engine.exposure, accent: accent, compact: true)
-                        .frame(width: 330)
+                        .frame(width: 340)
                 }
-                .padding(.horizontal, 14)
+                .padding(.horizontal, 16)
             } else {
                 VStack(spacing: 8) {
                     HStack {
-                        if engine.waveformEnabled {
-                            waveform
-                                .frame(width: 108)
-                        }
+                        waveform
                         Spacer(minLength: 0)
                     }
                     ExposureStrip(exposure: engine.exposure, accent: accent, compact: true)
@@ -196,6 +214,7 @@ struct RecorderView: View {
             stopBar
         }
     }
+
 
     // MARK: - 顶部元素
 
@@ -521,82 +540,35 @@ struct ExposureStrip: View {
 
 // MARK: - 白平衡条
 
-/// 单行 + 按需展开。白平衡不是每次都要动，
-/// 常驻两个滑块会把曝光条挤到看不见的地方。
+/// 一行常驻 + 手动档弹面板。
+///
+/// 白平衡不是每次都要动，常驻两个滑块会把曝光条挤走；
+/// 而"手动"是一个持续调的过程，所以放在弹出面板里：
+/// 第一次点「手动」选中它，再点一次才弹滑块，调完关闭。
 struct WhiteBalanceStrip: View {
 
     @ObservedObject var whiteBalance: WhiteBalanceController
     let accent: Color
 
-    @State private var expanded = false
-    @State private var tempDraft: Double?
-    @State private var tintDraft: Double?
-
-    private var tempSpan: Double {
-        Double(WhiteBalanceController.temperatureRange.upperBound - WhiteBalanceController.temperatureRange.lowerBound)
-    }
-
-    private var tintSpan: Double {
-        Double(WhiteBalanceController.tintRange.upperBound - WhiteBalanceController.tintRange.lowerBound)
-    }
+    @State private var showManual = false
 
     var body: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 6) {
-                Text("白平衡")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.white.opacity(0.42))
+        HStack(spacing: 6) {
+            Text("白平衡")
+                .font(.system(size: 10))
+                .foregroundStyle(.white.opacity(0.42))
 
-                ForEach(WhiteBalanceController.Mode.allCases) { mode in
-                    chip(mode)
-                }
-
-                Spacer(minLength: 0)
-
-                Text(whiteBalance.liveSummary)
-                    .font(.system(size: 9.5, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.6))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
-
-                Button {
-                    withAnimation(.easeOut(duration: 0.16)) { expanded.toggle() }
-                } label: {
-                    Image(systemName: expanded ? "chevron.down" : "chevron.up")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.45))
-                        .frame(width: 20, height: 20)
-                }
-                .buttonStyle(.plain)
+            ForEach(WhiteBalanceController.Mode.allCases) { mode in
+                chip(mode)
             }
 
-            if expanded {
-                sliderRow(
-                    title: "色温",
-                    valueText: String(format: "%.0fK", tempDraft.map { denormalizeTemp($0) } ?? whiteBalance.temperature),
-                    position: tempDraft ?? normalizedTemp,
-                    onDrag: { tempDraft = $0 },
-                    onCommit: {
-                        if let draft = tempDraft {
-                            whiteBalance.temperature = denormalizeTemp(draft)
-                            tempDraft = nil
-                        }
-                    }
-                )
+            Spacer(minLength: 0)
 
-                sliderRow(
-                    title: "色调",
-                    valueText: String(format: "%+.0f", tintDraft.map { denormalizeTint($0) } ?? whiteBalance.tint),
-                    position: tintDraft ?? normalizedTint,
-                    onDrag: { tintDraft = $0 },
-                    onCommit: {
-                        if let draft = tintDraft {
-                            whiteBalance.tint = denormalizeTint(draft)
-                            tintDraft = nil
-                        }
-                    }
-                )
-            }
+            Text(whiteBalance.liveSummary)
+                .font(.system(size: 9.5, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.6))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
@@ -604,13 +576,21 @@ struct WhiteBalanceStrip: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(Color.black.opacity(0.42))
         )
+        .sheet(isPresented: $showManual) {
+            manualSheet
+        }
     }
 
     private func chip(_ mode: WhiteBalanceController.Mode) -> some View {
         let selected = whiteBalance.mode == mode
         return Button {
-            whiteBalance.mode = mode
-            if mode != .manual { expanded = false }
+            // 已处于手动档时再点一次 → 弹出滑块
+            if mode == .manual && whiteBalance.mode == .manual {
+                showManual = true
+            } else {
+                whiteBalance.mode = mode
+                if mode == .manual { showManual = true }
+            }
         } label: {
             Text(mode.label)
                 .font(.system(size: 10.5, weight: .medium))
@@ -624,6 +604,87 @@ struct WhiteBalanceStrip: View {
         .buttonStyle(.plain)
     }
 
+    // MARK: 手动面板
+
+    private var manualSheet: some View {
+        NavigationStack {
+            VStack(spacing: 20) {
+                sliderRow(
+                    title: "色温",
+                    valueText: String(format: "%.0f K", tempDraft ?? whiteBalance.temperature),
+                    position: tempDraft.map { normalizedTemp($0) } ?? normalizedTemp(whiteBalance.temperature),
+                    onDrag: { tempDraft = denormalizeTemp($0) },
+                    onCommit: {
+                        if let draft = tempDraft {
+                            whiteBalance.temperature = draft
+                            tempDraft = nil
+                        }
+                    }
+                )
+
+                sliderRow(
+                    title: "色调",
+                    valueText: String(format: "%+.0f", tintDraft ?? whiteBalance.tint),
+                    position: tintDraft.map { normalizedTint($0) } ?? normalizedTint(whiteBalance.tint),
+                    onDrag: { tintDraft = denormalizeTint($0) },
+                    onCommit: {
+                        if let draft = tintDraft {
+                            whiteBalance.tint = draft
+                            tintDraft = nil
+                        }
+                    }
+                )
+
+                Text("按住滑块拖动，松手即生效。关闭面板后参数保持不变。")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                Spacer(minLength: 0)
+            }
+            .padding(20)
+            .background(Color.black.ignoresSafeArea())
+            .navigationTitle("白平衡 · 手动")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { showManual = false }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+        .presentationDetents([.height(300)])
+    }
+
+    @State private var tempDraft: Float?
+    @State private var tintDraft: Float?
+
+    private var tempSpan: Double {
+        Double(WhiteBalanceController.temperatureRange.upperBound - WhiteBalanceController.temperatureRange.lowerBound)
+    }
+
+    private var tintSpan: Double {
+        Double(WhiteBalanceController.tintRange.upperBound - WhiteBalanceController.tintRange.lowerBound)
+    }
+
+    private func normalizedTemp(_ value: Float) -> Double {
+        let low = Double(WhiteBalanceController.temperatureRange.lowerBound)
+        return min(max(Double(value) - low, 0), tempSpan) / tempSpan
+    }
+
+    private func normalizedTint(_ value: Float) -> Double {
+        let low = Double(WhiteBalanceController.tintRange.lowerBound)
+        return min(max(Double(value) - low, 0), tintSpan) / tintSpan
+    }
+
+    private func denormalizeTemp(_ position: Double) -> Float {
+        Float(Double(WhiteBalanceController.temperatureRange.lowerBound) + position * tempSpan)
+    }
+
+    private func denormalizeTint(_ position: Double) -> Float {
+        Float(Double(WhiteBalanceController.tintRange.lowerBound) + position * tintSpan)
+    }
+
     private func sliderRow(
         title: String,
         valueText: String,
@@ -631,11 +692,11 @@ struct WhiteBalanceStrip: View {
         onDrag: @escaping (Double) -> Void,
         onCommit: @escaping () -> Void
     ) -> some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 10) {
             Text(title)
-                .font(.system(size: 10))
-                .foregroundStyle(.white.opacity(0.42))
-                .frame(width: 30, alignment: .leading)
+                .font(.system(size: 11))
+                .foregroundStyle(.white.opacity(0.5))
+                .frame(width: 34, alignment: .leading)
 
             Slider(
                 value: Binding(get: { position }, set: { onDrag($0) }),
@@ -647,30 +708,10 @@ struct WhiteBalanceStrip: View {
             .tint(accent)
 
             Text(valueText)
-                .font(.system(size: 10, design: .monospaced))
+                .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.white.opacity(0.85))
-                .frame(width: 58, alignment: .trailing)
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
+                .frame(width: 66, alignment: .trailing)
         }
-    }
-
-    private var normalizedTemp: Double {
-        let low = Double(WhiteBalanceController.temperatureRange.lowerBound)
-        return min(max(Double(whiteBalance.temperature) - low, 0), tempSpan) / tempSpan
-    }
-
-    private var normalizedTint: Double {
-        let low = Double(WhiteBalanceController.tintRange.lowerBound)
-        return min(max(Double(whiteBalance.tint) - low, 0), tintSpan) / tintSpan
-    }
-
-    private func denormalizeTemp(_ position: Double) -> Float {
-        Float(Double(WhiteBalanceController.temperatureRange.lowerBound) + position * tempSpan)
-    }
-
-    private func denormalizeTint(_ position: Double) -> Float {
-        Float(Double(WhiteBalanceController.tintRange.lowerBound) + position * tintSpan)
     }
 }
 
