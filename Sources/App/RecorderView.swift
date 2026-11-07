@@ -99,10 +99,13 @@ struct RecorderView: View {
         aspect: CGFloat,
         degrees: CGFloat
     ) -> some View {
-        var width = available.width
+        // 靠近而非紧贴：留一圈边距，画面不顶到机身边缘，
+        // 视觉上才能看出取景框的边界在哪
+        let inset: CGFloat = 14
+        var width = max(1, available.width - inset * 2)
         var height = width / aspect
-        if height > available.height {
-            height = available.height
+        if height > available.height - inset * 2 {
+            height = max(1, available.height - inset * 2)
             width = height * aspect
         }
 
@@ -111,6 +114,7 @@ struct RecorderView: View {
             rotationDegrees: degrees
         )
         .frame(width: width, height: height)
+        .padding(inset)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: anchor)
     }
 
