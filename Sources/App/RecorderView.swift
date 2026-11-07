@@ -171,9 +171,15 @@ struct RecorderView: View {
         monitor.noteRequest(targetName, target: target, scene: scene)
         guard scene.interfaceOrientation != target else { return }
 
-        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { error in
-            Task { @MainActor in
-                RotationMonitor.shared.noteRequestResult(error.localizedDescription)
+        // 几何申请必须挪出当前的 SwiftUI 更新事务：方向键的 onChange
+        // 处在状态传播中，此刻同步调 UIKit 的窗口旋转会重入布局事务，
+        // 最后一帧（纯黑过渡帧）被冻在屏幕上——「一点横就黑、再无响应」。
+        // 挪到下一个 runloop 回合执行：事务先收尾，旋转再开始。
+        DispatchQueue.main.async {
+            scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { error in
+                Task { @MainActor in
+                    RotationMonitor.shared.noteRequestResult(error.localizedDescription)
+                }
             }
         }
     }
