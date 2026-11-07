@@ -123,13 +123,22 @@ struct WaveformView: View {
             RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .fill(Color.black.opacity(0.6))
 
-            if let image = image {
-                Image(decorative: image, scale: 1)
-                    .resizable()
-                    .interpolation(.low)
-                    .aspectRatio(contentMode: .fill)
-                    .colorMultiply(accent)
-            }
+            // 波形图本身是 48×96 的竖图，直接放进 ZStack 会按图片比例撑开
+            // （104 宽 → 208 高的长条），跑出 40pt 的框、压住状态栏和取景。
+            // 用 Color 占位、图片只做 overlay，再裁掉溢出部分。
+            Color.clear
+                .overlay(
+                    Group {
+                        if let image = image {
+                            Image(decorative: image, scale: 1)
+                                .resizable()
+                                .interpolation(.low)
+                                .aspectRatio(contentMode: .fill)
+                                .colorMultiply(accent)
+                        }
+                    }
+                )
+                .clipped()
 
             GeometryReader { geometry in
                 ForEach([0.25, 0.5, 0.75], id: \.self) { fraction in

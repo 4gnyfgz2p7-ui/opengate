@@ -62,6 +62,10 @@ final class MovieRecorder {
     private var writer: AVAssetWriter
     private var videoInput: AVAssetWriterInput
     private var audioInput: AVAssetWriterInput?
+    /// 直接追加 CVPixelBuffer 的标准通道。
+    /// 早先是自己拼 CMSampleBuffer 再 append，格式描述与时间戳都由我们构造，
+    /// 出问题时无从判断是编码器拒收还是构造错了；adaptor 是苹果的标准路径。
+    private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
 
     private let stateLock = NSLock()
     private var anchorPTS: CMTime?
@@ -157,6 +161,19 @@ final class MovieRecorder {
         videoInput = vInput
         settingsLevel = acceptedLevel
 
+        let sourceFormat = tier.isProRes
+            ? FourCC.code("x422")
+            : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: vInput,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: sourceFormat,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ]
+        )
+
         // ---- 音频输入 ----
         if withAudio {
             let aSettings = AudioSettings.writerSettings
@@ -186,10 +203,25 @@ final class MovieRecorder {
 
     // MARK: - 写入
 
+    /// 系统 ISP 通路：从 sample buffer 里取图像缓冲，再走统一入口
+    @discardableResult
+    func appendVideo(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            stateLock.lock()
+            if firstAppendFailure == nil { firstAppendFailure = "sample buffer 不含画面" }
+            stateLock.unlock()
+            return false
+        }
+        return appendImageBuffer(
+            imageBuffer,
+            presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        )
+    }
+
     /// 视频帧。时间戳按真实经过时间折算到 24 时基，既保证时基纯净，
     /// 又不累积偏差。
     @discardableResult
-    func appendVideo(_ sampleBuffer: CMSampleBuffer) -> Bool {
+    func appendImageBuffer(_ imageBuffer: CVPixelBuffer, presentationTimeStamp realPTS: CMTime) -> Bool {
         stateLock.lock()
         let alreadyFinished = finished
         stateLock.unlock()
@@ -210,8 +242,6 @@ final class MovieRecorder {
             stateLock.lock(); droppedVideoFrames += 1; stateLock.unlock()
             return false
         }
-
-        let realPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
         stateLock.lock()
         if anchorPTS == nil {
@@ -242,16 +272,14 @@ final class MovieRecorder {
 
         let targetPTS = CMTime(value: index, timescale: Self.frameTimescale)
 
-        guard let retimed = Self.retimed(
-            sampleBuffer,
-            presentationTimeStamp: targetPTS,
-            duration: CMTime(value: 1, timescale: Self.frameTimescale)
-        ) else {
-            stateLock.lock(); droppedVideoFrames += 1; stateLock.unlock()
+        guard let adaptor = adaptor else {
+            stateLock.lock()
+            if firstAppendFailure == nil { firstAppendFailure = "视频适配器未建立" }
+            stateLock.unlock()
             return false
         }
 
-        if videoInput.append(retimed) {
+        if adaptor.append(imageBuffer, withPresentationTime: targetPTS) {
             stateLock.lock()
             writtenVideoFrames += 1
             lastPTS = targetPTS

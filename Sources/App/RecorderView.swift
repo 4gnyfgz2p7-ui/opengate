@@ -193,7 +193,11 @@ struct RecorderView: View {
     /// 顶栏：档位 / 波形 / 方向 / 设置，一行放完，不压画面。
     private func topBarPane(rect: CGRect, landscape: Bool) -> some View {
         HStack(spacing: 8) {
-            statusChip
+            if isRecording {
+                recordingTimecode
+            } else {
+                statusChip
+            }
             waveform
             Spacer(minLength: 0)
             topActions
@@ -268,6 +272,22 @@ struct RecorderView: View {
     }
 
     // MARK: - 顶部元素
+
+    /// 录制中的时间码：红点 + 时:分:秒
+    private var recordingTimecode: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(Color.red)
+                .frame(width: 8, height: 8)
+            Text(Self.timecode(engine.elapsed))
+                .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(.white)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(Capsule().fill(Color.black.opacity(0.45)))
+    }
 
     private var statusChip: some View {
         Menu {
@@ -450,20 +470,6 @@ struct ExposureStrip: View {
 
     var body: some View {
         VStack(spacing: compact ? 6 : 8) {
-            // 当前实测值常驻：录制中也要能看见实际落到的 ISO 与快门，
-            // 而不是只知道滑块停在哪。
-            HStack(spacing: 10) {
-                Text(String(format: "ISO %.0f", exposure.liveISO))
-                Text(exposure.formatShutter(exposure.liveShutterSeconds))
-                if exposure.mode != .manualBoth {
-                    Text(String(format: "%+.1f EV", exposure.liveOffsetEV))
-                        .foregroundStyle(abs(exposure.liveOffsetEV) > 0.5 ? accent : Color.white.opacity(0.55))
-                }
-                Spacer(minLength: 0)
-            }
-            .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-            .foregroundStyle(.white.opacity(0.75))
-
             HStack(spacing: 6) {
                 ForEach(ExposureController.Mode.allCases) { mode in
                     modeChip(mode)
@@ -516,6 +522,18 @@ struct ExposureStrip: View {
                         }
                     }
                 )
+            }
+
+            // 全手动：两维都锁死，此时才给一个反算出来的场景 EV
+            if exposure.mode == .manualBoth, let ev = exposure.estimatedEV100 {
+                HStack(spacing: 6) {
+                    Text("EV100")
+                        .foregroundStyle(.white.opacity(0.45))
+                    Text(String(format: "%.1f", ev))
+                        .foregroundStyle(.white.opacity(0.85))
+                    Spacer(minLength: 0)
+                }
+                .font(.system(size: 10.5, weight: .medium, design: .monospaced))
             }
         }
         .padding(.horizontal, embedded ? 0 : 12)

@@ -224,12 +224,19 @@ final class RecordingEngine: ObservableObject {
 
             // 全幅格式只吐 Bayer：先 demosaic 成 10-bit YUV 再交给编码器。
             // 不做这一步 append 会被逐帧拒绝，文件停在 0 字节。
-            if let converter = converter,
-               CVPixelBufferGetPixelFormatType(imageBuffer) == BayerConverter.bayerFormat {
+            if CVPixelBufferGetPixelFormatType(imageBuffer) == BayerConverter.bayerFormat {
                 // 设备实际按 60 fps 供帧（会话启动会把帧时长改回默认），
                 // 而写入只要 24 帧/秒。逐帧 demosaic 等于白烧 2.5 倍算力，
                 // 先按 30 fps 掐一道，重复格点再交给写入端去重。
                 guard gate.passes(CMSampleBufferGetPresentationTimeStamp(buffer)) else { return }
+
+                // 没有转换器时**绝不能**把 btp2 原样交给编码器：
+                // 那正是早先“能录、但成片纯绿”的来源。宁可报错。
+                guard let converter = converter else {
+                    let reason = BayerConverter.compileNote ?? "未知原因"
+                    statsBox.markFailure("Bayer 转换器不可用：" + reason)
+                    return
+                }
 
                 guard let converted = converter.convert(
                     imageBuffer,
@@ -245,8 +252,11 @@ final class RecordingEngine: ObservableObject {
                 monitorable = converted
                 statsBox.markConverted()
                 statsBox.markDiagnostics(converter.lastDiagnostics.summary)
-                if let rebuilt = RecordingEngine.replacingImageBuffer(of: buffer, with: converted) {
-                    if recorder?.appendVideo(rebuilt) == true { statsBox.markAppended() }
+                if recorder?.appendImageBuffer(
+                    converted,
+                    presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(buffer)
+                ) == true {
+                    statsBox.markAppended()
                 }
             } else {
                 // 编码写入必须在采集队列上同步完成，不能异步延后
@@ -410,6 +420,10 @@ final class RecordingEngine: ObservableObject {
             if let device = self.capture.videoDevice {
                 self.exposure.attach(to: device)
                 self.whiteBalance.attach(to: device)
+            }
+            if self.bayerConverter == nil {
+                let reason = BayerConverter.compileNote ?? "未知原因"
+                self.pipelineNote = "Bayer 转换器不可用：" + reason
             }
             self.prepareTask = nil
 

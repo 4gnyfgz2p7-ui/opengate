@@ -386,6 +386,21 @@ final class ExposureController: ObservableObject {
     }
 
     /// 快门显示成 1/x 形式，超过 0.3 秒则显示秒
+    /// 场景曝光值（EV100），由**实际生效**的 ISO / 快门 / 光圈反算。
+    ///
+    /// 不做经验估计：EV100 = log2(N² / t) − log2(ISO / 100)，
+    /// 只依赖设备回读的真实参数，因此全手动时也有确定的值。
+    /// 早先界面上的 "+0.9 EV" 其实是 `exposureTargetOffset`，
+    /// 那是相对测光目标的偏差，不是曝光值，所以看着永远不准。
+    var estimatedEV100: Double? {
+        guard let device = device else { return nil }
+        let aperture = Double(device.lensAperture)
+        let iso = Double(liveISO > 0 ? liveISO : self.iso)
+        let shutter = liveShutterSeconds > 0 ? liveShutterSeconds : shutterSeconds
+        guard aperture > 0, iso > 0, shutter > 0 else { return nil }
+        return log2(aperture * aperture / shutter) - log2(iso / 100.0)
+    }
+
     func formatShutter(_ seconds: Double) -> String {
         guard seconds > 0, seconds.isFinite else { return "—" }
         if seconds >= 0.3 {
