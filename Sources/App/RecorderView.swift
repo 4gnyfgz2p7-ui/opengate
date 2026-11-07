@@ -16,6 +16,9 @@ struct RecorderView: View {
 
     @StateObject private var engine = RecordingEngine()
     @State private var showSettings = false
+    /// 几何申请迟迟不生效时的放行开关：宁可有瑕疵的界面，不留死黑屏
+    @State private var forceShow = false
+    @State private var escapeTask: Task<Void, Never>?
     @Environment(\.scenePhase) private var scenePhase
 
     var onShowProbe: () -> Void
@@ -41,9 +44,10 @@ struct RecorderView: View {
             // 方向键按下后、窗口转过去之前的一瞬，布局分支（看窗口尺寸）
             // 与拍摄画幅（看 degrees）必然互相矛盾——旧版截图里
             // 「横屏里竖长条预览」正是这一瞬被定格的结果。
-            // 此时只画黑底，等窗口转到与拍摄方向一致再出界面。
+            // 此时只画黑底，等窗口转到与拍摄方向一致再出界面；
+            // 若几何申请迟迟不生效（forceShow 放行），黑屏有上限，不会卡死。
             let captureLandscape = engine.rotationDegrees == 0 || engine.rotationDegrees == 180
-            let inSync = landscape == captureLandscape
+            let inSync = forceShow || landscape == captureLandscape
 
             // 界面跟着「拍摄方向」按钮走：按一下让窗口本身转过去，
             // 而不是把内容层转 90°（那会把取景和控件各转一次，画面压成一条）。
@@ -64,6 +68,16 @@ struct RecorderView: View {
                 }
             }
             .frame(width: size.width, height: size.height)
+            .onChange(of: size, initial: true) { _, newSize in
+                // 旋转链路监测：窗口尺寸/安全区/方向，含实际像素分辨率
+                let scene = foregroundScene
+                RotationMonitor.shared.noteWindow(
+                    size: newSize,
+                    insets: windowInsets,
+                    scale: scene?.screen.scale ?? 3,
+                    orientationName: scene.map { orientationName($0.interfaceOrientation) } ?? "未知"
+                )
+            }
         }
         .ignoresSafeArea()
         .onAppear {
@@ -103,6 +117,31 @@ struct RecorderView: View {
             .keyWindow?.safeAreaInsets ?? UIEdgeInsets(top: 59, left: 0, bottom: 34, right: 0)
     }
 
+    /// 前台 scene（监测与几何申请共用）
+    private var foregroundScene: UIWindowScene? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        return scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+    }
+
+    private func orientationTarget(_ degrees: CGFloat) -> UIInterfaceOrientation {
+        switch Int(degrees.rounded()) {
+        case 0: return .landscapeRight
+        case 180: return .landscapeLeft
+        case 270: return .portraitUpsideDown
+        default: return .portrait
+        }
+    }
+
+    private func orientationName(_ orientation: UIInterfaceOrientation) -> String {
+        switch orientation {
+        case .portrait: return "竖"
+        case .portraitUpsideDown: return "倒竖"
+        case .landscapeLeft: return "横左"
+        case .landscapeRight: return "横右"
+        default: return "未知"
+        }
+    }
+
     /// 拍摄方向 → 窗口方向。三个量必须严格同轴：
     /// `degrees`、`AVCaptureConnection.videoRotationAngle`、窗口 interface orientation，
     /// 即 90→portrait、0→landscapeRight、180→landscapeLeft、270→portraitUpsideDown。
@@ -110,22 +149,57 @@ struct RecorderView: View {
     /// （旧映射把 180 与 270 写反：横拍 B 被塞进倒竖屏、倒置被塞进横屏，
     /// 布局分支与画幅同时错位——「一转就乱」的主根因。）
     private func forceInterface(_ degrees: CGFloat) {
+        let monitor = RotationMonitor.shared
         let mask: UIInterfaceOrientationMask
+        let targetName: String
         switch Int(degrees.rounded()) {
-        case 0:   mask = .landscapeRight
-        case 180: mask = .landscapeLeft
-        case 270: mask = .portraitUpsideDown
-        default:  mask = .portrait
+        case 0:   mask = .landscapeRight;      targetName = "landscapeRight(横拍A)"
+        case 180: mask = .landscapeLeft;       targetName = "landscapeLeft(横拍B)"
+        case 270: mask = .portraitUpsideDown;  targetName = "portraitUpsideDown(倒置)"
+        default:  mask = .portrait;            targetName = "portrait(竖拍)"
         }
         // 先收紧支持面再申请几何：运行期支持的方向永远只有一个，
         // 物理转机身不再触发系统自转，方向键申请的落点不会被抢走。
         AppDelegate.supportedMask = mask
+        monitor.note("锁定支持面 \(targetName)")
 
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        let scene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
-        guard let scene = scene else { return }
+        guard let scene = foregroundScene else {
+            monitor.note("没有可用的前台 scene，几何申请未发出")
+            return
+        }
+        let target = orientationTarget(degrees)
+        monitor.noteRequest(targetName, target: target, scene: scene)
+        guard scene.interfaceOrientation != target else { return }
 
-        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { _ in }
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { error in
+            Task { @MainActor in
+                RotationMonitor.shared.noteRequestResult(error?.localizedDescription)
+            }
+        }
+    }
+
+    /// 黑屏逃生门：申请发出 2.5 s 窗口仍未跟上就补发一次；再 1.2 s 仍不齐就放行界面。
+    /// 黑屏必须有上限——「整体显示错乱」远好过「看似死机」。
+    private func scheduleEscape(_ degrees: CGFloat) {
+        escapeTask?.cancel()
+        escapeTask = Task {
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            guard !Task.isCancelled else { return }
+            guard escapeNeeded(degrees) else { return }
+            forceInterface(degrees)
+
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            guard !Task.isCancelled else { return }
+            if escapeNeeded(degrees) {
+                forceShow = true
+                RotationMonitor.shared.noteEscape(after: 3.7)
+            }
+        }
+    }
+
+    private func escapeNeeded(_ degrees: CGFloat) -> Bool {
+        guard let scene = foregroundScene else { return false }
+        return scene.interfaceOrientation != orientationTarget(degrees)
     }
 
     /// 三块互不重叠的矩形：顶栏（或镜头侧竖轨）、取景、控件。
@@ -412,7 +486,18 @@ struct RecorderView: View {
     private var topActions: some View {
         HStack(spacing: 8) {
             Button {
+                let from = engine.rotationDegrees
                 engine.rotation.cycle()
+                let to = engine.rotationDegrees
+                // 黑屏/无响应的证据链从这里开始：按键瞬间 + 会话状态
+                RotationMonitor.shared.notePress(
+                    from: from,
+                    to: to,
+                    sessionReady: engine.sessionReady,
+                    sessionRunning: engine.capture.isRunning
+                )
+                forceShow = false
+                scheduleEscape(to)
             } label: {
                 Text(engine.rotation.shortLabel)
                     .font(.system(size: 10.5, weight: .semibold))
@@ -880,6 +965,7 @@ struct SettingsSheet: View {
 
     @ObservedObject var engine: RecordingEngine
     var onShowProbe: () -> Void
+    @ObservedObject private var monitor = RotationMonitor.shared
 
     @Environment(\.dismiss) private var dismiss
     private let accent = Color(red: 0.42, green: 0.85, blue: 0.82)
@@ -892,6 +978,7 @@ struct SettingsSheet: View {
                     tierSection
                     storageSection
                     displaySection
+                    rotationSection
                     historySection
                 }
                 .padding(18)
@@ -1000,6 +1087,45 @@ struct SettingsSheet: View {
                 }
             }
             .buttonStyle(.plain)
+        }
+    }
+
+    /// 旋转链路时间线：黑屏/无响应的证据，一键分享。
+    private var rotationSection: some View {
+        section("方向监测") {
+            if let pending = monitor.pendingElapsed, pending < 10 {
+                Text("几何申请已发出 \(String(format: "%.1f", pending)) s，窗口未跟上")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.orange)
+            }
+
+            ForEach(Array(monitor.events.reversed().prefix(14))) { event in
+                HStack(alignment: .top, spacing: 8) {
+                    Text(String(format: "%7.1f", event.t))
+                        .font(.system(size: 9.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Text(event.text)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(event.text.hasPrefix("──") ? Color.white.opacity(0.95) : Color.white.opacity(0.72))
+                }
+            }
+
+            HStack(spacing: 12) {
+                ShareLink(item: monitor.logURL) {
+                    Text("导出日志")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.white)
+                }
+                Button {
+                    UIPasteboard.general.string = monitor.logText
+                } label: {
+                    Text("复制")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(accent)
+                }
+                .buttonStyle(.plain)
+                Spacer(minLength: 0)
+            }
         }
     }
 

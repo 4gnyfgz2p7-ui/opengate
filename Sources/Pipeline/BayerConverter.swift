@@ -48,6 +48,8 @@ final class BayerConverter {
         var rawHead = "—"
         /// 按当前解包方式读出的第一行前 16 个像素值
         var firstPixels = "—"
+        /// 源的每行字节数。像素排法全靠它和宽度相除得出，必须留档。
+        var sourceRowBytes = 0
         var calibration = ""
 
         var maxChannel: UInt8 { outMax.max() ?? 0 }
@@ -67,6 +69,7 @@ final class BayerConverter {
             [
                 "gpu=\(kernelRan ? 1 : 0)",
                 "size=\(kernelWidth)x\(kernelHeight)",
+                "row=\(sourceRowBytes)",
                 "rgb_min=\(outMin[0]),\(outMin[1]),\(outMin[2])",
                 "rgb_max=\(outMax[0]),\(outMax[1]),\(outMax[2])",
                 "rgb_mean=\(outMean[0]),\(outMean[1]),\(outMean[2])",
@@ -203,20 +206,9 @@ final class BayerConverter {
             headText += String(format: "%02x", headPointer[index])
         }
 
-        // 按当前解包方式读第一行前 16 个像素：这串数字能直接看出解包对不对
-        // （正确解法的相邻样本应在同一量级；错了会看到 10 倍以上的交替）
+        // 第一行前 16 个像素留到标定之后再读：那时才知道该用哪种排法，
+        // 用错排法读出来的数字没有诊断价值。
         var pixelText = ""
-        let rowPointer = headPointer
-        for x in 0..<min(16, width) {
-            let group = x >> 3
-            let k = x & 7
-            let offset = group * 12
-            guard offset + 11 < sourceRowBytes else { break }
-            let hi = Int(rowPointer[offset + k])
-            let loByte = Int(rowPointer[offset + 8 + (k >> 1)])
-            let nib = (k & 1) == 0 ? (loByte >> 4) : (loByte & 0x0F)
-            pixelText += (x == 0 ? "" : ",") + String((hi << 4) | nib)
-        }
 
         if sourceBuffer == nil || sourceCapacity < sourceLength {
             guard let allocated = device.makeBuffer(length: sourceLength, options: .storageModeShared) else {
@@ -252,6 +244,15 @@ final class BayerConverter {
 
         memcpy(bayerBuffer.contents(), sourceBase, sourceLength)
 
+        // 用标定选中的排法读第一行前 16 个像素：这串数字直接反映解包对不对
+        //（正确排法下相邻值应在同一量级；错了会看到 10 倍以上的交替）
+        let activeMode = Int(calibration?.unpackMode ?? 0)
+        let headRow = headPointer
+        for x in 0..<min(16, width) {
+            let sample = BayerCalibration.unpack(headRow, x, mode: activeMode)
+            pixelText += (x == 0 ? "" : ",") + String(Int(sample))
+        }
+
         // ---- 参数：扁平 uint32，下标即协议 ----
         let floats = [parameters.blackLevel, parameters.whiteLevel,
                       parameters.redGain, parameters.greenGain, parameters.blueGain]
@@ -264,6 +265,7 @@ final class BayerConverter {
             slots[4 + index] = value.bitPattern
         }
         slots[9] = UInt32(bitPattern: calibration?.pattern ?? parameters.pattern)
+        slots[10] = UInt32(bitPattern: calibration?.unpackMode ?? 0)
         slots.withUnsafeBytes { memcpy(paramsBuffer.contents(), $0.baseAddress, 44) }
         memset(probeBuffer.contents(), 0, 32)
 
@@ -318,6 +320,7 @@ final class BayerConverter {
         diagnostics.rawRange = calibration?.rawRangeText ?? "—"
         diagnostics.rawHead = headText
         diagnostics.firstPixels = pixelText
+        diagnostics.sourceRowBytes = sourceRowBytes
 
         // ---- 从**最终像素缓冲**上读回来：这一步是唯一可信的验收 ----
         CVPixelBufferLockBaseAddress(output, .readOnly)
@@ -430,23 +433,60 @@ final class BayerConverter {
         return v < lo ? lo : (v > hi ? hi : v);
     }
 
-    // btp2 的命名是 96VersatileBayerPacked12：**96 是每像素位数**，
-    // 96 / 12 = 8，即「每 8 个像素打包成 12 字节」。
+    // btp2 的字节排列没有公开文档。唯一确定的是 bytesPerRow = 4224 × 1.5，
+    // 即每像素 1.5 字节；这 12 位由哪几个字节拼成有九种讲得通的排法，
+    // 尺寸验算全都成立，只有真数据上的统计性质能分辨。
     //
-    //   字节 0..7 ：8 个像素各自的高 8 位
-    //   字节 8..11：8 个像素的低 4 位，每字节装两个（前一个在高半字节）
-    //
-    // 之前按「2 像素 3 字节」解，每像素也是 1.5 字节、bytesPerRow 一样是 6336，
-    // 所以尺寸验算一路都对，但像素顺序全错：解出来相邻样本差 11.6 倍
-    //（正确解法的绿/红比只有 1.95），成片出现 2 像素周期的条纹，颜色自然怪异。
-    inline ushort ac_raw12(const device uchar* base, uint rowBytes, int x, int y) {
-        int group = x >> 3;
-        int k = x & 7;
-        const device uchar* blk = base + uint(y) * rowBytes + uint(group) * 12u;
-        uint hi = uint(blk[k]);
-        uint loByte = uint(blk[8 + (k >> 1)]);
-        uint nib = ((k & 1) == 0) ? (loByte >> 4) : (loByte & 0x0Fu);
-        return ushort((hi << 4) | nib);
+    // 排法由 CPU 侧标定后通过 p[10] 传进来（见 BayerCalibration.unpack），
+    // 这里逐分支复刻同样的规则，保证两边算出同一个数。
+    inline ushort ac_raw12(const device uchar* base, uint rowBytes, int x, int y, int mode) {
+        const device uchar* row = base + uint(y) * rowBytes;
+
+        if (mode == 0) {
+            int g = x >> 3, k = x & 7;
+            const device uchar* blk = row + uint(g) * 12u;
+            uint lo = uint(blk[8 + (k >> 1)]);
+            uint nib = ((k & 1) == 0) ? (lo >> 4) : (lo & 0x0Fu);
+            return ushort((uint(blk[k]) << 4) | nib);
+        }
+        if (mode == 1) {
+            int g = x >> 3, k = x & 7;
+            const device uchar* blk = row + uint(g) * 12u;
+            uint lo = uint(blk[8 + (k >> 1)]);
+            uint nib = ((k & 1) == 0) ? (lo & 0x0Fu) : (lo >> 4);
+            return ushort((uint(blk[k]) << 4) | nib);
+        }
+        if (mode == 2 || mode == 3 || mode == 4 || mode == 5) {
+            int g = x >> 1;
+            const device uchar* blk = row + uint(g) * 3u;
+            uint b0 = uint(blk[0]), b1 = uint(blk[1]), b2 = uint(blk[2]);
+            bool even = (x & 1) == 0;
+            if (mode == 2) { return ushort(even ? ((b0 << 4) | (b1 >> 4)) : (((b1 & 0x0Fu) << 8) | b2)); }
+            if (mode == 3) { return ushort(even ? ((b0 << 4) | (b2 >> 4)) : (((b2 & 0x0Fu) << 8) | b1)); }
+            if (mode == 4) { return ushort(even ? (b0 | ((b1 & 0x0Fu) << 8)) : ((b1 >> 4) | (b2 << 4))); }
+            return ushort(even ? (b0 | ((b2 & 0x0Fu) << 8)) : ((b2 >> 4) | (b1 << 4)));
+        }
+        if (mode == 6) {
+            int g = x >> 2, k = x & 3;
+            const device uchar* blk = row + uint(g) * 6u;
+            uint lo = uint(blk[4 + (k >> 1)]);
+            uint nib = ((k & 1) == 0) ? (lo >> 4) : (lo & 0x0Fu);
+            return ushort((uint(blk[k]) << 4) | nib);
+        }
+        if (mode == 7) {
+            int g = x >> 2, k = x & 3;
+            const device uchar* blk = row + uint(g) * 6u;
+            uint lo = uint(blk[k >> 1]);
+            uint nib = ((k & 1) == 0) ? (lo >> 4) : (lo & 0x0Fu);
+            return ushort((uint(blk[2 + k]) << 4) | nib);
+        }
+        {
+            int g = x >> 3, k = x & 7;
+            const device uchar* blk = row + uint(g) * 12u;
+            uint lo = uint(blk[k >> 1]);
+            uint nib = ((k & 1) == 0) ? (lo >> 4) : (lo & 0x0Fu);
+            return ushort((uint(blk[4 + k]) << 4) | nib);
+        }
     }
 
     inline float ac_rec709(float v) {
@@ -471,22 +511,22 @@ final class BayerConverter {
 
     /// 双线性 demosaic → 扣黑 → 白平衡 → REC.709 传递函数。返回 0..1 的 RGB。
     inline float3 ac_pixel(const device uchar* src, uint rowBytes, int w, int h,
-                           int x, int y, int pattern,
+                           int x, int y, int pattern, int mode,
                            float black, float invRange, float3 gains) {
         int xm = ac_clamp(x - 1, 0, w - 1);
         int xp = ac_clamp(x + 1, 0, w - 1);
         int ym = ac_clamp(y - 1, 0, h - 1);
         int yp = ac_clamp(y + 1, 0, h - 1);
 
-        float c  = float(ac_raw12(src, rowBytes, x,  y));
-        float l  = float(ac_raw12(src, rowBytes, xm, y));
-        float r  = float(ac_raw12(src, rowBytes, xp, y));
-        float u  = float(ac_raw12(src, rowBytes, x,  ym));
-        float d  = float(ac_raw12(src, rowBytes, x,  yp));
-        float ul = float(ac_raw12(src, rowBytes, xm, ym));
-        float ur = float(ac_raw12(src, rowBytes, xp, ym));
-        float dl = float(ac_raw12(src, rowBytes, xm, yp));
-        float dr = float(ac_raw12(src, rowBytes, xp, yp));
+        float c  = float(ac_raw12(src, rowBytes, x,  y,  mode));
+        float l  = float(ac_raw12(src, rowBytes, xm, y,  mode));
+        float r  = float(ac_raw12(src, rowBytes, xp, y,  mode));
+        float u  = float(ac_raw12(src, rowBytes, x,  ym, mode));
+        float d  = float(ac_raw12(src, rowBytes, x,  yp, mode));
+        float ul = float(ac_raw12(src, rowBytes, xm, ym, mode));
+        float ur = float(ac_raw12(src, rowBytes, xp, ym, mode));
+        float dl = float(ac_raw12(src, rowBytes, xm, yp, mode));
+        float dr = float(ac_raw12(src, rowBytes, xp, yp, mode));
 
         int phase = (x & 1) | ((y & 1) << 1);
         int color = ac_color_at(pattern, phase);
@@ -533,6 +573,7 @@ final class BayerConverter {
         float white = as_type<float>(p[5]);
         float3 gains = float3(as_type<float>(p[6]), as_type<float>(p[7]), as_type<float>(p[8]));
         int pattern = int(p[9]);
+        int mode = int(p[10]);
 
         int x0 = int(gid.x) * 2;
         int y0 = int(gid.y) * 2;
@@ -542,10 +583,10 @@ final class BayerConverter {
         int x1 = min(x0 + 1, int(w) - 1);
         int y1 = min(y0 + 1, int(h) - 1);
 
-        float3 e0 = ac_pixel(src, rowBytes, int(w), int(h), x0, y0, pattern, black, invRange, gains);
-        float3 e1 = ac_pixel(src, rowBytes, int(w), int(h), x1, y0, pattern, black, invRange, gains);
-        float3 e2 = ac_pixel(src, rowBytes, int(w), int(h), x0, y1, pattern, black, invRange, gains);
-        float3 e3 = ac_pixel(src, rowBytes, int(w), int(h), x1, y1, pattern, black, invRange, gains);
+        float3 e0 = ac_pixel(src, rowBytes, int(w), int(h), x0, y0, pattern, mode, black, invRange, gains);
+        float3 e1 = ac_pixel(src, rowBytes, int(w), int(h), x1, y0, pattern, mode, black, invRange, gains);
+        float3 e2 = ac_pixel(src, rowBytes, int(w), int(h), x0, y1, pattern, mode, black, invRange, gains);
+        float3 e3 = ac_pixel(src, rowBytes, int(w), int(h), x1, y1, pattern, mode, black, invRange, gains);
 
         if (gid.x == 0u && gid.y == 0u) {
             probe[0] = 1u;

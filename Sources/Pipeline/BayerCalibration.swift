@@ -3,26 +3,25 @@ import CoreVideo
 
 /// Bayer 解包方式与相位的自动标定。
 ///
-/// 12-bit 打包有三种常见排法，外观完全一样（都是两像素三字节），
-/// 只有把样本取出来才看得出区别：
+/// `btp2` 的字节排列 Apple 没有公开文档，只能靠数据本身的统计性质反推。
+/// 硬事实只有一条：`bytesPerRow = 6336 = 4224 × 1.5`，即**每像素 1.5 字节**。
+/// 1.5 字节/像素可以有很多种切法，外观尺寸完全相同，只有把样本取出来才分得清。
 ///
-///   A：p0 = (b0 << 4) | (b1 >> 4)      p1 = ((b1 & 0x0F) << 8) | b2
-///   B：p0 = b0 | ((b1 & 0x0F) << 8)    p1 = (b1 >> 4) | (b2 << 4)
-///   C：p0 = ((b0 & 0xF0) << 4) | b1    p1 = ((b0 & 0x0F) << 8) | b2
+/// 所以这里不做假设，直接把候选排法全列出来，**在真实帧上逐种打分**：
 ///
-/// 取错了不会报错，只会得到一张"浮雕"般的图：每个像素都变成相邻像素之差。
+/// 判据是 Bayer 阵列的物理性质——(x, y) 与 (x+2, y)、(x, y+2) 落在同色滤光片下，
+/// 它们的值必须高度接近；(x+1, y)、(x, y+1) 是异色，天然差得远。
+/// 于是「同色差 / 异色差」这个比值在正确排法下明显小于 1，错排下逼近或超过 1。
+/// 这个判据不需要知道黑电平、白平衡和相位，因此不受它们出错的影响。
 ///
-/// 判据在 PC 上用合成数据验过，不是猜的：
-/// - **排法**看「同色相邻样本的平均差」。正确排法下同一颜色位置相隔 2 像素的样本
-///   是平滑的；实测（打包 A）A=0.0004、B=0.0018、C=0.0103，分离度 4–25 倍。
-/// - **相位**看「一格里两个绿点的差」。正确相位下两绿点高度相关（0.0006），
-///   错相位把 R、B 当成绿点（0.20），差两个数量级。
-/// - **R/B 谁在前**看白平衡后的中立性：设备给的增益本来就是中和现场用的，
-///   套错方向会明显偏离（实测 0.40 对 0.94）。
+/// 相位另用「一格里两个绿点之差」判定：正确相位下两绿点同色，差极小。
 final class BayerCalibration {
 
+    /// 候选排法数量
+    static let candidateCount = 9
+
     struct Outcome {
-        /// 0 = A，1 = B，2 = C
+        /// 选中的排法下标，与 `unpack(mode:)` 和着色器里的分支一一对应
         var unpackMode: Int32 = 0
         /// 0=RGGB 1=BGGR 2=GRBG 3=GBRG
         var pattern: Int32 = 0
@@ -35,27 +34,27 @@ final class BayerCalibration {
         var neutrality: Float = 0
         /// 原始样本的 min-max/mean（**未扣黑电平**），用来看黑白电平参数是否合理
         var rawRangeText: String = "—"
-        /// 三种解包排法各自的同色梯度，诊断用（若 Apple 不是标准打包，这里会露出来）
-        var modeGradients: [String] = []
+        /// 各候选排法的「同色/异色」比值，诊断用：数值最小者即最可能的正确排法
+        var modeRatios: [Double] = []
         /// 标定算出的相位
         var calibratedPattern: Int32 = 0
         /// 设备通过 ProRAW 附件给出的相位
         var devicePattern: Int32 = 0
 
         var summary: String {
-            let modes = ["A", "B", "C"]
             let patterns = ["RGGB", "BGGR", "GRBG", "GBRG"]
-            let modeName = modes[Int(max(0, min(2, unpackMode)))]
             let patternName = patterns[Int(max(0, min(3, pattern)))]
             let calibrated = patterns[Int(max(0, min(3, calibratedPattern)))]
             let device = patterns[Int(max(0, min(3, devicePattern)))]
-            var text = modeName + "·" + patternName
+            var text = "m\(unpackMode)·" + patternName
             text += "·" + String(format: "%.3f", gradient)
             if calibrated != patternName || device != patternName {
                 text += "·标定" + calibrated + "/设备" + device
             }
-            if modeGradients.count == 3 {
-                text += "·g" + modeGradients.joined(separator: "/")
+            if !modeRatios.isEmpty {
+                // 九种排法的比值，两位小数够看：最小那个就是被判为正确的排法
+                let list = modeRatios.map { String(format: "%.2f", min($0, 9.99)) }
+                text += "·r" + list.joined(separator: "/")
             }
             return text
         }
@@ -69,22 +68,90 @@ final class BayerCalibration {
         [1, 2, 0, 1],   // GBRG
     ]
 
-    /// btp2 的解包：每 8 个像素 12 字节，前 8 字节是高 8 位，后 4 字节是低 4 位。
-    private static func unpack(
-        _ base: UnsafeMutableRawPointer,
-        _ rowBytes: Int,
+    // MARK: - 九种候选排法
+
+    /// 从行首指针按 `mode` 取第 x 个像素的 12 位样本。
+    ///
+    /// 所有排法都建立在「每像素 1.5 字节」上，区别只在于这 12 位由哪几个字节拼成。
+    /// 0/1：8 像素 12 字节，前 8 字节是各像素高 8 位，后 4 字节是低 4 位
+    /// 2–5：2 像素 3 字节（MIPI RAW12 的几种常见位序）
+    /// 6/7：4 像素 6 字节
+    /// 8：8 像素 12 字节，但**低 4 位字节在前**
+    @inline(__always)
+    static func unpack(
+        _ row: UnsafePointer<UInt8>,
         _ x: Int,
-        _ y: Int
+        mode: Int
     ) -> Double {
-        let group = x >> 3
-        let k = x & 7
-        let block = base.advanced(by: y * rowBytes + group * 12)
-            .assumingMemoryBound(to: UInt8.self)
-        let hi = Double(block[k])
-        let loByte = Double(block[8 + (k >> 1)])
-        let nib = (k & 1) == 0 ? floor(loByte / 16) : (loByte - floor(loByte / 16) * 16)
-        return hi * 16 + nib
+        switch mode {
+
+        case 0:     // 8px/12B，偶像素取低半字节的高位
+            let g = x >> 3
+            let k = x & 7
+            let blk = row + g * 12
+            let lo = UInt32(blk[8 + (k >> 1)])
+            let nib = (k & 1) == 0 ? (lo >> 4) : (lo & 0x0F)
+            return Double((UInt32(blk[k]) << 4) | nib)
+
+        case 1:     // 同 0，偶像素取低半字节
+            let g = x >> 3
+            let k = x & 7
+            let blk = row + g * 12
+            let lo = UInt32(blk[8 + (k >> 1)])
+            let nib = (k & 1) == 0 ? (lo & 0x0F) : (lo >> 4)
+            return Double((UInt32(blk[k]) << 4) | nib)
+
+        case 2:     // 2px/3B：p0 = b0<<4 | b1>>4，p1 = (b1&0xF)<<8 | b2
+            let g = x >> 1
+            let blk = row + g * 3
+            let b0 = UInt32(blk[0]), b1 = UInt32(blk[1]), b2 = UInt32(blk[2])
+            return Double((x & 1) == 0 ? ((b0 << 4) | (b1 >> 4)) : (((b1 & 0x0F) << 8) | b2))
+
+        case 3:     // 2px/3B：p0 = b0<<4 | b2>>4，p1 = (b2&0xF)<<8 | b1
+            let g = x >> 1
+            let blk = row + g * 3
+            let b0 = UInt32(blk[0]), b1 = UInt32(blk[1]), b2 = UInt32(blk[2])
+            return Double((x & 1) == 0 ? ((b0 << 4) | (b2 >> 4)) : (((b2 & 0x0F) << 8) | b1))
+
+        case 4:     // 2px/3B 小端：p0 = b0 | (b1&0xF)<<8，p1 = b1>>4 | b2<<4
+            let g = x >> 1
+            let blk = row + g * 3
+            let b0 = UInt32(blk[0]), b1 = UInt32(blk[1]), b2 = UInt32(blk[2])
+            return Double((x & 1) == 0 ? (b0 | ((b1 & 0x0F) << 8)) : ((b1 >> 4) | (b2 << 4)))
+
+        case 5:     // 2px/3B 小端变体：p0 = b0 | (b2&0xF)<<8，p1 = b2>>4 | b1<<4
+            let g = x >> 1
+            let blk = row + g * 3
+            let b0 = UInt32(blk[0]), b1 = UInt32(blk[1]), b2 = UInt32(blk[2])
+            return Double((x & 1) == 0 ? (b0 | ((b2 & 0x0F) << 8)) : ((b2 >> 4) | (b1 << 4)))
+
+        case 6:     // 4px/6B：前 4 字节高 8 位，后 2 字节低 4 位
+            let g = x >> 2
+            let k = x & 3
+            let blk = row + g * 6
+            let lo = UInt32(blk[4 + (k >> 1)])
+            let nib = (k & 1) == 0 ? (lo >> 4) : (lo & 0x0F)
+            return Double((UInt32(blk[k]) << 4) | nib)
+
+        case 7:     // 4px/6B：前 2 字节低 4 位，后 4 字节高 8 位
+            let g = x >> 2
+            let k = x & 3
+            let blk = row + g * 6
+            let lo = UInt32(blk[k >> 1])
+            let nib = (k & 1) == 0 ? (lo >> 4) : (lo & 0x0F)
+            return Double((UInt32(blk[2 + k]) << 4) | nib)
+
+        default:    // 8：8px/12B，低 4 位字节在前
+            let g = x >> 3
+            let k = x & 7
+            let blk = row + g * 12
+            let lo = UInt32(blk[k >> 1])
+            let nib = (k & 1) == 0 ? (lo >> 4) : (lo & 0x0F)
+            return Double((UInt32(blk[4 + k]) << 4) | nib)
+        }
     }
+
+    // MARK: - 标定
 
     static func run(
         base: UnsafeMutableRawPointer,
@@ -101,59 +168,65 @@ final class BayerCalibration {
         let step = 24
         let invRange = 1.0 / Double(max(white - black, 1))
         let blackValue = Double(black)
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
 
+        @inline(__always)
         func value(_ mode: Int, _ x: Int, _ y: Int) -> Double {
-            max(0.0, (unpack(base, rowBytes, x, y) - blackValue) * invRange)
+            let row = bytes.advanced(by: y * rowBytes)
+            return max(0.0, (unpack(row, x, mode: mode) - blackValue) * invRange)
         }
 
         // ---- 第一关：排法 ----
-        var gradients = [Double](repeating: .greatestFiniteMagnitude, count: 3)
-        var zeroFractions = [Double](repeating: 1, count: 3)
+        //
+        // 采样点只取偶数坐标，且从 step 起步：y = 0 行贴着传感器边缘，
+        // 前几个像素可能是无效区（实测那一段会出现 3000 以上的孤立值），
+        // 拿它当判据会误导。
+        var sameDiff = [Double](repeating: 0, count: candidateCount)
+        var crossDiff = [Double](repeating: 0, count: candidateCount)
+        var sampleCount = 0.0
 
-        for mode in 0..<3 {
-            var total = 0.0
-            var samples = 0.0
-            var zeros = 0.0
-            var y = 0
-            while y + 4 < height {
-                var x = 0
-                while x + 4 < width {
-                    let a = value(mode, x, y)
-                    let b = value(mode, x + 2, y)
-                    let c = value(mode, x, y + 2)
-                    let d = value(mode, x, y + 4)
-                    total += abs(a - b) + abs(a - c) + abs(b - d)
-                    samples += 3
-                    if a == 0 { zeros += 1 }
-                    x += step
+        var sampleY = step
+        while sampleY + 2 < height {
+            var sampleX = step
+            while sampleX + 2 < width {
+                for mode in 0..<candidateCount {
+                    let center = value(mode, sampleX, sampleY)
+                    sameDiff[mode] += abs(center - value(mode, sampleX + 2, sampleY))
+                                   + abs(center - value(mode, sampleX, sampleY + 2))
+                    crossDiff[mode] += abs(center - value(mode, sampleX + 1, sampleY))
+                                    + abs(center - value(mode, sampleX, sampleY + 1))
                 }
-                y += step
+                sampleCount += 1
+                sampleX += step
             }
-            gradients[mode] = samples > 0 ? total / samples : .greatestFiniteMagnitude
-            zeroFractions[mode] = samples > 0 ? zeros / (samples / 3) : 1
+            sampleY += step
         }
 
-        // 解包方式**固定**为标准 MIPI 打包（mode 0）。
-        //
-        // 12 种组合的全矩阵测试说明了为什么不能自动选：
-        // 「高位在前」与「首字节合装」都采用 b0 在高位、b1 在低位，只是位数分配不同，
-        // 梯度几乎相同（实测 0.0050 对 0.0061，差 1.2 倍），噪声一进来就会选错；
-        // 而选错的代价是画面平均差 0.197（肉眼炸裂）。
-        // 相反，相位的判据分离度是 157 倍（0.0015 对 0.235），可以放心自动判定。
-        // 三种排法的梯度仍然算出来写进元数据，万一 Apple 不是标准打包，按读数一次就能校正。
-        let bestMode = 0
-        _ = zeroFractions
+        var ratios = [Double](repeating: .greatestFiniteMagnitude, count: candidateCount)
+        var bestMode = 0
+        var bestRatio = Double.greatestFiniteMagnitude
+        for mode in 0..<candidateCount {
+            // 异色差接近 0 说明这一排法把画面解成了一片死平（或全被黑电平压成 0），
+            // 不能因为分子分母同时接近 0 就判它最优
+            guard crossDiff[mode] > 1e-9 * max(sampleCount, 1) else { continue }
+            let ratio = sameDiff[mode] / crossDiff[mode]
+            ratios[mode] = ratio
+            if ratio < bestRatio {
+                bestRatio = ratio
+                bestMode = mode
+            }
+        }
 
         // 原始样本统计：不扣黑电平，直接看传感器给了什么
         var rawMin = Double.greatestFiniteMagnitude
         var rawMax = 0.0
         var rawSum = 0.0
         var rawCount = 0.0
-        var rawY = 0
+        var rawY = step
         while rawY + 4 < height {
-            var rawX = 0
+            var rawX = step
             while rawX + 4 < width {
-                let sample = unpack(base, rowBytes, rawX, rawY)
+                let sample = unpack(bytes.advanced(by: rawY * rowBytes), rawX, mode: bestMode)
                 if sample < rawMin { rawMin = sample }
                 if sample > rawMax { rawMax = sample }
                 rawSum += sample
@@ -174,7 +247,6 @@ final class BayerCalibration {
         var bestPatternScore = Double.greatestFiniteMagnitude
         var bestGreenPair = 0.0
         var bestNeutrality = 0.0
-        var greenPairs: [Int: Double] = [:]
 
         for pattern in 0..<4 {
             let table = colors[pattern]
@@ -189,9 +261,9 @@ final class BayerCalibration {
             var blueSum = 0.0
             var count = 0.0
 
-            var y = 0
+            var y = step
             while y + 1 < height {
-                var x = 0
+                var x = step
                 while x + 1 < width {
                     var quad = [Double](repeating: 0, count: 4)
                     for index in 0..<4 {
@@ -211,8 +283,6 @@ final class BayerCalibration {
             let neutrality = abs(log(max(redSum, 1e-6) / max(blueSum, 1e-6)))
             let score = normalizedPair + neutrality * 0.5
 
-            greenPairs[pattern] = normalizedPair
-
             if score < bestPatternScore {
                 bestPatternScore = score
                 bestPattern = pattern
@@ -221,23 +291,14 @@ final class BayerCalibration {
             }
         }
 
-        // 相位：以标定结果为准。
-        //
-        // 解包方式改正之后，「一格两个绿点之差」的分离度实测 157 倍
-        //（正确 0.0015 / 错误 0.235），比 ProRAW 附件给的 BayerPattern 更可信——
-        // 0.5.12 的实测就是设备说 GBRG、标定说 BGGR，两者冲突。
-        // 设备值仍然记进诊断串，两者不一致时能从文件里看到。
-        let chosenPattern = bestPattern
-        let preferred = Int(preferredPattern)
-
         var outcome = Outcome()
         outcome.unpackMode = Int32(bestMode)
-        outcome.pattern = Int32(chosenPattern)
-        outcome.modeGradients = gradients.map { String(format: "%.4f", $0) }
+        outcome.pattern = Int32(bestPattern)
+        outcome.modeRatios = ratios
         outcome.calibratedPattern = Int32(bestPattern)
         outcome.devicePattern = Int32(preferredPattern)
         outcome.score = Float(bestPatternScore)
-        outcome.gradient = Float(gradients[bestMode])
+        outcome.gradient = Float(sameDiff[bestMode] / max(sampleCount * 2, 1))
         outcome.greenPair = Float(bestGreenPair)
         outcome.neutrality = Float(bestNeutrality)
         outcome.rawRangeText = rawRangeText

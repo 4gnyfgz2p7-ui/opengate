@@ -73,12 +73,22 @@ struct CameraPreviewView: UIViewRepresentable {
         }
 
         func applyRotationIfPossible() {
-            guard let connection = previewLayer.connection else { return }
-            // 连接在 session 装配完成后才存在，首次可能拿不到，
-            // 下一次 layout 会补上
-            if connection.isVideoRotationAngleSupported(requestedRotation) {
+            guard let connection = previewLayer.connection else {
+                // 连接在 session 装配完成后才存在，首次可能拿不到，
+                // 下一次 layout 会补上
+                RotationMonitor.shared.notePreview(connectionNil: true, angle: 0, supported: false)
+                return
+            }
+            let supported = connection.isVideoRotationAngleSupported(requestedRotation)
+            if supported {
                 connection.videoRotationAngle = requestedRotation
             }
+            // 状态没变时监测内部会去重；角度被系统改写会单独记录
+            RotationMonitor.shared.notePreview(
+                connectionNil: false,
+                angle: Int(connection.videoRotationAngle),
+                supported: supported
+            )
         }
     }
 }
