@@ -40,6 +40,12 @@ final class BayerCalibration {
         var calibratedPattern: Int32 = 0
         /// 设备通过 ProRAW 附件给出的相位
         var devicePattern: Int32 = 0
+        /// 由场景本身算出的白平衡增益（灰世界，60% 分位），录制期间锁定
+        var whiteBalanceRed: Float = 1
+        var whiteBalanceBlue: Float = 1
+        /// 场景原始的 R/G、B/G 比例（未加任何增益），诊断用
+        var levelRed: Double = 1
+        var levelBlue: Double = 1
 
         var summary: String {
             let patterns = ["RGGB", "BGGR", "GRBG", "GBRG"]
@@ -51,6 +57,8 @@ final class BayerCalibration {
             if calibrated != patternName || device != patternName {
                 text += "·标定" + calibrated + "/设备" + device
             }
+            text += String(format: "·wb%.2f/%.2f", Double(whiteBalanceRed), Double(whiteBalanceBlue))
+            text += String(format: "·lv%.2f/%.2f", min(levelRed, 9.99), min(levelBlue, 9.99))
             if !modeRatios.isEmpty {
                 // 九种排法的比值，两位小数够看：最小那个就是被判为正确的排法
                 let list = modeRatios.map { String(format: "%.2f", min($0, 9.99)) }
@@ -291,6 +299,62 @@ final class BayerCalibration {
             }
         }
 
+        // ---- 第三关：场景白平衡 ----
+        //
+        // 设备给的 ProResRAW_WhiteBalance*Factor 量纲不可靠：0.5.14 实测按它乘完，
+        // G 只有 63 而 R 到 100、B 到 91，画面整体偏品红。这里不猜量纲，
+        // 直接用场景自己定：取每通道 60% 分位（避开暗部噪声与高光削顶），让三者相等。
+        // 结果在整段录制里锁定，等于固定白平衡。
+        let wbTable = colors[bestPattern]
+        var samplesR: [Double] = []
+        var samplesG: [Double] = []
+        var samplesB: [Double] = []
+        samplesR.reserveCapacity(8192)
+        samplesG.reserveCapacity(8192)
+        samplesB.reserveCapacity(8192)
+
+        var wbY = step
+        while wbY + 1 < height {
+            var wbX = step
+            while wbX + 1 < width {
+                for index in 0..<4 {
+                    let sample = value(bestMode, wbX + (index & 1), wbY + (index >> 1))
+                    switch wbTable[index] {
+                    case 0: samplesR.append(sample)
+                    case 1: samplesG.append(sample)
+                    default: samplesB.append(sample)
+                    }
+                }
+                wbX += step
+            }
+            wbY += step
+        }
+
+        func percentile(_ values: [Double], _ fraction: Double) -> Double {
+            guard !values.isEmpty else { return 0 }
+            let sorted = values.sorted()
+            let position = Int(Double(sorted.count - 1) * fraction)
+            return sorted[max(0, min(sorted.count - 1, position))]
+        }
+
+        let levelR = percentile(samplesR, 0.6)
+        let levelG = percentile(samplesG, 0.6)
+        let levelB = percentile(samplesB, 0.6)
+
+        var whiteBalanceRed: Float = 1
+        var whiteBalanceBlue: Float = 1
+        // 画面太暗（绿通道分位低于 1% 满量程）时三通道都被噪声主导，
+        // 算出来的比例没有意义，宁可不动白平衡
+        if levelG > 0.01 {
+            if levelR > 1e-6 {
+                // 0.35–2.8 之外的比例不是白平衡能解释的，多半是通道算错了，别硬拉
+                whiteBalanceRed = Float(min(2.8, max(0.35, levelG / levelR)))
+            }
+            if levelB > 1e-6 {
+                whiteBalanceBlue = Float(min(2.8, max(0.35, levelG / levelB)))
+            }
+        }
+
         var outcome = Outcome()
         outcome.unpackMode = Int32(bestMode)
         outcome.pattern = Int32(bestPattern)
@@ -302,6 +366,10 @@ final class BayerCalibration {
         outcome.greenPair = Float(bestGreenPair)
         outcome.neutrality = Float(bestNeutrality)
         outcome.rawRangeText = rawRangeText
+        outcome.whiteBalanceRed = whiteBalanceRed
+        outcome.whiteBalanceBlue = whiteBalanceBlue
+        outcome.levelRed = levelR / max(levelG, 1e-9)
+        outcome.levelBlue = levelB / max(levelG, 1e-9)
         return outcome
     }
 }

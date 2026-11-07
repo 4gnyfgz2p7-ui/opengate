@@ -254,8 +254,18 @@ final class BayerConverter {
         }
 
         // ---- 参数：扁平 uint32，下标即协议 ----
+        // 白平衡用标定出来的场景值：设备附件里的 WhiteBalance*Factor 量纲不明，
+        // 直接乘会出现 G 被压到 63、R/B 抬到 100/91 的偏品红画面。
+        var redGain = parameters.redGain
+        var greenGain = parameters.greenGain
+        var blueGain = parameters.blueGain
+        if let calibrated = calibration {
+            redGain = calibrated.whiteBalanceRed
+            greenGain = 1
+            blueGain = calibrated.whiteBalanceBlue
+        }
         let floats = [parameters.blackLevel, parameters.whiteLevel,
-                      parameters.redGain, parameters.greenGain, parameters.blueGain]
+                      redGain, greenGain, blueGain]
         var slots = [UInt32](repeating: 0, count: 11)
         slots[0] = UInt32(width)
         slots[1] = UInt32(height)
