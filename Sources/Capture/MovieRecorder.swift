@@ -161,17 +161,12 @@ final class MovieRecorder {
         videoInput = vInput
         settingsLevel = acceptedLevel
 
-        let sourceFormat = tier.isProRes
-            ? FourCC.code("x422")
-            : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        // BGRA 进、由 AVFoundation 转成目标编码格式。
+        // 不指定 sourcePixelBufferAttributes：全幅走 BGRA、系统 ISP 降级走 10-bit YUV，
+        // 两条路都要能 append，让 adaptor 保持中立。
         adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: vInput,
-            sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: sourceFormat,
-                kCVPixelBufferWidthKey as String: width,
-                kCVPixelBufferHeightKey as String: height,
-                kCVPixelBufferMetalCompatibilityKey as String: true,
-            ]
+            sourcePixelBufferAttributes: nil
         )
 
         // ---- 音频输入 ----

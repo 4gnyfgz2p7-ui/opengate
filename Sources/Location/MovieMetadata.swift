@@ -109,6 +109,8 @@ enum MovieMetadata {
         let locationOutcome: LocationProvider.Outcome
         let startedAt: Date
         let orientation: String
+        /// Bayer 通路的自检读数：解包排法、相位、RGB 极值、原始样本范围
+        let pipelineDiagnostics: String
     }
 
     static func items(for context: RecordingContext) -> [AVMetadataItem] {
@@ -139,6 +141,10 @@ enum MovieMetadata {
         items.append(customItem(key: "com.aitimes.acamera.color_pipeline", value: context.colorPipeline))
         items.append(customItem(key: "com.aitimes.acamera.audio", value: context.audioDescription))
         items.append(customItem(key: "com.aitimes.acamera.orientation", value: context.orientation))
+        items.append(customItem(
+            key: "com.aitimes.acamera.pipeline_diagnostics",
+            value: context.pipelineDiagnostics
+        ))
 
         return items
     }

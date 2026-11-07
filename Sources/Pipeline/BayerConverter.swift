@@ -3,16 +3,21 @@ import CoreVideo
 import CoreMedia
 import Metal
 
-/// btp2（Bayer 12-bit 打包）→ 10-bit YCbCr 的 GPU 转换。
+/// btp2（Bayer 12-bit 打包）→ 32BGRA。
 ///
-/// 这条链路唯一可靠的写法是**直接写进输出像素缓冲的纹理**：
-/// 早先是 GPU 写自有 MTLBuffer、再逐行 memcpy 回 CVPixelBuffer，
-/// 结果编码器收到的缓冲始终是全 0（成片纯绿），而 GPU 侧明明有数据。
-/// 现在把平面包成 `texture2d<write>` 让 kernel 直接落盘，
-/// 中间不再有任何一块“可能没复制过去”的内存。
+/// **为什么不再自己写 YUV**
 ///
-/// 参数用扁平 uint32 缓冲传：结构体一旦布局判断错，kernel 读到的 width 就是 0，
-/// 所有线程立刻 return，命令缓冲却显示 completed。
+/// 10-bit biplanar 的平面是 16-bit 容器、10-bit 有效、video range 64..940。
+/// 往里写一个样本要同时满足三件事：按 /1023 归一、叠上 64+876*y 的映射、
+/// 色度再加 512 偏置。漏掉任何一件都不会报错，只会得到一张错图——
+/// 实测 0.5.11 的成片就是 Y 全 0、Cb 467、Cr 684，播放器里呈现纯红：
+/// 亮度每个像素都被压进 0 附近的量化格，色度却按正确公式算出了颜色。
+///
+/// BGRA 没有这一层歧义：写 0..1 就是 0..255。转成 10-bit YUV 的事交给
+/// AVFoundation 的标准路径，那是系统每天都在跑的代码。
+///
+/// 位深从 10 bit 降到 8 bit 是当前阶段的自觉取舍：先把画面弄对，
+/// 等 Apple Log 2 接进来时再换 16-bit 浮点通路（Log 本来就要在 RGB 域做）。
 final class BayerConverter {
 
     /// 与着色器里的 `p[...]` 下标一一对应。
@@ -24,33 +29,57 @@ final class BayerConverter {
         var blueGain: Float = 1
         /// 0=RGGB 1=BGGR 2=GRBG 3=GBRG
         var pattern: Int32 = 0
-        var width: UInt32 = 0
-        var height: UInt32 = 0
-        var sourceBytesPerRow: UInt32 = 0
-        /// 0 = 4:2:0（HEVC）  1 = 4:2:2（ProRes）
-        var chroma422: Int32 = 0
     }
 
-    /// 一次转换的自检结果。真机上直接读数，不用猜。
+    /// 一次转换的自检结果。直接读数，不猜。
     struct Diagnostics {
         var kernelRan = false
         var kernelWidth: UInt32 = 0
         var kernelHeight: UInt32 = 0
-        /// 写完之后，从**输出像素缓冲**上读回来的 Y 极值（10-bit）
-        var cvYMin: UInt32 = 0
-        var cvYMax: UInt32 = 0
+        /// kernel 自己算出来的第一个像素（RGB ×1000），验证像素管线是否有值
+        var firstPixel = "—"
+        /// 输出缓冲上稀疏采样得到的 RGB 极值与均值（0..255）
+        var outMin: [UInt8] = [0, 0, 0]
+        var outMax: [UInt8] = [0, 0, 0]
+        var outMean: [UInt8] = [0, 0, 0]
+        /// 原始 Bayer 样本范围（未扣黑电平），用来判断黑白电平参数是否合理
+        var rawRange = "—"
+        /// 源数据前 24 字节的十六进制。打包方式若有疑问，用这 8 组字节在 PC 上直接验算。
+        var rawHead = "—"
+        var calibration = ""
 
-        var isBlack: Bool { cvYMax < 32 }
-        var calibration: String = ""
+        var maxChannel: UInt8 { outMax.max() ?? 0 }
+
+        /// 整幅基本无亮度就判失败
+        var isBlack: Bool { maxChannel < 10 }
 
         var summary: String {
-            var text = "GPU \(kernelRan ? "1" : "0") · \(kernelWidth)×\(kernelHeight) · CV[\(cvYMin),\(cvYMax)]"
+            var text = "GPU \(kernelRan ? 1 : 0) · \(kernelWidth)×\(kernelHeight)"
+            text += " · RGB≤\(outMin[0])/\(outMin[1])/\(outMin[2])…\(outMax[0])/\(outMax[1])/\(outMax[2])"
             if !calibration.isEmpty { text += " · " + calibration }
             return text
+        }
+
+        /// 写进视频文件的诊断串，ffprobe 直接可读
+        var metadataText: String {
+            [
+                "gpu=\(kernelRan ? 1 : 0)",
+                "size=\(kernelWidth)x\(kernelHeight)",
+                "rgb_min=\(outMin[0]),\(outMin[1]),\(outMin[2])",
+                "rgb_max=\(outMax[0]),\(outMax[1]),\(outMax[2])",
+                "rgb_mean=\(outMean[0]),\(outMean[1]),\(outMean[2])",
+                "first=\(firstPixel)",
+                "raw=\(rawRange)",
+                "head=\(rawHead)",
+                "cal=\(calibration)",
+            ].joined(separator: ";")
         }
     }
 
     static let bayerFormat: OSType = FourCC.code("btp2")
+    static let outputFormat: OSType = kCVPixelFormatType_32BGRA
+    /// 供外部（写入端）判断该走哪条追加路径
+    static var isBayer(_ format: OSType) -> Bool { format == bayerFormat }
 
     private let device: MTLDevice
     private let queue: MTLCommandQueue
@@ -64,16 +93,16 @@ final class BayerConverter {
     private var pools: [OSType: CVPixelBufferPool] = [:]
     private var poolWidth = 0
     private var poolHeight = 0
-
-    /// 纹理引用必须在 GPU 跑完之前一直活着，否则底层表面可能被回收
-    private var yTextureRef: CVMetalTexture?
-    private var cTextureRef: CVMetalTexture?
+    private var outputTextureRef: CVMetalTexture?
 
     /// 构造失败的原因，显示在设置页
     private(set) static var compileNote: String?
 
     /// 第一帧自动标定出来的解包方式与相位
     private(set) var calibration: BayerCalibration.Outcome?
+
+    private(set) var lastFailureStage: String?
+    private(set) var lastDiagnostics = Diagnostics()
 
     /// 初始化失败即代表这台设备走不了 Bayer 通路，调用方应降级到系统 ISP 格式。
     init?() {
@@ -84,8 +113,8 @@ final class BayerConverter {
         do {
             let options = MTLCompileOptions()
             let library = try device.makeLibrary(source: Self.shaderSource, options: options)
-            guard let function = library.makeFunction(name: "bayer_to_yuv") else {
-                Self.compileNote = "找不到 bayer_to_yuv"
+            guard let function = library.makeFunction(name: "bayer_to_bgra") else {
+                Self.compileNote = "找不到 bayer_to_bgra"
                 return nil
             }
             pipeline = try device.makeComputePipelineState(function: function)
@@ -111,12 +140,8 @@ final class BayerConverter {
 
     // MARK: - 转换
 
-    private(set) var lastFailureStage: String?
-    private(set) var lastDiagnostics = Diagnostics()
-
     func convert(
         _ source: CVPixelBuffer,
-        chroma422: Bool,
         parameters: Parameters
     ) -> CVPixelBuffer? {
         lastFailureStage = nil
@@ -133,12 +158,7 @@ final class BayerConverter {
             return nil
         }
 
-        // x422 的 CV 常量在 iOS SDK 上并不总是存在，统一用四字符码拼
-        let format = chroma422
-            ? FourCC.code("x422")
-            : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-
-        guard let output = pooledBuffer(format: format, width: width, height: height) else {
+        guard let output = pooledBuffer(format: Self.outputFormat, width: width, height: height) else {
             lastFailureStage = "输出像素缓冲创建失败"
             return nil
         }
@@ -147,29 +167,19 @@ final class BayerConverter {
             return nil
         }
 
-        let chromaWidth = width / 2
-        let chromaHeight = chroma422 ? height : height / 2
-
-        var yCVTexture: CVMetalTexture?
-        var cCVTexture: CVMetalTexture?
-        let yStatus = CVMetalTextureCacheCreateTextureFromImage(
+        var cvTexture: CVMetalTexture?
+        let textureStatus = CVMetalTextureCacheCreateTextureFromImage(
             kCFAllocatorDefault, cache, output, nil,
-            MTLPixelFormat.r16Unorm, width, height, 0, &yCVTexture
+            MTLPixelFormat.bgra8Unorm, width, height, 0, &cvTexture
         )
-        let cStatus = CVMetalTextureCacheCreateTextureFromImage(
-            kCFAllocatorDefault, cache, output, nil,
-            MTLPixelFormat.rg16Unorm, chromaWidth, chromaHeight, 1, &cCVTexture
-        )
-        guard yStatus == kCVReturnSuccess, cStatus == kCVReturnSuccess,
-              let yCVTexture = yCVTexture, let cCVTexture = cCVTexture,
-              let yTexture = CVMetalTextureGetTexture(yCVTexture),
-              let cTexture = CVMetalTextureGetTexture(cCVTexture)
+        guard textureStatus == kCVReturnSuccess,
+              let cvTexture = cvTexture,
+              let texture = CVMetalTextureGetTexture(cvTexture)
         else {
-            lastFailureStage = "纹理创建失败（Y \(yStatus) / C \(cStatus)）"
+            lastFailureStage = "纹理创建失败（\(textureStatus)）"
             return nil
         }
-        yTextureRef = yCVTexture
-        cTextureRef = cCVTexture
+        outputTextureRef = cvTexture
 
         // ---- 源：Bayer 没有对应像素格式，只能拷进 MTLBuffer ----
         CVPixelBufferLockBaseAddress(source, .readOnly)
@@ -181,6 +191,14 @@ final class BayerConverter {
         }
         let sourceRowBytes = CVPixelBufferGetBytesPerRow(source)
         let sourceLength = sourceRowBytes * height
+
+        // 前 24 字节的十六进制：万一打包方式与假设不符，这 8 组三字节
+        // 足够在 PC 上把两种排法各算一遍，一次定死。
+        var headText = ""
+        let headPointer = sourceBase.assumingMemoryBound(to: UInt8.self)
+        for index in 0..<min(24, sourceLength) {
+            headText += String(format: "%02x", headPointer[index])
+        }
 
         if sourceBuffer == nil || sourceCapacity < sourceLength {
             guard let allocated = device.makeBuffer(length: sourceLength, options: .storageModeShared) else {
@@ -197,7 +215,8 @@ final class BayerConverter {
             lastFailureStage = "缓冲缺失"
             return nil
         }
-        // 第一帧先把解包方式与 Bayer 相位定下来：取错排法不会报错，
+
+        // 第一帧把解包方式与 Bayer 相位定下来：取错排法不会报错，
         // 只会得到一张浮雕状的图，靠肉眼看是猜不出来的。
         if calibration == nil {
             calibration = BayerCalibration.run(
@@ -222,7 +241,7 @@ final class BayerConverter {
         slots[0] = UInt32(width)
         slots[1] = UInt32(height)
         slots[2] = UInt32(sourceRowBytes)
-        slots[3] = chroma422 ? 1 : 0
+        slots[3] = 0
         for (index, value) in floats.enumerated() {
             slots[4 + index] = value.bitPattern
         }
@@ -240,8 +259,7 @@ final class BayerConverter {
 
         encoder.setComputePipelineState(pipeline)
         encoder.setBuffer(bayerBuffer, offset: 0, index: 0)
-        encoder.setTexture(yTexture, index: 0)
-        encoder.setTexture(cTexture, index: 1)
+        encoder.setTexture(texture, index: 0)
         encoder.setBuffer(paramsBuffer, offset: 0, index: 3)
         encoder.setBuffer(probeBuffer, offset: 0, index: 4)
 
@@ -260,6 +278,9 @@ final class BayerConverter {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
+        outputTextureRef = nil
+        CVMetalTextureCacheFlush(cache, 0)
+
         guard commandBuffer.status == .completed else {
             lastFailureStage = "GPU 未完成（\(commandBuffer.status.rawValue)）"
             return nil
@@ -270,34 +291,49 @@ final class BayerConverter {
         diagnostics.kernelRan = probe[0] == 1
         diagnostics.kernelWidth = probe[1]
         diagnostics.kernelHeight = probe[2]
+        diagnostics.firstPixel = String(
+            format: "%.3f/%.3f/%.3f",
+            Double(probe[4]) / 1000.0,
+            Double(probe[5]) / 1000.0,
+            Double(probe[6]) / 1000.0
+        )
         diagnostics.calibration = calibration?.summary ?? ""
+        diagnostics.rawRange = calibration?.rawRangeText ?? "—"
+        diagnostics.rawHead = headText
 
-        // 纹理引用用完即放，并清一次纹理缓存，避免缓存无限增长
-        yTextureRef = nil
-        cTextureRef = nil
-        CVMetalTextureCacheFlush(cache, 0)
-
-        // ---- 从输出像素缓冲上直接读回来：这一步是唯一可信的验收 ----
+        // ---- 从**最终像素缓冲**上读回来：这一步是唯一可信的验收 ----
         CVPixelBufferLockBaseAddress(output, .readOnly)
-        if let plane = CVPixelBufferGetBaseAddressOfPlane(output, 0) {
-            let stride = CVPixelBufferGetBytesPerRowOfPlane(output, 0)
-            var minValue = UInt32.max
-            var maxValue: UInt32 = 0
+        if let base = CVPixelBufferGetBaseAddress(output) {
+            let stride = CVPixelBufferGetBytesPerRow(output)
+            var lows = [UInt8](repeating: 255, count: 3)
+            var highs = [UInt8](repeating: 0, count: 3)
+            var sums = [Int](repeating: 0, count: 3)
+            var count = 0
             var row = 0
             while row < height {
-                let rowPointer = plane.advanced(by: row * stride)
-                    .assumingMemoryBound(to: UInt16.self)
+                let rowPointer = base.advanced(by: row * stride)
                 var column = 0
                 while column < width {
-                    let value = UInt32(rowPointer[column])
-                    if value < minValue { minValue = value }
-                    if value > maxValue { maxValue = value }
-                    column += 97
+                    let pixel = rowPointer.advanced(by: column * 4)
+                        .assumingMemoryBound(to: UInt8.self)
+                    // BGRA 内存顺序
+                    let values = [pixel[2], pixel[1], pixel[0]]
+                    for channel in 0..<3 {
+                        let value = values[channel]
+                        if value < lows[channel] { lows[channel] = value }
+                        if value > highs[channel] { highs[channel] = value }
+                        sums[channel] += Int(value)
+                    }
+                    count += 1
+                    column += 61
                 }
-                row += 97
+                row += 61
             }
-            diagnostics.cvYMin = minValue == UInt32.max ? 0 : minValue
-            diagnostics.cvYMax = maxValue
+            if count > 0 {
+                diagnostics.outMin = lows
+                diagnostics.outMax = highs
+                diagnostics.outMean = (0..<3).map { UInt8(clamping: sums[$0] / count) }
+            }
         }
         CVPixelBufferUnlockBaseAddress(output, .readOnly)
 
@@ -308,7 +344,7 @@ final class BayerConverter {
             return nil
         }
         if diagnostics.isBlack {
-            lastFailureStage = "输出全黑（CV Y≤\(diagnostics.cvYMax)）"
+            lastFailureStage = "输出无亮度（RGB≤\(diagnostics.maxChannel)）"
             return nil
         }
 
@@ -339,8 +375,7 @@ final class BayerConverter {
                 attributes as CFDictionary,
                 &pool
             )
-            guard status == kCVReturnSuccess, let created = pool else { return nil }
-            pools[format] = created
+            if status == kCVReturnSuccess, let created = pool { pools[format] = created }
         }
 
         if let pool = pools[format] {
@@ -377,11 +412,10 @@ final class BayerConverter {
         return v < lo ? lo : (v > hi ? hi : v);
     }
 
-    // MIPI RAW12：两个像素打包进 3 字节
-    //   p0 = (b0 << 4) | (b1 >> 4)
-    //   p1 = ((b1 & 0x0F) << 8) | b2
-    // mode 0：高位在前（MIPI 常见）
-    // mode 1：低位在前
+    // 12-bit 打包：两个像素三字节
+    //   mode 0（MIPI 标准）：p0 = (b0<<4)|(b1>>4)      p1 = ((b1&0x0F)<<8)|b2
+    //   mode 1（低位在前）  ：p0 = b0|((b1&0x0F)<<8)   p1 = (b1>>4)|(b2<<4)
+    //   mode 2（首字节合装）：p0 = ((b0&0xF0)<<4)|b1   p1 = ((b0&0x0F)<<8)|b2
     inline ushort ac_raw12(const device uchar* base, uint rowBytes, int x, int y, int mode) {
         const device uchar* q = base + uint(y) * rowBytes + uint(x >> 1) * 3u;
         if (mode == 0) {
@@ -396,7 +430,6 @@ final class BayerConverter {
             }
             return ushort((ushort(q[1]) >> 4) | (ushort(q[2]) << 4));
         }
-        // mode 2：首字节装两个高半字节
         if ((x & 1) == 0) {
             return ushort((ushort(q[0] & 0xF0) << 4) | ushort(q[1]));
         }
@@ -423,6 +456,7 @@ final class BayerConverter {
         return t[phase];
     }
 
+    /// 双线性 demosaic → 扣黑 → 白平衡 → REC.709 传递函数。返回 0..1 的 RGB。
     inline float3 ac_pixel(const device uchar* src, uint rowBytes, int w, int h,
                            int x, int y, int pattern,
                            float black, float invRange, float3 gains, int unpackMode) {
@@ -474,28 +508,19 @@ final class BayerConverter {
         return float3(ac_rec709(linear.r), ac_rec709(linear.g), ac_rec709(linear.b));
     }
 
-    kernel void bayer_to_yuv(const device uchar* src [[buffer(0)]],
-                             texture2d<float, access::write> yTex [[texture(0)]],
-                             texture2d<float, access::write> cTex [[texture(1)]],
-                             constant uint* p [[buffer(3)]],
-                             device uint* probe [[buffer(4)]],
-                             uint2 gid [[thread_position_in_grid]]) {
+    kernel void bayer_to_bgra(const device uchar* src [[buffer(0)]],
+                              texture2d<float, access::write> dst [[texture(0)]],
+                              constant uint* p [[buffer(3)]],
+                              device uint* probe [[buffer(4)]],
+                              uint2 gid [[thread_position_in_grid]]) {
         uint w = p[0];
         uint h = p[1];
         uint rowBytes = p[2];
-        int chroma422 = int(p[3]);
         float black = as_type<float>(p[4]);
         float white = as_type<float>(p[5]);
         float3 gains = float3(as_type<float>(p[6]), as_type<float>(p[7]), as_type<float>(p[8]));
         int pattern = int(p[9]);
         int unpackMode = int(p[10]);
-
-        if (gid.x == 0u && gid.y == 0u) {
-            probe[0] = 1u;
-            probe[1] = w;
-            probe[2] = h;
-            probe[3] = rowBytes;
-        }
 
         int x0 = int(gid.x) * 2;
         int y0 = int(gid.y) * 2;
@@ -510,43 +535,21 @@ final class BayerConverter {
         float3 e2 = ac_pixel(src, rowBytes, int(w), int(h), x0, y1, pattern, black, invRange, gains, unpackMode);
         float3 e3 = ac_pixel(src, rowBytes, int(w), int(h), x1, y1, pattern, black, invRange, gains, unpackMode);
 
-        // 10-bit 存在 16-bit 容器的高 10 位：写 unorm 时按 /1023 归一，
-        // 硬件量化后正好落到 value << 6。
-        const float invCode = 1.0f / 1023.0f;
-        float3 lumaWeights = float3(0.2126f, 0.7152f, 0.0722f);
-
-        yTex.write(float4(dot(e0, lumaWeights) * invCode, 0.0f, 0.0f, 1.0f), uint2(uint(x0), uint(y0)));
-        yTex.write(float4(dot(e1, lumaWeights) * invCode, 0.0f, 0.0f, 1.0f), uint2(uint(x1), uint(y0)));
-        yTex.write(float4(dot(e2, lumaWeights) * invCode, 0.0f, 0.0f, 1.0f), uint2(uint(x0), uint(y1)));
-        yTex.write(float4(dot(e3, lumaWeights) * invCode, 0.0f, 0.0f, 1.0f), uint2(uint(x1), uint(y1)));
-
-        // 色度：BT.709 的 Cb/Cr，视频范围 64..960，中性 512
-        if (chroma422 == 1) {
-            float3 pairTop = (e0 + e1) * 0.5f;
-            float3 pairBottom = (e2 + e3) * 0.5f;
-
-            float yT = dot(pairTop, lumaWeights);
-            float cbT = (pairTop.b - yT) / 1.8556f;
-            float crT = (pairTop.r - yT) / 1.5748f;
-            cTex.write(float4((512.0f + cbT * 896.0f) * invCode,
-                              (512.0f + crT * 896.0f) * invCode, 0.0f, 1.0f),
-                       uint2(uint(x0) / 2u, uint(y0)));
-
-            float yB = dot(pairBottom, lumaWeights);
-            float cbB = (pairBottom.b - yB) / 1.8556f;
-            float crB = (pairBottom.r - yB) / 1.5748f;
-            cTex.write(float4((512.0f + cbB * 896.0f) * invCode,
-                              (512.0f + crB * 896.0f) * invCode, 0.0f, 1.0f),
-                       uint2(uint(x0) / 2u, uint(y1)));
-        } else {
-            float3 average = (e0 + e1 + e2 + e3) * 0.25f;
-            float yv = dot(average, lumaWeights);
-            float cb = (average.b - yv) / 1.8556f;
-            float cr = (average.r - yv) / 1.5748f;
-            cTex.write(float4((512.0f + cb * 896.0f) * invCode,
-                              (512.0f + cr * 896.0f) * invCode, 0.0f, 1.0f),
-                       uint2(uint(x0) / 2u, uint(y0) / 2u));
+        if (gid.x == 0u && gid.y == 0u) {
+            probe[0] = 1u;
+            probe[1] = w;
+            probe[2] = h;
+            probe[3] = rowBytes;
+            probe[4] = uint(clamp(e0.r, 0.0f, 1.0f) * 1000.0f);
+            probe[5] = uint(clamp(e0.g, 0.0f, 1.0f) * 1000.0f);
+            probe[6] = uint(clamp(e0.b, 0.0f, 1.0f) * 1000.0f);
         }
+
+        // BGRA8Unorm：写 0..1 就是 0..255，没有位深与范围这一层歧义
+        dst.write(float4(e0, 1.0f), uint2(uint(x0), uint(y0)));
+        dst.write(float4(e1, 1.0f), uint2(uint(x1), uint(y0)));
+        dst.write(float4(e2, 1.0f), uint2(uint(x0), uint(y1)));
+        dst.write(float4(e3, 1.0f), uint2(uint(x1), uint(y1)));
     }
     """#
 }

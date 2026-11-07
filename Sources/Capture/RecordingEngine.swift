@@ -66,6 +66,7 @@ final class FrameStats {
         var appended = 0
         var lastFailure: String?
         var diagnostics: String?
+        var diagnosticsDetail: String?
     }
 
     private let lock = NSLock()
@@ -74,6 +75,7 @@ final class FrameStats {
     private var appended = 0
     private var lastFailure: String?
     private var diagnostics: String?
+    private var diagnosticsDetail: String?
 
     func markDelivered() { lock.lock(); delivered += 1; lock.unlock() }
     func markConverted() { lock.lock(); converted += 1; lock.unlock() }
@@ -81,11 +83,18 @@ final class FrameStats {
 
     func markFailure(_ stage: String) { lock.lock(); lastFailure = stage; lock.unlock() }
 
-    func markDiagnostics(_ text: String) { lock.lock(); diagnostics = text; lock.unlock() }
+    /// `detail` 是写进视频文件元数据的机器可读串，`text` 是给人看的一行摘要
+    func markDiagnostics(_ text: String, detail: String? = nil) {
+        lock.lock()
+        diagnostics = text
+        if let detail = detail { diagnosticsDetail = detail }
+        lock.unlock()
+    }
 
     func reset() {
         lock.lock()
-        delivered = 0; converted = 0; appended = 0; lastFailure = nil; diagnostics = nil
+        delivered = 0; converted = 0; appended = 0
+        lastFailure = nil; diagnostics = nil; diagnosticsDetail = nil
         lock.unlock()
     }
 
@@ -96,7 +105,8 @@ final class FrameStats {
             converted: converted,
             appended: appended,
             lastFailure: lastFailure,
-            diagnostics: diagnostics
+            diagnostics: diagnostics,
+            diagnosticsDetail: diagnosticsDetail
         )
     }
 }
@@ -222,7 +232,7 @@ final class RecordingEngine: ObservableObject {
             statsBox.markDelivered()
             var monitorable = imageBuffer
 
-            // 全幅格式只吐 Bayer：先 demosaic 成 10-bit YUV 再交给编码器。
+            // 全幅格式只吐 Bayer：先 demosaic 成 BGRA 再交给编码器。
             // 不做这一步 append 会被逐帧拒绝，文件停在 0 字节。
             if CVPixelBufferGetPixelFormatType(imageBuffer) == BayerConverter.bayerFormat {
                 // 设备实际按 60 fps 供帧（会话启动会把帧时长改回默认），
@@ -240,18 +250,18 @@ final class RecordingEngine: ObservableObject {
 
                 guard let converted = converter.convert(
                     imageBuffer,
-                    chroma422: recorder?.wantsChroma422 ?? false,
                     parameters: RecordingEngine.bayerParameters(from: imageBuffer)
                 ) else {
                     let diag = converter.lastDiagnostics
-                    statsBox.markDiagnostics(diag.summary)
+                    statsBox.markDiagnostics(diag.summary, detail: diag.metadataText)
                     if let stage = converter.lastFailureStage { statsBox.markFailure(stage) }
                     return
                 }
 
                 monitorable = converted
                 statsBox.markConverted()
-                statsBox.markDiagnostics(converter.lastDiagnostics.summary)
+                let diag = converter.lastDiagnostics
+                statsBox.markDiagnostics(diag.summary, detail: diag.metadataText)
                 if recorder?.appendImageBuffer(
                     converted,
                     presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(buffer)
@@ -556,7 +566,8 @@ final class RecordingEngine: ObservableObject {
                 audioDescription: AudioSettings.description,
                 locationOutcome: locationOutcome,
                 startedAt: startedAt,
-                orientation: rotationLabel
+                orientation: rotationLabel,
+                pipelineDiagnostics: pipelineDiagnosticsText
             )
             let metadata = MovieMetadata.items(for: context)
 
@@ -700,9 +711,14 @@ final class RecordingEngine: ObservableObject {
         return rotation.isLandscape ? ratio : 1.0 / ratio
     }
 
-    /// GPU 自检读数：kernel 有没有进来、读到多大、Y 的极值
+    /// GPU 自检读数：kernel 有没有进来、读到多大、输出 RGB 的极值
     var pipelineBadge: String {
         stats.snapshot.diagnostics ?? "—"
+    }
+
+    /// 写进视频文件的诊断串，录完直接从文件读，不用再截图
+    var pipelineDiagnosticsText: String {
+        stats.snapshot.diagnosticsDetail ?? "—"
     }
 
     /// 档位旁的一行小字：画面从哪来、多大

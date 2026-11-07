@@ -81,11 +81,18 @@ final class WaveformSampler {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
-        guard let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else { return nil }
+        // BGRA 是单平面，取平面 0 的地址会返回 nil；两条路分开取
+        let planar = CVPixelBufferIsPlanar(pixelBuffer)
+        let base = planar
+            ? CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)
+            : CVPixelBufferGetBaseAddress(pixelBuffer)
+        guard let base = base else { return nil }
 
-        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
-        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
-        let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        let width = planar ? CVPixelBufferGetWidthOfPlane(pixelBuffer, 0) : CVPixelBufferGetWidth(pixelBuffer)
+        let height = planar ? CVPixelBufferGetHeightOfPlane(pixelBuffer, 0) : CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = planar
+            ? CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+            : CVPixelBufferGetBytesPerRow(pixelBuffer)
         guard width > 0, height > 0 else { return nil }
 
         var local = [UInt32](repeating: 0, count: Self.columns * Self.levels)
@@ -199,6 +206,7 @@ private enum YPlaneLayout {
     case u8FullRange       // 0–255
     case u16VideoRange     // 64–940（10-bit）
     case u16FullRange      // 0–1023（10-bit）
+    case bgra8             // 32BGRA：单平面、全范围
 
     init?(format: OSType) {
         switch format {
@@ -210,6 +218,8 @@ private enum YPlaneLayout {
             self = .u16VideoRange
         case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
             self = .u16FullRange
+        case kCVPixelFormatType_32BGRA:
+            self = .bgra8
         default:
             return nil
         }
@@ -225,6 +235,15 @@ private enum YPlaneLayout {
             let pointer = base.assumingMemoryBound(to: UInt16.self)
             let index = y * (bytesPerRow / 2) + x
             return Float(UInt16(littleEndian: pointer[index]))
+        case .bgra8:
+            // 内存顺序是 B G R A；在这里直接算加权亮度，
+            // 与视频编码器用的 BT.709 系数一致，波形读数和成片对得上
+            let pointer = base.assumingMemoryBound(to: UInt8.self)
+            let offset = y * bytesPerRow + x * 4
+            let b = Float(pointer[offset])
+            let g = Float(pointer[offset + 1])
+            let r = Float(pointer[offset + 2])
+            return 0.2126 * r + 0.7152 * g + 0.0722 * b
         }
     }
 
@@ -240,6 +259,8 @@ private enum YPlaneLayout {
             result = (value - 64) / 876 * 255
         case .u16FullRange:
             result = value / 1023 * 255
+        case .bgra8:
+            result = value
         }
         return min(255, max(0, result))
     }

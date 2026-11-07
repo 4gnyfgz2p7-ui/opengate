@@ -33,13 +33,31 @@ final class BayerCalibration {
         var greenPair: Float = 0
         /// 白平衡后 R 与 B 的失衡程度
         var neutrality: Float = 0
+        /// 原始样本的 min-max/mean（**未扣黑电平**），用来看黑白电平参数是否合理
+        var rawRangeText: String = "—"
+        /// 三种解包排法各自的同色梯度，诊断用（若 Apple 不是标准打包，这里会露出来）
+        var modeGradients: [String] = []
+        /// 标定算出的相位
+        var calibratedPattern: Int32 = 0
+        /// 设备通过 ProRAW 附件给出的相位
+        var devicePattern: Int32 = 0
 
         var summary: String {
             let modes = ["A", "B", "C"]
             let patterns = ["RGGB", "BGGR", "GRBG", "GBRG"]
             let modeName = modes[Int(max(0, min(2, unpackMode)))]
             let patternName = patterns[Int(max(0, min(3, pattern)))]
-            return modeName + "·" + patternName + "·" + String(format: "%.3f", gradient)
+            let calibrated = patterns[Int(max(0, min(3, calibratedPattern)))]
+            let device = patterns[Int(max(0, min(3, devicePattern)))]
+            var text = modeName + "·" + patternName
+            text += "·" + String(format: "%.3f", gradient)
+            if calibrated != patternName || device != patternName {
+                text += "·标定" + calibrated + "/设备" + device
+            }
+            if modeGradients.count == 3 {
+                text += "·g" + modeGradients.joined(separator: "/")
+            }
+            return text
         }
     }
 
@@ -123,19 +141,40 @@ final class BayerCalibration {
             zeroFractions[mode] = samples > 0 ? zeros / (samples / 3) : 1
         }
 
-        var bestMode = 0
-        var bestModeScore = Double.greatestFiniteMagnitude
-        let minGradient = gradients.min() ?? 0
-        for mode in 0..<3 {
-            // 梯度为主；两种排法接近时（1.5 倍以内）用"读出来全黑"的比例破平
-            var score = gradients[mode]
-            score += gradients[mode] <= minGradient * 1.5
-                ? zeroFractions[mode] * 0.01
-                : zeroFractions[mode] * 0.5
-            if score < bestModeScore {
-                bestModeScore = score
-                bestMode = mode
+        // 解包方式**固定**为标准 MIPI 打包（mode 0）。
+        //
+        // 12 种组合的全矩阵测试说明了为什么不能自动选：
+        // 「高位在前」与「首字节合装」都采用 b0 在高位、b1 在低位，只是位数分配不同，
+        // 梯度几乎相同（实测 0.0050 对 0.0061，差 1.2 倍），噪声一进来就会选错；
+        // 而选错的代价是画面平均差 0.197（肉眼炸裂）。
+        // 相反，相位的判据分离度是 157 倍（0.0015 对 0.235），可以放心自动判定。
+        // 三种排法的梯度仍然算出来写进元数据，万一 Apple 不是标准打包，按读数一次就能校正。
+        let bestMode = 0
+        _ = zeroFractions
+
+        // 原始样本统计：不扣黑电平，直接看传感器给了什么
+        var rawMin = Double.greatestFiniteMagnitude
+        var rawMax = 0.0
+        var rawSum = 0.0
+        var rawCount = 0.0
+        var rawY = 0
+        while rawY + 4 < height {
+            var rawX = 0
+            while rawX + 4 < width {
+                let sample = unpack(base, rowBytes, rawX, rawY, bestMode)
+                if sample < rawMin { rawMin = sample }
+                if sample > rawMax { rawMax = sample }
+                rawSum += sample
+                rawCount += 1
+                rawX += step
             }
+            rawY += step
+        }
+        let rawRangeText: String
+        if rawCount > 0, rawMin.isFinite {
+            rawRangeText = String(format: "%.0f-%.0f/%.0f", rawMin, rawMax, rawSum / rawCount)
+        } else {
+            rawRangeText = "—"
         }
 
         // ---- 第二关：相位 ----
@@ -143,6 +182,7 @@ final class BayerCalibration {
         var bestPatternScore = Double.greatestFiniteMagnitude
         var bestGreenPair = 0.0
         var bestNeutrality = 0.0
+        var greenPairs: [Int: Double] = [:]
 
         for pattern in 0..<4 {
             let table = colors[pattern]
@@ -179,6 +219,8 @@ final class BayerCalibration {
             let neutrality = abs(log(max(redSum, 1e-6) / max(blueSum, 1e-6)))
             let score = normalizedPair + neutrality * 0.5
 
+            greenPairs[pattern] = normalizedPair
+
             if score < bestPatternScore {
                 bestPatternScore = score
                 bestPattern = pattern
@@ -187,13 +229,30 @@ final class BayerCalibration {
             }
         }
 
+        // 相位：设备通过 ProResRAW_BayerPattern 给的值优先。
+        // 标定的绿点差分离度有 157 倍，所以只在设备没给、或设备值明显错（差 3 倍以上）时才接管。
+        var chosenPattern = bestPattern
+        let preferred = Int(preferredPattern)
+        if preferred >= 0, preferred < 4 {
+            if let preferredPair = greenPairs[preferred],
+               bestGreenPair * 3.0 < preferredPair {
+                chosenPattern = bestPattern
+            } else {
+                chosenPattern = preferred
+            }
+        }
+
         var outcome = Outcome()
         outcome.unpackMode = Int32(bestMode)
-        outcome.pattern = Int32(bestPattern)
+        outcome.pattern = Int32(chosenPattern)
+        outcome.modeGradients = gradients.map { String(format: "%.4f", $0) }
+        outcome.calibratedPattern = Int32(bestPattern)
+        outcome.devicePattern = Int32(preferredPattern)
         outcome.score = Float(bestPatternScore)
         outcome.gradient = Float(gradients[bestMode])
         outcome.greenPair = Float(bestGreenPair)
         outcome.neutrality = Float(bestNeutrality)
+        outcome.rawRangeText = rawRangeText
         return outcome
     }
 }
