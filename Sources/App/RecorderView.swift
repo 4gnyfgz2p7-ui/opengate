@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import AVFoundation
 
 /// 拍摄主界面。
 ///
@@ -756,6 +757,7 @@ struct SettingsSheet: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
+                    frameSection
                     captureSection
                     tierSection
                     storageSection
@@ -775,6 +777,68 @@ struct SettingsSheet: View {
         }
         .preferredColorScheme(.dark)
         .presentationDetents([.medium, .large])
+    }
+
+    /// 画幅对比：视场角更大的那一档才是整块传感器读出的。
+    /// 这一块是为了把"到底哪个是真全幅"从推测变成可读的数字。
+    private var frameSection: some View {
+        section("画幅") {
+            if let device = engine.capture.videoDevice {
+                ForEach(formatRows(device), id: \.title) { row in
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(row.title)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(.white)
+                        Spacer(minLength: 8)
+                        Text(row.fieldOfView)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.7))
+                        if row.isActive {
+                            Text("当前")
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .foregroundStyle(accent)
+                        }
+                    }
+                }
+                Text("视场角更大的那档才覆盖更多传感器；数字相同说明只是同一块画幅换了比例。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("会话未就绪")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private struct FrameRow {
+        var title: String
+        var fieldOfView: String
+        var isActive: Bool
+    }
+
+    private func formatRows(_ device: AVCaptureDevice) -> [FrameRow] {
+        var seen = Set<String>()
+        var rows: [FrameRow] = []
+        let activeWidth = Int(engine.captureConfiguration?.width ?? 0)
+        let activeHeight = Int(engine.captureConfiguration?.height ?? 0)
+
+        for format in device.formats {
+            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            let width = Int(dims.width)
+            let height = Int(dims.height)
+            guard (width == 4224 && height == 3024) || (width == 4032 && height == 3024) else { continue }
+            let title = "\(width)×\(height)"
+            guard !seen.contains(title) else { continue }
+            seen.insert(title)
+            rows.append(FrameRow(
+                title: title,
+                fieldOfView: String(format: "%.1f°", format.videoFieldOfView),
+                isActive: width == activeWidth && height == activeHeight
+            ))
+        }
+        return rows.sorted { $0.title > $1.title }
     }
 
     private var captureSection: some View {

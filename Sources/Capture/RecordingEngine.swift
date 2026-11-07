@@ -64,26 +64,35 @@ final class FrameStats {
         var delivered = 0
         var converted = 0
         var appended = 0
+        var lastFailure: String?
     }
 
     private let lock = NSLock()
     private var delivered = 0
     private var converted = 0
     private var appended = 0
+    private var lastFailure: String?
 
     func markDelivered() { lock.lock(); delivered += 1; lock.unlock() }
     func markConverted() { lock.lock(); converted += 1; lock.unlock() }
     func markAppended() { lock.lock(); appended += 1; lock.unlock() }
 
+    func markFailure(_ stage: String) { lock.lock(); lastFailure = stage; lock.unlock() }
+
     func reset() {
         lock.lock()
-        delivered = 0; converted = 0; appended = 0
+        delivered = 0; converted = 0; appended = 0; lastFailure = nil
         lock.unlock()
     }
 
     var snapshot: Snapshot {
         lock.lock(); defer { lock.unlock() }
-        return Snapshot(delivered: delivered, converted: converted, appended: appended)
+        return Snapshot(
+            delivered: delivered,
+            converted: converted,
+            appended: appended,
+            lastFailure: lastFailure
+        )
     }
 }
 
@@ -221,7 +230,10 @@ final class RecordingEngine: ObservableObject {
                     imageBuffer,
                     chroma422: recorder?.wantsChroma422 ?? false,
                     parameters: RecordingEngine.bayerParameters(from: imageBuffer)
-                ) else { return }
+                ) else {
+                    if let stage = converter.lastFailureStage { statsBox.markFailure(stage) }
+                    return
+                }
 
                 monitorable = converted
                 statsBox.markConverted()
@@ -420,7 +432,8 @@ final class RecordingEngine: ObservableObject {
         guard force || snap.converted == 0 else { return }
 
         recovering = true
-        pipelineNote = "全幅转换未出帧（收帧 \(snap.delivered)），已切到系统 ISP"
+        let stage = snap.lastFailure ?? "未知"
+        pipelineNote = "全幅转换未出帧：\(stage)（收帧 \(snap.delivered)），已切到系统 ISP"
         capture.stop()
         exposure.detach()
         whiteBalance.detach()

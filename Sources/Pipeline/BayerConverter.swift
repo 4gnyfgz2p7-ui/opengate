@@ -38,6 +38,8 @@ final class BayerConverter {
 
     private var sourceBuffer: MTLBuffer?
     private var sourceCapacity = 0
+    private var yPlaneBuffer: MTLBuffer?
+    private var cPlaneBuffer: MTLBuffer?
     private var pools: [OSType: CVPixelBufferPool] = [:]
     private var poolWidth = 0
     private var poolHeight = 0
@@ -63,60 +65,64 @@ final class BayerConverter {
 
     // MARK: - 转换
 
+    /// 最近一次失败发生在哪一步。全幅链路出问题时，这句话直接显示在界面上，
+    /// 不用再靠猜是哪一环。
+    private(set) var lastFailureStage: String?
+
     func convert(
         _ source: CVPixelBuffer,
         chroma422: Bool,
         parameters: Parameters
     ) -> CVPixelBuffer? {
-        guard CVPixelBufferGetPixelFormatType(source) == Self.bayerFormat else { return nil }
+        lastFailureStage = nil
+
+        guard CVPixelBufferGetPixelFormatType(source) == Self.bayerFormat else {
+            lastFailureStage = "源不是 btp2"
+            return nil
+        }
 
         let width = CVPixelBufferGetWidth(source)
         let height = CVPixelBufferGetHeight(source)
-        guard width > 1, height > 1 else { return nil }
+        guard width > 1, height > 1 else {
+            lastFailureStage = "源尺寸异常"
+            return nil
+        }
 
         CVPixelBufferLockBaseAddress(source, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
 
-        guard let sourceBase = CVPixelBufferGetBaseAddress(source) else { return nil }
+        guard let sourceBase = CVPixelBufferGetBaseAddress(source) else {
+            lastFailureStage = "源地址不可读"
+            return nil
+        }
         let sourceRowBytes = CVPixelBufferGetBytesPerRow(source)
         let sourceLength = sourceRowBytes * height
 
         if sourceBuffer == nil || sourceCapacity < sourceLength {
-            guard let allocated = device.makeBuffer(
-                length: sourceLength,
-                options: .storageModeShared
-            ) else { return nil }
+            guard let allocated = device.makeBuffer(length: sourceLength, options: .storageModeShared) else {
+                lastFailureStage = "源缓冲分配失败"
+                return nil
+            }
             sourceBuffer = allocated
             sourceCapacity = sourceLength
         }
-        guard let bayerBuffer = sourceBuffer else { return nil }
+        guard let bayerBuffer = sourceBuffer else {
+            lastFailureStage = "源缓冲缺失"
+            return nil
+        }
         memcpy(bayerBuffer.contents(), sourceBase, sourceLength)
 
-        // x422 的 CV 常量在 iOS SDK 上并不总是存在（工程早先就因为它编译失败过），
-        // 统一用四字符码拼，避免 SDK 差异。
+        // x422 的 CV 常量在 iOS SDK 上并不总是存在，统一用四字符码拼
         let format = chroma422
             ? FourCC.code("x422")
             : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-        guard let output = pooledBuffer(format: format, width: width, height: height) else {
+
+        guard let yBuffer = outputBuffer(&yPlaneBuffer, bytes: width * height * 2),
+              let cBuffer = outputBuffer(&cPlaneBuffer, bytes: (chroma422 ? width * height : width * height / 2) * 2)
+        else {
+            lastFailureStage = "输出缓冲分配失败"
             return nil
         }
-
-        CVPixelBufferLockBaseAddress(output, [])
-        defer { CVPixelBufferUnlockBaseAddress(output, []) }
-
-        guard let yBase = CVPixelBufferGetBaseAddressOfPlane(output, 0),
-              let cBase = CVPixelBufferGetBaseAddressOfPlane(output, 1),
-              let yBuffer = wrapped(
-                yBase,
-                length: CVPixelBufferGetBytesPerRowOfPlane(output, 0)
-                    * CVPixelBufferGetHeightOfPlane(output, 0)
-              ),
-              let cBuffer = wrapped(
-                cBase,
-                length: CVPixelBufferGetBytesPerRowOfPlane(output, 1)
-                    * CVPixelBufferGetHeightOfPlane(output, 1)
-              )
-        else { return nil }
 
         var params = parameters
         params.width = UInt32(width)
@@ -126,7 +132,10 @@ final class BayerConverter {
 
         guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder()
-        else { return nil }
+        else {
+            lastFailureStage = "命令队列失败"
+            return nil
+        }
 
         encoder.setComputePipelineState(pipeline)
         encoder.setBuffer(bayerBuffer, offset: 0, index: 0)
@@ -145,24 +154,56 @@ final class BayerConverter {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
-        guard commandBuffer.status == .completed else { return nil }
+        guard commandBuffer.status == .completed else {
+            lastFailureStage = "GPU 未完成（\(commandBuffer.status.rawValue)）"
+            return nil
+        }
+
+        guard let output = pooledBuffer(format: format, width: width, height: height) else {
+            lastFailureStage = "输出像素缓冲创建失败"
+            return nil
+        }
+
+        CVPixelBufferLockBaseAddress(output, [])
+        defer { CVPixelBufferUnlockBaseAddress(output, []) }
+
+        guard let yBase = CVPixelBufferGetBaseAddressOfPlane(output, 0),
+              let cBase = CVPixelBufferGetBaseAddressOfPlane(output, 1)
+        else {
+            lastFailureStage = "输出平面不可写"
+            return nil
+        }
+
+        // 逐行回写：平面 stride 可以大于紧排字节数，按行搬最稳。
+        // 之前是把平面指针直接包成 MTLBuffer 让 GPU 写（bytesNoCopy 要求页对齐），
+        // 对齐不满足时整条链路静默返回 nil——现在只依赖 memcpy。
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(output, 0)
+        let yRowBytes = width * 2
+        let ySource = yBuffer.contents()
+        for row in 0..<height {
+            memcpy(yBase + row * yStride, ySource + row * yRowBytes, yRowBytes)
+        }
+
+        let chromaHeight = chroma422 ? height : height / 2
+        let cStride = CVPixelBufferGetBytesPerRowOfPlane(output, 1)
+        let cRowBytes = (chroma422 ? width : width / 2) * 4
+        let cSource = cBuffer.contents()
+        for row in 0..<chromaHeight {
+            memcpy(cBase + row * cStride, cSource + row * cRowBytes, cRowBytes)
+        }
+
         return output
     }
 
     // MARK: - 缓冲
 
-    /// 把一个 CVPixelBuffer 平面包成 MTLBuffer。
-    /// `bytesNoCopy` 要求页对齐，I/O Surface 后背存储通常满足；不满足就放弃，
-    /// 由调用方降级——宁可录 4:3，也不要出一堆颜色错乱的文件。
-    private func wrapped(_ pointer: UnsafeMutableRawPointer, length: Int) -> MTLBuffer? {
-        guard length > 0, Int(bitPattern: pointer) % 4096 == 0 else { return nil }
-        let rounded = (length + 4095) / 4096 * 4096
-        return device.makeBuffer(
-            bytesNoCopy: pointer,
-            length: rounded,
-            options: .storageModeShared,
-            deallocator: nil
-        )
+    private func outputBuffer(_ cache: inout MTLBuffer?, bytes: Int) -> MTLBuffer? {
+        if let existing = cache, existing.length >= bytes { return existing }
+        guard let created = device.makeBuffer(length: bytes, options: .storageModeShared) else {
+            return nil
+        }
+        cache = created
+        return created
     }
 
     private func pooledBuffer(format: OSType, width: Int, height: Int) -> CVPixelBuffer? {
@@ -191,11 +232,29 @@ final class BayerConverter {
             pools[format] = created
         }
 
-        guard let pool = pools[format] else { return nil }
-        var buffer: CVPixelBuffer?
-        let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer)
-        guard status == kCVReturnSuccess else { return nil }
-        return buffer
+        if let pool = pools[format] {
+            var buffer: CVPixelBuffer?
+            let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer)
+            if status == kCVReturnSuccess, let buffer = buffer { return buffer }
+        }
+
+        // 池这条路不通就直接建一个：池失败通常只是属性问题，
+        // 没必要因此让整条全幅链路瘫掉。
+        let directAttributes: [String: Any] = [
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+        ]
+        var direct: CVPixelBuffer?
+        let directStatus = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            format,
+            directAttributes as CFDictionary,
+            &direct
+        )
+        guard directStatus == kCVReturnSuccess else { return nil }
+        return direct
     }
 
     // MARK: - 着色器
