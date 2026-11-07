@@ -79,7 +79,7 @@ final class BayerConverter {
     static let bayerFormat: OSType = FourCC.code("btp2")
     static let outputFormat: OSType = kCVPixelFormatType_32BGRA
     /// 供外部（写入端）判断该走哪条追加路径
-    static var isBayer(_ format: OSType) -> Bool { format == bayerFormat }
+    static func isBayer(_ format: OSType) -> Bool { format == bayerFormat }
 
     private let device: MTLDevice
     private let queue: MTLCommandQueue
