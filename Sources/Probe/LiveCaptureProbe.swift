@@ -47,12 +47,13 @@ final class LiveCaptureProbe: NSObject, AVCaptureVideoDataOutputSampleBufferDele
             if let dictionary = CMCopyDictionaryOfAttachments(
                 allocator: kCFAllocatorDefault,
                 target: sampleBuffer,
-                attachmentMode: .shouldPropagate
+                attachmentMode: kCMAttachmentMode_ShouldPropagate
             ) as? [String: Any] {
                 sampleAttachmentKeys = dictionary.keys.sorted()
             }
 
-            if let dictionary = CVPixelBufferGetAttachments(imageBuffer, .shouldPropagate) as? [String: Any] {
+            // CVPixelBufferGetAttachments 在 iOS SDK 中不可用，走通用的 CVBuffer 接口
+            if let dictionary = CVBufferGetAttachments(imageBuffer, kCVAttachmentMode_ShouldPropagate) as? [String: Any] {
                 pixelAttachmentKeys = dictionary.keys.sorted()
             }
 
