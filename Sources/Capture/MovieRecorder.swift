@@ -405,17 +405,28 @@ final class MovieRecorder {
         return values?.volumeAvailableCapacityForImportantUsage ?? 0
     }
 
-    /// 开录前的空间检查。按预估码率 × 计划时长估，留 1.5 倍余量。
-    static func preflightSpaceCheck(
-        tier: QualityTier,
-        plannedSeconds: Double
-    ) -> RecorderError? {
-        let directory = recordingDirectory()
-        let available = availableCapacity(at: directory)
-        let requiredBytes = Int64(tier.estimatedMegabytesPerSecond * plannedSeconds * 1.5 * 1_000_000)
-        if available > 0 && available < requiredBytes {
+    /// 剩余可录时长（秒）。按该档真实写入速率折算，读不到容量时返回 0。
+    static func remainingSeconds(tier: QualityTier) -> Double {
+        let available = Double(availableCapacity(at: recordingDirectory()))
+        guard available > 0 else { return 0 }
+        return available / (max(tier.estimatedMegabytesPerSecond, 1) * 1_000_000)
+    }
+
+    /// 开录前的空间检查。
+    ///
+    /// 只拒绝真正无法开始的情况：不足 90 秒的写入量。
+    /// 早先按"计划录 10 分钟"预留，配合被放大的码率估算，
+    /// 会把有 94 GB 空闲的设备直接挡在门外——那不是保护，是误伤。
+    /// 录制过程中由 `RecordingEngine` 持续监控，空间见底时正常收尾。
+    static func preflightSpaceCheck(tier: QualityTier) -> RecorderError? {
+        let available = availableCapacity(at: recordingDirectory())
+        guard available > 0 else { return nil }
+
+        let mbps = max(tier.estimatedMegabytesPerSecond, 1)
+        let minimumBytes = Int64(90 * mbps * 1_000_000)
+        if available < minimumBytes {
             return .insufficientSpace(
-                requiredMB: requiredBytes / 1_000_000,
+                requiredMB: minimumBytes / 1_000_000,
                 availableMB: available / 1_000_000
             )
         }

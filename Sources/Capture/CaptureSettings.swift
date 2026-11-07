@@ -2,58 +2,57 @@ import Foundation
 import AVFoundation
 import CoreMedia
 
-/// 四档定义。
+/// 四档定义，按写入码率从低到高排列。
 ///
 /// 四档共用同一份全幅画面：切档只改末端编码器、色度、GOP，
 /// 不改画幅、不改几何、不改帧率。
 ///
-/// 体积量级实测预期（按 4224×3024 @ 24 fps 推算）：
-/// HQ ≈ 136 MB/s ＞ LT ≈ 95 MB/s ≳ Plan B（All-Intra HEVC）＞ Plan A（长 GOP HEVC）。
-/// 注意档 2 的体积小于档 3，与枚举顺序相反——这是编码结构决定的，不是笔误。
+/// 命名直接用编码名称，不用"档 1 / Plan A"这类编号——
+/// 编号在切换、归档、对文档时都要回查对照表，编码名称自带含义。
 enum QualityTier: String, CaseIterable, Identifiable, Codable {
-    case proResHQ
     case hevcLongGOP
     case hevcAllIntra
     case proResLT
+    case proResHQ
 
     var id: String { rawValue }
 
     // MARK: - 显示
 
-    /// 任务书编号，写进元数据便于对齐文档
+    /// 写进元数据的稳定标识
     var identifier: String {
         switch self {
-        case .proResHQ: return "档1-HQ"
-        case .hevcLongGOP: return "档2-PlanA"
-        case .hevcAllIntra: return "档3-PlanB"
-        case .proResLT: return "档4-LT"
+        case .hevcLongGOP: return "hevc-long-gop"
+        case .hevcAllIntra: return "hevc-all-intra"
+        case .proResLT: return "prores422lt"
+        case .proResHQ: return "prores422hq"
         }
     }
 
     var displayName: String {
         switch self {
-        case .proResHQ: return "档 1 · HQ"
-        case .hevcLongGOP: return "档 2 · Plan A"
-        case .hevcAllIntra: return "档 3 · Plan B"
-        case .proResLT: return "档 4 · LT"
+        case .hevcLongGOP: return "HEVC 长 GOP"
+        case .hevcAllIntra: return "HEVC 全 I 帧"
+        case .proResLT: return "ProRes 422 LT"
+        case .proResHQ: return "ProRes 422 HQ"
         }
     }
 
     var subtitle: String {
         switch self {
-        case .proResHQ: return "ProRes 422 HQ · 10-bit 4:2:2 · 全 I 帧"
-        case .hevcLongGOP: return "HEVC Main10 · 10-bit 4:2:0 · 长 GOP"
-        case .hevcAllIntra: return "HEVC Main10 · 10-bit 4:2:0 · 全 I 帧"
-        case .proResLT: return "ProRes 422 LT · 10-bit 4:2:2 · 全 I 帧"
+        case .hevcLongGOP: return "10-bit 4:2:0 · 长 GOP"
+        case .hevcAllIntra: return "10-bit 4:2:0 · 全 I 帧"
+        case .proResLT: return "10-bit 4:2:2 · 全 I 帧"
+        case .proResHQ: return "10-bit 4:2:2 · 全 I 帧"
         }
     }
 
     var roleDescription: String {
         switch self {
+        case .hevcLongGOP: return "体积最小，录得最久"
+        case .hevcAllIntra: return "逐帧可剪，体积居中"
+        case .proResLT: return "ProRes 轻量档"
         case .proResHQ: return "调色母版"
-        case .hevcLongGOP: return "最小体积 · 录得最久"
-        case .hevcAllIntra: return "逐帧可剪"
-        case .proResLT: return "ProRes 瘦身档"
         }
     }
 
@@ -109,15 +108,19 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
         }
     }
 
-    /// 预估写入速率（MB/s），用于界面提示与剩余空间估算。
-    /// 依据：ProRes 422 HQ 约 3.54 bit/像素（Apple ProRes 白皮书 1080p29.97 = 220 Mbps 反推）；
-    /// HEVC 按设定码率折算。
+    /// 预估写入速率（MB/s）。
+    ///
+    /// 单位必须统一为 MB/s。旧实现里 HEVC 返回的是 KB/s（少除一个 1000），
+    /// 而空间检查按 MB 乘 1e6，需求被放大一千倍——
+    /// 于是 94 GB 可用空间被判成"需要 22.5 TB"而拒绝开录。
     var estimatedMegabytesPerSecond: Double {
+        if let bitRate = averageBitRate {
+            return Double(bitRate) / 8.0 / 1_000_000.0
+        }
         switch self {
         case .proResHQ: return 135
         case .proResLT: return 95
-        case .hevcLongGOP: return Double(averageBitRate ?? 0) / 8.0 / 1000.0
-        case .hevcAllIntra: return Double(averageBitRate ?? 0) / 8.0 / 1000.0
+        default: return 0
         }
     }
 

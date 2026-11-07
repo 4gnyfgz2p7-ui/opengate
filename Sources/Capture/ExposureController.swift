@@ -52,18 +52,35 @@ final class ExposureController: ObservableObject {
 
         var shortLabel: String {
             switch self {
-            case .autoBoth: return "A / A"
-            case .manualISO: return "M / A"
-            case .manualShutter: return "A / M"
-            case .manualBoth: return "M / M"
+            case .autoBoth: return "AUTO"
+            case .manualISO: return "ISO"
+            case .manualShutter: return "快门"
+            case .manualBoth: return "手动"
             }
+        }
+
+        /// 界面按钮上的主标题。用摄影惯用词，不用 A/A、M/A 这类缩写——
+        /// 缩写要把"哪个是哪个"记在脑子里，而按钮只有四个。
+        var title: String {
+            switch self {
+            case .autoBoth: return "自动"
+            case .manualISO: return "ISO 优先"
+            case .manualShutter: return "快门优先"
+            case .manualBoth: return "全手动"
+            }
+        }
+
+        /// 是否显示 EV 滑块。全手动不给 EV——那时 ISO 与快门各自独立，
+        /// 亮度由这两个值直接决定，再叠一层 EV 只会互相打架。
+        var showsEVSlider: Bool {
+            self != .manualBoth
         }
 
         var description: String {
             switch self {
             case .autoBoth: return "ISO 自动 · 快门自动"
-            case .manualISO: return "ISO 手动 · 快门自动（无级）"
-            case .manualShutter: return "ISO 自动 · 快门手动"
+            case .manualISO: return "ISO 手动 · 快门自动（改 ISO 时快门反比补偿）"
+            case .manualShutter: return "ISO 自动 · 快门手动（改快门时 ISO 反比补偿）"
             case .manualBoth: return "ISO 手动 · 快门手动"
             }
         }
@@ -205,18 +222,46 @@ final class ExposureController: ObservableObject {
 
     private func applyManualISO() {
         guard let device = device, mode.isoIsManual, !mode.usesNativeAuto else { return }
+
+        let newISO = clampISO(iso)
         try? device.lockForConfiguration()
-        let duration = clampDuration(shutterSeconds)
-        let targetISO = clampISO(iso)
-        device.setExposureModeCustom(duration: duration, iso: targetISO, completionHandler: nil)
+
+        var duration = clampDuration(shutterSeconds)
+
+        // ISO 优先（快门自动）下，改 ISO 不应改变画面亮度：
+        // 曝光量 ∝ ISO × 快门，所以快门按反比补偿，两者一起写回设备。
+        // 全手动模式不补偿——那时改 ISO 就是要提亮或压暗。
+        if mode == .manualISO {
+            let currentISO = max(device.iso, 1)
+            let currentShutter = CMTimeGetSeconds(device.exposureDuration)
+            if currentShutter > 0, newISO > 0 {
+                duration = clampDuration(currentShutter * Double(currentISO / newISO))
+                shutterSeconds = CMTimeGetSeconds(duration)
+            }
+        }
+
+        device.setExposureModeCustom(duration: duration, iso: newISO, completionHandler: nil)
         device.unlockForConfiguration()
     }
 
     private func applyManualShutter() {
         guard let device = device, mode.shutterIsManual, !mode.usesNativeAuto else { return }
-        try? device.lockForConfiguration()
+
         let duration = clampDuration(shutterSeconds)
-        let targetISO = clampISO(device.iso)
+        var targetISO = clampISO(device.iso)
+
+        // 快门优先（ISO 自动）下同理：改快门时 ISO 反比补偿，亮度不变。
+        if mode == .manualShutter {
+            let currentISO = device.iso
+            let currentShutter = CMTimeGetSeconds(device.exposureDuration)
+            let newShutter = CMTimeGetSeconds(duration)
+            if currentShutter > 0, newShutter > 0 {
+                targetISO = clampISO(Float(Double(currentISO) * currentShutter / newShutter))
+                iso = targetISO
+            }
+        }
+
+        try? device.lockForConfiguration()
         device.setExposureModeCustom(duration: duration, iso: targetISO, completionHandler: nil)
         device.unlockForConfiguration()
     }

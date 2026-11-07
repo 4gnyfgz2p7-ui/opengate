@@ -68,6 +68,7 @@ final class RecordingEngine: ObservableObject {
             if state.isBusy && tier != oldValue {
                 tier = oldValue
             }
+            refreshStorageNote()
         }
     }
 
@@ -80,6 +81,11 @@ final class RecordingEngine: ObservableObject {
     @Published private(set) var lastLocationDegraded = false
     @Published private(set) var history: [MovieRecorder.Outcome] = []
     @Published private(set) var sessionReady = false
+
+    /// 当前档位下还能录多久（秒）。空间读不到时为 0。
+    @Published private(set) var remainingSeconds: Double = 0
+    /// 录制中被空间逼停的原因，用于界面提示
+    @Published private(set) var autoStopReason: String?
 
     /// 当前生效的拍摄角度。转发自 `rotation`，让主界面能观察到变化。
     @Published private(set) var rotationDegrees: CGFloat = 90
@@ -245,6 +251,7 @@ final class RecordingEngine: ObservableObject {
         // 角度在按下的瞬间定格：录制中转向不应改变已写文件的显示矩阵
         let degrees = rotation.degrees
         let rotationLabel = rotation.label
+        autoStopReason = nil
 
         Task { [weak self] in
             guard let self = self else { return }
@@ -258,10 +265,11 @@ final class RecordingEngine: ObservableObject {
 
             // ---- 步骤 2：空间检查 ----
             self.state = .preparing("正在检查存储…")
-            if let spaceError = MovieRecorder.preflightSpaceCheck(tier: selectedTier, plannedSeconds: 600) {
+            if let spaceError = MovieRecorder.preflightSpaceCheck(tier: selectedTier) {
                 self.state = .failed(spaceError.localizedDescription)
                 return
             }
+            self.remainingSeconds = MovieRecorder.remainingSeconds(tier: selectedTier)
 
             // ---- 步骤 3：建 writer 并写入元数据 ----
             self.state = .preparing("正在准备编码器…")
@@ -354,6 +362,14 @@ final class RecordingEngine: ObservableObject {
                         self.droppedFrames = recorder.liveDroppedFrames
                     }
                     self.refreshWrittenBytes()
+                    self.refreshStorageNote()
+
+                    // 空间见底时主动收尾，而不是让 writer 在半路失败：
+                    // 正常收尾能保住文件与 moov，失败只会留下无法播放的残片。
+                    if self.remainingSeconds < 20 {
+                        self.autoStopReason = "存储空间将满，已自动停止并保存"
+                        self.stopRecording()
+                    }
                 }
             }
         }
@@ -372,6 +388,11 @@ final class RecordingEngine: ObservableObject {
         } else if let last = history.first {
             writtenBytes = last.fileSize
         }
+    }
+
+    /// 剩余可录时长。每 0.5 秒重算一次，代价只有一次 resourceValues 查询。
+    private func refreshStorageNote() {
+        remainingSeconds = MovieRecorder.remainingSeconds(tier: tier)
     }
 
     // MARK: - 派生信息
