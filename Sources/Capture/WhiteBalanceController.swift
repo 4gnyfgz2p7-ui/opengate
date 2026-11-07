@@ -70,14 +70,38 @@ final class WhiteBalanceController: ObservableObject {
         self.device = device
 
         // 接管时把设备当前估算值读进滑块，避免一进来就跳色
-        let current = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains)
-        if current.temperature.isFinite, current.temperature > 0 {
-            temperature = min(max(current.temperature, Self.temperatureRange.lowerBound), Self.temperatureRange.upperBound)
+        if let gains = Self.readableGains(of: device) {
+            let current = device.temperatureAndTintValues(for: gains)
+            if current.temperature.isFinite, current.temperature > 0 {
+                temperature = min(max(current.temperature, Self.temperatureRange.lowerBound), Self.temperatureRange.upperBound)
+            }
+            tint = min(max(current.tint, Self.tintRange.lowerBound), Self.tintRange.upperBound)
+            liveTemperature = temperature
+            liveTint = tint
         }
-        tint = min(max(current.tint, Self.tintRange.lowerBound), Self.tintRange.upperBound)
 
         applyMode()
         startReadback()
+    }
+
+    /// 取一组合法的白平衡增益。
+    ///
+    /// `temperatureAndTintValues(for:)` 对越界增益**抛 ObjC 异常**，
+    /// Swift 的 try 接不住，整个 App 会直接terminate——
+    /// 之前录制中途闪退、留下 0 字节文件的就是它。
+    /// 增益出现 0（Bayer 直出格式下就会这样）或大于 maxWhiteBalanceGain 时
+    /// 一律视为不可读，跳过这一次换算。
+    private static func readableGains(of device: AVCaptureDevice) -> AVCaptureDevice.WhiteBalanceGains? {
+        let upper = device.maxWhiteBalanceGain
+        guard upper.isFinite, upper >= 1 else { return nil }
+        let gains = device.deviceWhiteBalanceGains
+        func valid(_ value: Float) -> Bool {
+            value.isFinite && value >= 1 && value <= upper
+        }
+        guard valid(gains.redGain), valid(gains.greenGain), valid(gains.blueGain) else {
+            return nil
+        }
+        return gains
     }
 
     func detach() {
@@ -149,7 +173,8 @@ final class WhiteBalanceController: ObservableObject {
                 guard let self = self, !Task.isCancelled else { return }
                 await MainActor.run {
                     guard let device = self.device else { return }
-                    let values = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains)
+                    guard let gains = Self.readableGains(of: device) else { return }
+                    let values = device.temperatureAndTintValues(for: gains)
                     if values.temperature.isFinite {
                         self.liveTemperature = values.temperature
                     }

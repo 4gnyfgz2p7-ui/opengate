@@ -15,37 +15,70 @@ struct CameraPreviewView: UIViewRepresentable {
     func makeUIView(context: Context) -> PreviewContainerView {
         let view = PreviewContainerView()
         view.backgroundColor = .black
-        view.previewLayer.session = session
         view.previewLayer.videoGravity = .resizeAspect
+        view.requestedRotation = rotationDegrees
+        view.attach(session: session)
         return view
     }
 
     func updateUIView(_ uiView: PreviewContainerView, context: Context) {
-        if uiView.previewLayer.session !== session {
-            uiView.previewLayer.session = session
-        }
-        applyRotation(to: uiView)
+        uiView.requestedRotation = rotationDegrees
+        uiView.attach(session: session)
+        uiView.applyRotationIfPossible()
     }
 
-    private func applyRotation(to view: PreviewContainerView) {
-        guard let connection = view.previewLayer.connection else { return }
-        // 预览层连接在 session 装配完成后才存在，首次调用可能拿不到，
-        // 下一次更新会补上
-        if connection.isVideoRotationAngleSupported(rotationDegrees) {
-            connection.videoRotationAngle = rotationDegrees
-        }
-    }
-
+    /// 预览容器。
+    ///
+    /// 黑屏的根因就在这里：预览图层一旦离开窗口再回来（切横竖、换布局分支、
+    /// 从后台回前台），视频连接会失效，但 `session` 属性还挂着，
+    /// `AVCaptureVideoPreviewLayer` 自己不会重建连接——画面就这么黑着，
+    /// 而采集会话其实还在正常跑（所以开关指示灯仍是绿的）。
+    /// 修法是在重新入窗和每次布局时把 session 再挂一次，并补回旋转角。
     final class PreviewContainerView: UIView {
+
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
 
+        var requestedRotation: CGFloat = 90
+
+        private weak var attachedSession: AVCaptureSession?
+
         var previewLayer: AVCaptureVideoPreviewLayer {
-            guard let layer = layer as? AVCaptureVideoPreviewLayer else {
-                // layerClass 已固定，这里不可能走到；用空层兜底而不是 fatalError，
-                // 避免界面在异常情况下直接崩掉
-                return AVCaptureVideoPreviewLayer()
+            // layerClass 已固定，这里必定成立
+            layer as! AVCaptureVideoPreviewLayer
+        }
+
+        func attach(session: AVCaptureSession) {
+            guard previewLayer.session !== session else { return }
+            previewLayer.session = session
+            attachedSession = session
+        }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            guard window != nil else { return }
+            // 重新入窗：把 session 再挂一次，强制重建视频连接
+            if let session = attachedSession ?? previewLayer.session {
+                previewLayer.session = session
+                attachedSession = session
             }
-            return layer
+            applyRotationIfPossible()
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            if previewLayer.frame != bounds {
+                previewLayer.frame = bounds
+            }
+            applyRotationIfPossible()
+        }
+
+        func applyRotationIfPossible() {
+            guard let connection = previewLayer.connection else { return }
+            // 连接在 session 装配完成后才存在，首次可能拿不到，
+            // 下一次 layout 会补上
+            if connection.isVideoRotationAngleSupported(requestedRotation) {
+                connection.videoRotationAngle = requestedRotation
+            }
         }
     }
 }

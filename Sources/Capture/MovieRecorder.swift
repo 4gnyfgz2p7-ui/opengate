@@ -73,8 +73,18 @@ final class MovieRecorder {
     private var lastPTS: CMTime = .zero
     private var finished = false
     private var startWallClock = Date()
+    /// 第一条被编码器拒收的帧的原因。空文件问题全靠这条线索定位。
+    private var firstAppendFailure: String?
     /// 实际生效的编码设置层级：0 为完整设置，数字越大表示降级越多
     private(set) var settingsLevel = 0
+
+    /// ProRes 需要 4:2:2 输入，HEVC 只要 4:2:0
+    var wantsChroma422: Bool { tier.isProRes }
+
+    var appendFailureDescription: String? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return firstAppendFailure
+    }
 
     private static let frameTimescale: CMTimeScale = 24
 
@@ -235,7 +245,16 @@ final class MovieRecorder {
             lastPTS = targetPTS
             stateLock.unlock()
         } else {
-            stateLock.lock(); droppedVideoFrames += 1; stateLock.unlock()
+            stateLock.lock()
+            droppedVideoFrames += 1
+            let firstFailure = firstAppendFailure == nil
+            if firstFailure {
+                // 只在第一次记，避免每条帧都拼字符串。
+                // 这条文本是"文件 0 字节"唯一的现场证据，必须留给界面看。
+                let reason = writer.error?.localizedDescription ?? "append 返回 false"
+                firstAppendFailure = reason
+            }
+            stateLock.unlock()
         }
     }
 
@@ -314,6 +333,7 @@ final class MovieRecorder {
         let audioBuffers = writtenAudioBuffers
         let discarded = discardedAudioBuffers
         let last = lastPTS
+        let failure = firstAppendFailure
         stateLock.unlock()
 
         videoInput.markAsFinished()
@@ -323,6 +343,27 @@ final class MovieRecorder {
             writer.finishWriting {
                 continuation.resume()
             }
+        }
+
+        // 一帧都没写进去时不要留文件。
+        // 之前这种情况下会留下一个 0 字节的 .mov——用户看到的就是「录完 0 KB」，
+        // 既打不开也说不出原因。删掉它，把真正的原因交给界面显示。
+        if frames == 0 {
+            try? FileManager.default.removeItem(at: outputURL)
+            return Outcome(
+                url: outputURL,
+                tier: tier,
+                duration: 0,
+                fileSize: 0,
+                writtenVideoFrames: 0,
+                droppedVideoFrames: dropped,
+                writtenAudioBuffers: audioBuffers,
+                discardedAudioBuffers: discarded,
+                effectiveFrameRate: 0,
+                averageWriteRateMBps: 0,
+                finishedCleanly: false,
+                note: "未写入任何帧：\(failure ?? "编码器没有接受画面")"
+            )
         }
 
         var note = "正常"

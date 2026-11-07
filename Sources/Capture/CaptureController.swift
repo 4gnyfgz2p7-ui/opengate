@@ -39,6 +39,10 @@ final class CaptureController: NSObject {
         var whiteBalanceLocked: Bool = false
         var focusLocked: Bool = false
         var audioEnabled: Bool = false
+        /// 采集回来的是传感器原始 Bayer，编码前必须自己 demosaic
+        var isBayer: Bool = false
+        /// 全幅是否被迫让位给系统 ISP（Bayer 转换器不可用时）
+        var degradedToSystemISP: Bool = false
         var notes: [String] = []
 
         var resolutionText: String { "\(width)×\(height)" }
@@ -47,6 +51,13 @@ final class CaptureController: NSObject {
             if isExact24 { return "1/24 精确 24.000" }
             guard frameDurationTimescale > 0, frameDurationValue > 0 else { return "—" }
             return "\(frameDurationValue)/\(frameDurationTimescale)"
+        }
+
+        /// 一行说清画面是怎么来的，界面常驻显示，避免"以为在录全幅"
+        var pipelineText: String {
+            if isBayer { return "Bayer 直出 · 自建管线" }
+            if degradedToSystemISP { return "系统 ISP · 非全幅" }
+            return "系统 ISP"
         }
     }
 
@@ -88,7 +99,8 @@ final class CaptureController: NSObject {
     func configure(
         path: Path,
         audioEnabled: Bool,
-        lockWhiteBalance: Bool = false
+        lockWhiteBalance: Bool = false,
+        canProcessBayer: Bool = true
     ) -> Configuration {
 
         var result = Configuration()
@@ -151,18 +163,35 @@ final class CaptureController: NSObject {
         session.addOutput(output)
         videoOutput = output
 
-        // 像素格式必须在 output 进入会话之后才能查到
-        if let chosen = Self.choosePixelFormat(from: output, path: path) {
-            output.videoSettings = [
-                kCVPixelBufferPixelFormatTypeKey as String: chosen
-            ]
-            result.pixelFormat = FourCC.string(chosen)
-        } else {
-            result.notes.append("未找到合适像素格式，沿用系统默认")
-            result.pixelFormat = "默认"
+        output.setSampleBufferDelegate(self, queue: videoQueue)
+
+        session.commitConfiguration()
+
+        // 像素格式必须**显式**指定：这个全幅格式在输出上只暴露 btp2，
+        // 什么都不设等于向系统要一个它给不出的 420v——结果是零帧到达，
+        // 预览层照样出画（它自己直连格式），于是表现为
+        // "取景正常、波形空、录制文件 0 字节"。
+        var chosen = Self.choosePixelFormat(from: output.availableVideoPixelFormatTypes, path: path)
+
+        if let code = chosen, FourCC.isBayer(code), !canProcessBayer {
+            result.notes.append("Bayer 转换器不可用，改用系统 ISP 格式")
+            if let adopted = adoptProcessedFormat(device: device, output: output, result: &result) {
+                chosen = adopted
+                result.degradedToSystemISP = true
+            }
         }
 
-        output.setSampleBufferDelegate(self, queue: videoQueue)
+        if let chosen = chosen {
+            output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: chosen]
+            result.pixelFormat = FourCC.string(chosen)
+            result.isBayer = FourCC.isBayer(chosen)
+            if result.isBayer {
+                result.path = .bayerDirect
+            }
+        } else {
+            result.notes.append("该格式没有可用像素格式")
+            result.pixelFormat = "无"
+        }
 
         // 防抖必须关：任何防抖都会裁切画幅，与"全幅不裁切"直接冲突
         if let connection = output.connection(with: .video) {
@@ -180,12 +209,12 @@ final class CaptureController: NSObject {
 
         // ---- 音频 ----
         if audioEnabled {
+            session.beginConfiguration()
             if attachAudio(result: &result) {
                 result.audioEnabled = true
             }
+            session.commitConfiguration()
         }
-
-        session.commitConfiguration()
 
         // commit 会把设备帧时长改回默认值（实测变回 60 fps），
         // 必须在 commit 之后重新钉一次，否则记录到的实际帧率与标称不符。
@@ -201,6 +230,46 @@ final class CaptureController: NSObject {
 
         configuration = result
         return result
+    }
+
+    /// 换一个能吐 YUV 的格式。
+    ///
+    /// 只在前一条通路不可用时才走这里（例如 Bayer 转换器没起来）。
+    /// 逐个子尝试是必要的：能否出 YUV 只有 commit 之后读
+    /// `availableVideoPixelFormatTypes` 才知道，没有静态查询接口。
+    private func adoptProcessedFormat(
+        device: AVCaptureDevice,
+        output: AVCaptureVideoDataOutput,
+        result: inout Configuration
+    ) -> OSType? {
+        let current = device.activeFormat
+        let candidates = device.formats
+            .filter { $0 !== current && !$0.videoSupportedFrameRateRanges.isEmpty }
+            .sorted { lhs, rhs in
+                let l = CMVideoFormatDescriptionGetDimensions(lhs.formatDescription)
+                let r = CMVideoFormatDescriptionGetDimensions(rhs.formatDescription)
+                return Int(l.width) * Int(l.height) > Int(r.width) * Int(r.height)
+            }
+            .prefix(8)
+
+        for candidate in candidates {
+            var scratch = result
+            session.beginConfiguration()
+            applyDeviceSettings(
+                device: device,
+                format: candidate,
+                lockWhiteBalance: false,
+                result: &scratch
+            )
+            session.commitConfiguration()
+
+            if let code = Self.firstProcessedFormat(from: output.availableVideoPixelFormatTypes) {
+                let dims = CMVideoFormatDescriptionGetDimensions(candidate.formatDescription)
+                result.notes.append("降级尺寸 \(dims.width)×\(dims.height)")
+                return code
+            }
+        }
+        return nil
     }
 
     private func applyDeviceSettings(
@@ -375,30 +444,33 @@ final class CaptureController: NSObject {
     ///
     /// systemProcessed 优先 10-bit 全幅 YUV；退到 8-bit；再退 BGRA。
     /// bayerDirect 只接受 Bayer 四字符码。
-    static func choosePixelFormat(
-        from output: AVCaptureVideoDataOutput,
-        path: Path
-    ) -> OSType? {
-        let available = output.availableVideoPixelFormatTypes
+    ///
+    /// 一条都不能漏：选不出格式时**绝不能**把 `videoSettings` 留空——
+    /// 留空等于向系统要默认的 420v，而全幅格式给不出，结果是零帧。
+    static func choosePixelFormat(from available: [OSType], path: Path) -> OSType? {
         guard !available.isEmpty else { return nil }
 
         switch path {
         case .systemProcessed:
-            // 只保留确定存在的常量：iOS 采集侧输出以 4:2:0 为主，
-            // 422 10-bit 在 AVCaptureVideoDataOutput 上基本不可得，
-            // 且对应 CV 常量存在 SDK 版本差异，不引入以免编译失败。
-            let preferred: [OSType] = [
-                kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
-                kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
-                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                kCVPixelFormatType_32BGRA,
-            ]
-            return preferred.first { available.contains($0) }
+            if let processed = firstProcessedFormat(from: available) { return processed }
+            // 系统 ISP 一步都走不通：退回 Bayer，交给自建管线
+            return available.first { FourCC.isBayer($0) }
 
         case .bayerDirect:
-            return available.first { FourCC.isBayer($0) }
+            return available.first { FourCC.isBayer($0) } ?? firstProcessedFormat(from: available)
         }
+    }
+
+    /// 能直接喂编码器的格式（10-bit → 8-bit → BGRA）
+    static func firstProcessedFormat(from available: [OSType]) -> OSType? {
+        let preferred: [OSType] = [
+            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            kCVPixelFormatType_32BGRA,
+        ]
+        return preferred.first { available.contains($0) }
     }
 }
 

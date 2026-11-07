@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// 拍摄主界面。
 ///
@@ -14,6 +15,7 @@ struct RecorderView: View {
 
     @StateObject private var engine = RecordingEngine()
     @State private var showSettings = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var onShowProbe: () -> Void
 
@@ -41,42 +43,34 @@ struct RecorderView: View {
                 ? CGSize(width: physical.height, height: physical.width)
                 : physical
             let angle = rotateAll ? Double(engine.rotation.degrees) - 90 : 0
-            let contentLandscape = contentSize.width > contentSize.height
+            let landscape = contentSize.width > contentSize.height
 
             // 整层转过之后，预览层自己的方向要补回去，否则画面是歪的
             let previewDegrees: CGFloat = rotateAll ? 90 : engine.rotationDegrees
-            // 旋转后的坐标里画面是竖的 3:4，转回去正好铺成横的 4:3
-            let aspect: CGFloat = rotateAll
-                ? 3.0 / 4.0
-                : (engine.rotation.isLandscape ? 4.0 / 3.0 : 3.0 / 4.0)
 
-            // 分区布局，不是叠加：取景占一块，控件占剩下的那块，
-            // 两者物理上不重叠，滑块永远不会压到画面上。
-            let previewSize = fittedPreviewSize(in: contentSize, aspect: aspect)
-            let anchor = previewAnchor(rotated: rotateAll, contentLandscape: contentLandscape)
+            // 画面比例必须取**真实画幅**：4224:3024 = 1.397，不是 4:3。
+            // 之前按 3:4 算，取景框比画面宽，`resizeAspect` 于是在左右各补了
+            // 约 9.5pt 黑边——这才是"画面没顶满"的真正来源。
+            let aspect = engine.captureAspect
 
-            Group {
-                if contentLandscape {
-                    HStack(spacing: 0) {
-                        if anchor == .trailing {
-                            controlsPane(landscape: true, size: contentSize)
-                            previewPane(size: previewSize, degrees: previewDegrees, anchor: anchor)
-                        } else {
-                            previewPane(size: previewSize, degrees: previewDegrees, anchor: anchor)
-                            controlsPane(landscape: true, size: contentSize)
-                        }
-                    }
-                } else {
-                    VStack(spacing: 0) {
-                        if anchor == .bottom {
-                            controlsPane(landscape: false, size: contentSize)
-                            previewPane(size: previewSize, degrees: previewDegrees, anchor: anchor)
-                        } else {
-                            previewPane(size: previewSize, degrees: previewDegrees, anchor: anchor)
-                            controlsPane(landscape: false, size: contentSize)
-                        }
-                    }
-                }
+            let zones = layoutZones(
+                size: contentSize,
+                aspect: aspect,
+                safeTop: rotateAll ? 0 : topInset,
+                landscape: landscape
+            )
+
+            // 单一层级：取景、波形、控件各占一块互不重叠的区域。
+            // 早先按横竖切换 HStack / VStack，切一下就把预览 UIView 重建一次，
+            // 新层拿不到视频连接 → 画面全黑。现在层级固定，只改 frame。
+            ZStack(alignment: .topLeading) {
+                Color.black
+
+                previewPane(rect: zones.preview, degrees: previewDegrees)
+
+                stripPane(rect: zones.strip, landscape: landscape)
+
+                controlsPane(rect: zones.controls, landscape: landscape)
             }
             .frame(width: contentSize.width, height: contentSize.height)
             .background(Color.black)
@@ -85,6 +79,9 @@ struct RecorderView: View {
         }
         .ignoresSafeArea()
         .onAppear { engine.prepareSession() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { engine.resumeSession() }
+        }
         .preferredColorScheme(.dark)
         .statusBarHidden(isRecording)
         .persistentSystemOverlays(.hidden)
@@ -93,49 +90,120 @@ struct RecorderView: View {
         }
     }
 
+    // MARK: - 分区
+
+    private struct Zones {
+        var preview: CGRect
+        var strip: CGRect
+        var controls: CGRect
+    }
+
+    /// 顶部安全区。取景铺满全屏，拿不到安全区就会把波形塞进灵动岛里。
+    private var topInset: CGFloat {
+        (UIApplication.shared.connectedScenes.first as? UIWindowScene)?
+            .keyWindow?.safeAreaInsets.top ?? 59
+    }
+
+    /// 三个互不重叠的矩形。
+    ///
+    /// 竖屏：画面横向**贴满两侧**，上方一条固定高度给波形（镜头侧），控件在下方。
+    /// 横屏：画面上下贴满、贴住远离镜头的那一侧，控件竖排在镜头侧。
+    private func layoutZones(
+        size: CGSize,
+        aspect: CGFloat,
+        safeTop: CGFloat,
+        landscape: Bool
+    ) -> Zones {
+        let gap: CGFloat = 6
+
+        if landscape {
+            let controlsWidth = min(320, size.width * 0.36)
+            let available = max(1, size.width - controlsWidth)
+            let width = min(available, size.height * aspect)
+            let height = width / aspect
+
+            // 横 A（0°）镜头在左 → 画面贴右；横 B（180°）反过来
+            let cameraOnLeft = engine.rotationDegrees != 180
+            let previewX = cameraOnLeft ? size.width - width : controlsWidth
+            let controlsX = cameraOnLeft ? 0 : size.width - controlsWidth
+
+            let stripHeight: CGFloat = 64
+            return Zones(
+                preview: CGRect(x: previewX, y: (size.height - height) / 2, width: width, height: height),
+                strip: CGRect(x: controlsX + 12, y: 12, width: 116, height: stripHeight),
+                controls: CGRect(
+                    x: controlsX,
+                    y: 12 + stripHeight + gap,
+                    width: controlsWidth,
+                    height: size.height - (12 + stripHeight + gap) - 10
+                )
+            )
+        }
+
+        // 竖屏：上方两行（档位/按钮 + 波形），画面在其下方横向贴满
+        let headTop = max(safeTop - 8, 6)
+        let rowOne: CGFloat = 34
+        let stripHeight: CGFloat = 56
+        let headBottom = headTop + rowOne + 4 + stripHeight
+
+        // 待机与录制用同一块高度：录起来画面不会突然缩放
+        let controlsHeight: CGFloat = 244
+        let width = min(size.width, max(1, (size.height - headBottom - controlsHeight - gap) * aspect))
+        let height = width / aspect
+
+        // 竖拍 90° 镜头在上 → 画面贴下沿；倒置 270° 上下互换
+        let upsideDown = engine.rotationDegrees == 270
+        let previewY = upsideDown
+            ? size.height - headBottom - height
+            : headBottom
+
+        return Zones(
+            preview: CGRect(x: 0, y: previewY, width: width, height: height),
+            strip: CGRect(x: 14, y: headTop + rowOne + 4, width: 116, height: stripHeight),
+            controls: CGRect(
+                x: 0,
+                y: upsideDown ? 0 : size.height - controlsHeight,
+                width: size.width,
+                height: controlsHeight
+            )
+        )
+    }
+
     // MARK: - 取景
 
-    /// 取景画面永远靠近镜头模组一侧，不居中、也不紧贴。
-    ///
-    /// 后置模组在机身背面左上角，换算到屏幕就是：竖拍靠上、横 A（0°）靠左、
-    /// 横 B（180°）靠右、倒置（270°）靠下。
-    /// 整层旋转模式下坐标已经转过 90°，"靠上"在旋转坐标里就等于物理上的对应侧，
-    /// 这一步取反会把画面贴到握持手那一侧。
-    private func previewAnchor(rotated: Bool, contentLandscape: Bool) -> Alignment {
-        if rotated { return .top }
-        if contentLandscape {
-            return engine.rotation.degrees == 180 ? .trailing : .leading
-        }
-        return engine.rotation.degrees == 270 ? .bottom : .top
-    }
-
-    /// 画面尺寸：按显示比例贴合可用空间，留 14pt 边距（靠近而非紧贴）。
-    private func fittedPreviewSize(in available: CGSize, aspect: CGFloat) -> CGSize {
-        let inset: CGFloat = 14
-        var width = max(1, available.width - inset * 2)
-        var height = width / aspect
-        if height > available.height - inset * 2 {
-            height = max(1, available.height - inset * 2)
-            width = height * aspect
-        }
-        return CGSize(width: width, height: height)
-    }
-
-    private func previewPane(size: CGSize, degrees: CGFloat, anchor: Alignment) -> some View {
+    private func previewPane(rect: CGRect, degrees: CGFloat) -> some View {
         CameraPreviewView(
             session: engine.capture.session,
             rotationDegrees: degrees
         )
-        .frame(width: size.width, height: size.height)
-        .padding(14)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: anchor)
+        .frame(width: rect.width, height: rect.height)
+        .position(x: rect.midX, y: rect.midY)
     }
 
-    private func controlsPane(landscape: Bool, size: CGSize) -> some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            controls(landscape: landscape, size: size)
+    /// 波形栏：只在镜头侧那一块，永远不压画面。
+    private func stripPane(rect: CGRect, landscape: Bool) -> some View {
+        HStack(alignment: .center, spacing: 8) {
+            if landscape {
+                waveform
+                Spacer(minLength: 0)
+            } else {
+                statusChip
+                waveform
+                Spacer(minLength: 0)
+                topActions
+            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(width: rect.width, height: rect.height, alignment: .leading)
+        .position(x: rect.midX, y: rect.midY)
+    }
+
+    private func controlsPane(rect: CGRect, landscape: Bool) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            controls(landscape: landscape, size: rect.size)
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        .frame(width: rect.width, height: rect.height)
+        .position(x: rect.midX, y: rect.midY)
     }
 
     // MARK: - 控件层
@@ -150,64 +218,36 @@ struct RecorderView: View {
     }
 
     private func standbyControls(landscape: Bool, size: CGSize) -> some View {
-        Group {
+        VStack(spacing: 9) {
+            // 横屏时波形栏只剩 116pt 宽，塞不下档位与按钮，挪到控件列顶部
             if landscape {
-                // 横屏：一边塞波形，另一边放参数与录制
-                HStack(alignment: .top, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 10) {
-                        statusChip
-                        waveform
-                        Spacer(minLength: 0)
-                    }
-
+                HStack(spacing: 8) {
+                    statusChip
                     Spacer(minLength: 0)
-
-                    VStack(spacing: 10) {
-                        topActions
-                        Spacer(minLength: 0)
-                        ExposureStrip(exposure: engine.exposure, accent: accent)
-                        WhiteBalanceStrip(whiteBalance: engine.whiteBalance, accent: accent)
-                        recordBar
-                    }
-                    .frame(width: min(340, size.width * 0.34))
+                    topActions
                 }
-                .padding(14)
-            } else {
-                VStack(spacing: 0) {
-                    HStack(alignment: .top) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            statusChip
-                            waveform
-                        }
-                        Spacer(minLength: 0)
-                        topActions
-                    }
-
-                    Spacer(minLength: 0)
-
-                    VStack(spacing: 10) {
-                        if let message = statusMessage {
-                            Text(message)
-                                .font(.system(size: 10.5))
-                                .foregroundStyle(.red.opacity(0.9))
-                                .lineLimit(2)
-                                .multilineTextAlignment(.center)
-                        }
-                        ExposureStrip(exposure: engine.exposure, accent: accent)
-                        WhiteBalanceStrip(whiteBalance: engine.whiteBalance, accent: accent)
-                        recordBar
-                    }
-                }
-                .padding(.horizontal, 14)
-                .padding(.top, 4)
-                .padding(.bottom, 6)
             }
+
+            if let message = statusMessage {
+                Text(message)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.red.opacity(0.9))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+            }
+
+            ExposureStrip(exposure: engine.exposure, accent: accent, compact: landscape)
+            WhiteBalanceStrip(whiteBalance: engine.whiteBalance, accent: accent)
+            recordBar
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
     }
 
     /// 录制中只保留：监看画面、时间码、曝光、停止键。
     private func recordingControls(landscape: Bool) -> some View {
-        VStack(spacing: 0) {
+        VStack(spacing: 8) {
             HStack(spacing: 8) {
                 Circle()
                     .fill(Color.red)
@@ -218,32 +258,12 @@ struct RecorderView: View {
                     .monospacedDigit()
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 6)
 
-            Spacer(minLength: 0)
-
-            if landscape {
-                HStack(alignment: .bottom, spacing: 12) {
-                    waveform
-                    Spacer(minLength: 0)
-                    ExposureStrip(exposure: engine.exposure, accent: accent, compact: true)
-                        .frame(width: 340)
-                }
-                .padding(.horizontal, 16)
-            } else {
-                VStack(spacing: 8) {
-                    HStack {
-                        waveform
-                        Spacer(minLength: 0)
-                    }
-                    ExposureStrip(exposure: engine.exposure, accent: accent, compact: true)
-                }
-                .padding(.horizontal, 14)
-            }
+            ExposureStrip(exposure: engine.exposure, accent: accent, compact: true)
 
             stopBar
         }
+        .padding(.horizontal, 14)
     }
 
 
@@ -266,9 +286,13 @@ struct RecorderView: View {
                 Text(engine.tier.displayName)
                     .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(.white)
-                Text("\(Int(engine.tier.estimatedMegabytesPerSecond)) MB/s")
+                    .lineLimit(1)
+                // 画面是怎么来的必须写在明面上：
+                // 全幅 Bayer 走自建管线，降级时是系统 ISP、尺寸也不一样。
+                Text(engine.formatBadge)
                     .font(.system(size: 9.5, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.5))
+                    .lineLimit(1)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
@@ -313,7 +337,7 @@ struct RecorderView: View {
     private var waveform: some View {
         if engine.waveformImage != nil {
             WaveformView(image: engine.waveformImage, accent: accent, reading: engine.waveformReading)
-                .frame(width: 132, height: 78)
+                .frame(width: 116, height: 56)
                 .background(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(Color.black.opacity(0.35))
@@ -787,10 +811,17 @@ struct SettingsSheet: View {
             row("分辨率", engine.captureConfiguration?.resolutionText ?? "未配置")
             row("帧率", String(format: "%.3f fps", Double(VideoSettingsBuilder.frameRate)))
             row("音频", "LPCM 48 kHz / 16-bit / 2 ch")
-            row("色彩管线", "系统 ISP · SDR · 未启用 Log")
+            row("画面通路", engine.captureConfiguration?.pipelineText ?? "—")
+            row("像素格式", engine.captureConfiguration?.pixelFormat ?? "—")
             row("定位", engine.lastLocationText)
             if let note = engine.thermalNote {
                 row("机身温度", note)
+            }
+            if let config = engine.captureConfiguration, !config.notes.isEmpty {
+                Text(config.notes.joined(separator: "；"))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

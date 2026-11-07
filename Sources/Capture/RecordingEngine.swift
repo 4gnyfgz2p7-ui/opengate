@@ -55,6 +55,25 @@ final class RecorderBox {
     }
 }
 
+/// Bayer 转换很贵（19 MB 拷贝 + 1270 万像素 demosaic），
+/// 源却按 60 fps 送帧。这里按 30 fps 放行，写入端再按 24 帧网格去重。
+final class FrameGate {
+    private let lock = NSLock()
+    private var last: CMTime = .invalid
+    private let minimumInterval = 1.0 / 30.0
+
+    func passes(_ pts: CMTime) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard pts.isValid else { return true }
+        if last.isValid {
+            let delta = CMTimeGetSeconds(CMTimeSubtract(pts, last))
+            if delta.isFinite, delta >= 0, delta < minimumInterval { return false }
+        }
+        last = pts
+        return true
+    }
+}
+
 /// 把定位、采集、编码、落盘串起来。
 @MainActor
 final class RecordingEngine: ObservableObject {
@@ -111,6 +130,10 @@ final class RecordingEngine: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var prepareTask: Task<Void, Never>?
 
+    /// 全幅 Bayer 直出的唯一出路。初始化失败（Metal 不可用）时为 nil，
+    /// 采集层会据此降级到系统 ISP 格式，而不是硬录出一个 0 字节文件。
+    private let bayerConverter = BayerConverter()
+
     /// 定位等待上限（秒）。够拿到冷启动首次定位的概率不高，
     /// 但配合 60 秒内的缓存足以覆盖连续拍摄场景。
     var locationTimeout: TimeInterval = 3.0
@@ -134,16 +157,45 @@ final class RecordingEngine: ObservableObject {
     private func wireCapture() {
         let box = recorderBox
         let sampler = waveform
+        let converter = bayerConverter
+        let gate = FrameGate()
 
         capture.onVideoSample = { [weak self] buffer in
-            // 编码写入必须在采集队列上同步完成，不能异步延后
-            box.get()?.appendVideo(buffer)
+            let recorder = box.get()
+            guard let imageBuffer = CMSampleBufferGetImageBuffer(buffer) else {
+                recorder?.appendVideo(buffer)
+                return
+            }
+
+            var monitorable = imageBuffer
+
+            // 全幅格式只吐 Bayer：先 demosaic 成 10-bit YUV 再交给编码器。
+            // 不做这一步 append 会被逐帧拒绝，文件停在 0 字节。
+            if let converter = converter,
+               CVPixelBufferGetPixelFormatType(imageBuffer) == BayerConverter.bayerFormat {
+                // 设备实际按 60 fps 供帧（会话启动会把帧时长改回默认），
+                // 而写入只要 24 帧/秒。逐帧 demosaic 等于白烧 2.5 倍算力，
+                // 先按 30 fps 掐一道，重复格点再交给写入端去重。
+                guard gate.passes(CMSampleBufferGetPresentationTimeStamp(buffer)) else { return }
+
+                guard let converted = converter.convert(
+                    imageBuffer,
+                    chroma422: recorder?.wantsChroma422 ?? false,
+                    parameters: RecordingEngine.bayerParameters(from: imageBuffer)
+                ) else { return }
+
+                monitorable = converted
+                if let rebuilt = RecordingEngine.replacingImageBuffer(of: buffer, with: converted) {
+                    recorder?.appendVideo(rebuilt)
+                }
+            } else {
+                // 编码写入必须在采集队列上同步完成，不能异步延后
+                recorder?.appendVideo(buffer)
+            }
 
             // 波形采样同队列串行执行（约 1.3 万次读取），
             // 只有产出新图时才跳回主线程，避免每帧都触发一次线程切换。
-            // 采样器要的是像素缓冲，需从 sample buffer 里取出图像平面。
-            if let pixelBuffer = CMSampleBufferGetImageBuffer(buffer),
-               let image = sampler.process(pixelBuffer) {
+            if let image = sampler.process(monitorable) {
                 let reading = sampler.currentReading()
                 Task { @MainActor in
                     self?.waveformImage = image
@@ -154,6 +206,94 @@ final class RecordingEngine: ObservableObject {
         capture.onAudioSample = { buffer in
             box.get()?.appendAudio(buffer)
         }
+    }
+
+    /// 从 Bayer 帧的附件里取黑电平 / 白电平 / 白平衡增益。
+    ///
+    /// 这些值跟着每一帧走（自动白平衡时每帧都在变），所以不缓存。
+    /// 读不到就用 12-bit 的常规默认值：黑 0、白 4095、增益 1——
+    /// 画面会偏一点，但不会因为缺一个键就完全不出来。
+    nonisolated static func bayerParameters(from buffer: CVPixelBuffer) -> BayerConverter.Parameters {
+        var parameters = BayerConverter.Parameters()
+
+        guard let attachments = CMCopyDictionaryOfAttachments(
+            allocator: kCFAllocatorDefault,
+            target: buffer,
+            attachmentMode: kCMAttachmentMode_ShouldPropagate
+        ) as? [String: Any] else { return parameters }
+
+        var black = scalar(attachments["ProResRAW_BlackLevel"]) ?? 0
+        var white = scalar(attachments["ProResRAW_WhiteLevel"]) ?? 4095
+        if white > 0 && white <= 1.0 {
+            // 归一化表示
+            black *= 4095
+            white *= 4095
+        } else if white > 4095 {
+            // 16-bit 容器
+            let scale = 4095.0 / white
+            black *= scale
+            white *= scale
+        }
+        parameters.blackLevel = max(0, black)
+        parameters.whiteLevel = max(parameters.blackLevel + 1, white)
+
+        if let red = scalar(attachments["ProResRAW_WhiteBalanceRedFactor"]), red > 0 {
+            parameters.redGain = red
+        }
+        if let blue = scalar(attachments["ProResRAW_WhiteBalanceBlueFactor"]), blue > 0 {
+            parameters.blueGain = blue
+        }
+        if let gain = scalar(attachments["ProResRAW_GainFactor"]), gain > 0, gain != 1 {
+            parameters.redGain /= gain
+            parameters.greenGain /= gain
+            parameters.blueGain /= gain
+        }
+
+        if let pattern = scalar(attachments["ProResRAW_BayerPattern"]) {
+            let index = Int(pattern)
+            if index >= 0 && index < 4 { parameters.pattern = Int32(index) }
+        }
+        return parameters
+    }
+
+    private nonisolated static func scalar(_ value: Any?) -> Float? {
+        if let number = value as? NSNumber { return number.floatValue }
+        if let array = value as? [NSNumber], !array.isEmpty {
+            let total = array.reduce(Float(0)) { $0 + $1.floatValue }
+            return total / Float(array.count)
+        }
+        return nil
+    }
+
+    /// 把 CMSampleBuffer 里的画面换成转换后的 YUV 缓冲，时间戳原样保留。
+    private nonisolated static func replacingImageBuffer(
+        of sampleBuffer: CMSampleBuffer,
+        with imageBuffer: CVPixelBuffer
+    ) -> CMSampleBuffer? {
+        var formatDescription: CMVideoFormatDescription?
+        let formatStatus = CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: imageBuffer,
+            formatDescriptionOut: &formatDescription
+        )
+        guard formatStatus == noErr, let description = formatDescription else { return nil }
+
+        var timing = CMSampleTimingInfo(
+            duration: CMSampleBufferGetDuration(sampleBuffer),
+            presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sampleBuffer),
+            decodeTimeStamp: .invalid
+        )
+
+        var rebuilt: CMSampleBuffer?
+        let status = CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: imageBuffer,
+            formatDescription: description,
+            sampleTiming: &timing,
+            sampleBufferOut: &rebuilt
+        )
+        guard status == noErr else { return nil }
+        return rebuilt
     }
 
     private func observeThermalState() {
@@ -198,7 +338,8 @@ final class RecordingEngine: ObservableObject {
 
             let config = self.capture.configure(
                 path: .systemProcessed,
-                audioEnabled: true
+                audioEnabled: true,
+                canProcessBayer: self.bayerConverter != nil
             )
             self.captureConfiguration = config
             self.capture.start()
@@ -219,6 +360,19 @@ final class RecordingEngine: ObservableObject {
         whiteBalance.detach()
         capture.stop()
         sessionReady = false
+    }
+
+    /// 回到前台时重新拉起采集。
+    ///
+    /// `AVCaptureSession` 在后台会被系统停掉，而 `sessionReady` 还停在 true，
+    /// 指示灯是绿的、开关也能按，画面却是黑的——这正是「切一下就没画面」的
+    /// 另一半原因。回前台必须无条件检查一次运行状态。
+    func resumeSession() {
+        guard capture.videoDevice != nil else { return }
+        if !capture.isRunning {
+            capture.start()
+        }
+        sessionReady = capture.isRunning
     }
 
     private static func requestAccess(for mediaType: AVMediaType) async -> Bool {
@@ -280,7 +434,9 @@ final class RecordingEngine: ObservableObject {
                 width: width,
                 height: height,
                 frameRate: VideoSettingsBuilder.frameRate,
-                colorPipeline: "system-isp-sdr",
+                colorPipeline: self.captureConfiguration?.isBayer == true
+                    ? "bayer12-demosaic-rec709"
+                    : "system-isp-sdr",
                 audioDescription: AudioSettings.description,
                 locationOutcome: locationOutcome,
                 startedAt: startedAt,
@@ -359,6 +515,14 @@ final class RecordingEngine: ObservableObject {
                     // 真实丢帧来自写入器，不能靠墙钟与理论帧率推算
                     if let recorder = self.recorderBox.get() {
                         self.droppedFrames = recorder.liveDroppedFrames
+
+                        // 两秒还没有一帧落进写入器 = 编码器拒收画面。
+                        // 继续计时只会得到一个 0 字节文件，不如立刻收手并说明原因。
+                        if self.elapsed > 2.0, recorder.liveWrittenFrames == 0 {
+                            self.autoStopReason = "画面未能写入：\(recorder.appendFailureDescription ?? "编码器未接受该画面格式")"
+                            self.stopRecording()
+                            return
+                        }
                     }
                     self.refreshWrittenBytes()
 
@@ -393,6 +557,23 @@ final class RecordingEngine: ObservableObject {
     var captureSummary: String {
         guard let config = captureConfiguration else { return "未配置" }
         return "\(config.resolutionText) · \(config.pixelFormat) · \(config.frameRateText)"
+    }
+
+    /// 真实画幅比例（宽/高，按显示方向）。4224:3024 = 1.397，不是 4:3。
+    var captureAspect: CGFloat {
+        guard let config = captureConfiguration, config.height > 0 else {
+            return rotation.isLandscape ? 4224.0 / 3024.0 : 3024.0 / 4224.0
+        }
+        let longSide = CGFloat(max(config.width, config.height))
+        let shortSide = CGFloat(min(config.width, config.height))
+        let ratio = shortSide > 0 ? longSide / shortSide : 4.0 / 3.0
+        return rotation.isLandscape ? ratio : 1.0 / ratio
+    }
+
+    /// 档位旁的一行小字：画面从哪来、多大
+    var formatBadge: String {
+        guard let config = captureConfiguration else { return "—" }
+        return "\(config.width)×\(config.height) · \(config.pixelFormat)"
     }
 
     var audioSummary: String {
