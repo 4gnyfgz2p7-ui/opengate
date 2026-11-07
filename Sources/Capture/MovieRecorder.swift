@@ -73,6 +73,8 @@ final class MovieRecorder {
     private var lastPTS: CMTime = .zero
     private var finished = false
     private var startWallClock = Date()
+    /// 实际生效的编码设置层级：0 为完整设置，数字越大表示降级越多
+    private(set) var settingsLevel = 0
 
     private static let frameTimescale: CMTimeScale = 24
 
@@ -106,28 +108,44 @@ final class MovieRecorder {
         }
 
         // ---- 视频输入 ----
-        let videoSettings = VideoSettingsBuilder.videoSettings(
-            tier: tier,
-            width: width,
-            height: height,
-            appleLog2: appleLog2
-        )
+        //
+        // 逐级降级：首选设置被拒就换成更宽松的一套，直到能录。
+        // 早先只试一套，一旦被拒整档都录不了；而降级后至少能出片，
+        // 并把实际生效的层级写进结果，便于回头查是哪一侧不支持。
+        var accepted: AVAssetWriterInput?
+        var acceptedLevel = -1
 
-        guard writer.canApply(outputSettings: videoSettings, forMediaType: .video) else {
-            throw RecorderError.videoInputRejected
+        for level in 0...3 {
+            guard let settings = VideoSettingsBuilder.fallbackSettings(
+                tier: tier,
+                width: width,
+                height: height,
+                appleLog2: appleLog2,
+                level: level
+            ) else { continue }
+
+            guard writer.canApply(outputSettings: settings, forMediaType: .video) else { continue }
+
+            let candidate = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+            candidate.expectsMediaDataInRealTime = true
+            // 拍摄方向只作为显示矩阵写入容器，**不旋转像素**。
+            // 4224×3024 是传感器原生画幅，旋转像素要么改变实际存储尺寸，
+            // 要么引入一次全画幅重采样，与「全幅不裁切、不改几何」冲突。
+            candidate.transform = videoTransform
+
+            if writer.canAdd(candidate) {
+                writer.add(candidate)
+                accepted = candidate
+                acceptedLevel = level
+                break
+            }
         }
 
-        let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        vInput.expectsMediaDataInRealTime = true
-        // 拍摄方向只作为显示矩阵写入容器，**不旋转像素**。
-        // 4224×3024 是传感器原生画幅，旋转像素要么改变实际存储尺寸，
-        // 要么引入一次全画幅重采样，与「全幅不裁切、不改几何」冲突。
-        vInput.transform = videoTransform
-        guard writer.canAdd(vInput) else {
+        guard let vInput = accepted else {
             throw RecorderError.videoInputRejected
         }
-        writer.add(vInput)
         videoInput = vInput
+        settingsLevel = acceptedLevel
 
         // ---- 音频输入 ----
         if withAudio {

@@ -50,20 +50,36 @@ struct RecorderView: View {
                 ? 3.0 / 4.0
                 : (engine.rotation.isLandscape ? 4.0 / 3.0 : 3.0 / 4.0)
 
-            ZStack {
-                Color.black
+            // 分区布局，不是叠加：取景占一块，控件占剩下的那块，
+            // 两者物理上不重叠，滑块永远不会压到画面上。
+            let previewSize = fittedPreviewSize(in: contentSize, aspect: aspect)
+            let anchor = previewAnchor(rotated: rotateAll, contentLandscape: contentLandscape)
 
-                previewView(
-                    available: contentSize,
-                    anchor: previewAnchor(rotated: rotateAll, contentLandscape: contentLandscape),
-                    aspect: aspect,
-                    degrees: previewDegrees
-                )
-
-                controls(landscape: contentLandscape, size: contentSize)
-                    .frame(width: contentSize.width, height: contentSize.height)
+            Group {
+                if contentLandscape {
+                    HStack(spacing: 0) {
+                        if anchor == .trailing {
+                            controlsPane(landscape: true, size: contentSize)
+                            previewPane(size: previewSize, degrees: previewDegrees, anchor: anchor)
+                        } else {
+                            previewPane(size: previewSize, degrees: previewDegrees, anchor: anchor)
+                            controlsPane(landscape: true, size: contentSize)
+                        }
+                    }
+                } else {
+                    VStack(spacing: 0) {
+                        if anchor == .bottom {
+                            controlsPane(landscape: false, size: contentSize)
+                            previewPane(size: previewSize, degrees: previewDegrees, anchor: anchor)
+                        } else {
+                            previewPane(size: previewSize, degrees: previewDegrees, anchor: anchor)
+                            controlsPane(landscape: false, size: contentSize)
+                        }
+                    }
+                }
             }
             .frame(width: contentSize.width, height: contentSize.height)
+            .background(Color.black)
             .rotationEffect(.degrees(angle))
             .frame(width: physical.width, height: physical.height)
         }
@@ -79,12 +95,12 @@ struct RecorderView: View {
 
     // MARK: - 取景
 
-    /// 取景画面永远贴向镜头模组一侧，绝不在中间居中。
+    /// 取景画面永远靠近镜头模组一侧，不居中、也不紧贴。
     ///
-    /// 后置模组在机身背面左上角，换算到屏幕就是：竖拍贴顶、横 A（0°）贴左、
-    /// 横 B（180°）贴右、倒置（270°）贴底。
-    /// 整层旋转模式下坐标已经转过 90°，所以"贴顶"在旋转坐标里就等于物理上的
-    /// 对应侧边，直接用 .top 即可——这一步搞错就会贴到握持手那一侧去。
+    /// 后置模组在机身背面左上角，换算到屏幕就是：竖拍靠上、横 A（0°）靠左、
+    /// 横 B（180°）靠右、倒置（270°）靠下。
+    /// 整层旋转模式下坐标已经转过 90°，"靠上"在旋转坐标里就等于物理上的对应侧，
+    /// 这一步取反会把画面贴到握持手那一侧。
     private func previewAnchor(rotated: Bool, contentLandscape: Bool) -> Alignment {
         if rotated { return .top }
         if contentLandscape {
@@ -93,14 +109,8 @@ struct RecorderView: View {
         return engine.rotation.degrees == 270 ? .bottom : .top
     }
 
-    private func previewView(
-        available: CGSize,
-        anchor: Alignment,
-        aspect: CGFloat,
-        degrees: CGFloat
-    ) -> some View {
-        // 靠近而非紧贴：留一圈边距，画面不顶到机身边缘，
-        // 视觉上才能看出取景框的边界在哪
+    /// 画面尺寸：按显示比例贴合可用空间，留 14pt 边距（靠近而非紧贴）。
+    private func fittedPreviewSize(in available: CGSize, aspect: CGFloat) -> CGSize {
         let inset: CGFloat = 14
         var width = max(1, available.width - inset * 2)
         var height = width / aspect
@@ -108,14 +118,24 @@ struct RecorderView: View {
             height = max(1, available.height - inset * 2)
             width = height * aspect
         }
+        return CGSize(width: width, height: height)
+    }
 
-        return CameraPreviewView(
+    private func previewPane(size: CGSize, degrees: CGFloat, anchor: Alignment) -> some View {
+        CameraPreviewView(
             session: engine.capture.session,
             rotationDegrees: degrees
         )
-        .frame(width: width, height: height)
-        .padding(inset)
+        .frame(width: size.width, height: size.height)
+        .padding(14)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: anchor)
+    }
+
+    private func controlsPane(landscape: Bool, size: CGSize) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            controls(landscape: landscape, size: size)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: - 控件层

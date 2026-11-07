@@ -159,36 +159,87 @@ enum VideoSettingsBuilder {
         appleLog2: Bool
     ) -> [String: Any] {
 
+        // 码率、GOP、profile 这些**必须**放进 AVVideoCompressionPropertiesKey，
+        // 放顶层不会被报错，但 AVAssetWriter 会在 canAdd 阶段直接拒绝输入，
+        // 表现为"写入器不接受该档的视频参数"。
+        var compression: [String: Any] = [:]
+
+        if let bitRate = tier.averageBitRate {
+            compression[AVVideoAverageBitRateKey] = bitRate
+        }
+        if let interval = tier.maxKeyFrameInterval {
+            // 以帧数计，不是秒；不设 Duration 键，两者互斥
+            compression[AVVideoMaxKeyFrameIntervalKey] = interval
+        }
+        if tier.isHEVC {
+            compression[AVVideoProfileLevelKey] = hevcProfileLevel
+        }
+        compression[AVVideoExpectedSourceFrameRateKey] = frameRate
+        // 锁 24 fps 且要求时间戳精确，帧重排会引入解码时序偏差
+        compression[AVVideoAllowFrameReorderingKey] = false
+
         var settings: [String: Any] = [
             AVVideoCodecKey: tier.codec,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
             AVVideoColorPropertiesKey: colorProperties(appleLog2: appleLog2),
-            AVVideoExpectedSourceFrameRateKey: frameRate,
+            AVVideoCompressionPropertiesKey: compression,
         ]
 
-        // 明确要求不做帧重排：锁 24 fps 且要求时间戳精确，重排会引入解码时序偏差
-        settings[AVVideoAllowFrameReorderingKey] = false
-
-        if let bitRate = tier.averageBitRate {
-            settings[AVVideoAverageBitRateKey] = bitRate
-        }
-
-        if let interval = tier.maxKeyFrameInterval {
-            // 以帧数计，不是秒；不设 Duration 键，两者互斥
-            settings[AVVideoMaxKeyFrameIntervalKey] = interval
-        }
-
-        if tier.isHEVC {
-            settings[AVVideoProfileLevelKey] = hevcProfileLevel
-        }
-
         if appleLog2 {
-            // 与 AVVideoColorPropertiesKey 平级，不嵌在 colorProperties 里
+            // 与 AVVideoColorPropertiesKey 平级，不嵌进 compression
             settings[logTransferFunctionKey] = logTransferFunctionAppleLog2
         }
 
         return settings
+    }
+
+    /// 逐级降级的备选设置。
+    ///
+    /// 首选项被写入器拒绝时按顺序试，直到能录为止：
+    /// 宁可少一个码率约束，也不要整档录不了。
+    static func fallbackSettings(
+        tier: QualityTier,
+        width: Int,
+        height: Int,
+        appleLog2: Bool,
+        level: Int
+    ) -> [String: Any]? {
+        switch level {
+        case 0:
+            return videoSettings(tier: tier, width: width, height: height, appleLog2: appleLog2)
+
+        case 1:
+            // 去掉码率与 GOP，交给编码器自选
+            return [
+                AVVideoCodecKey: tier.codec,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+                AVVideoColorPropertiesKey: colorProperties(appleLog2: appleLog2),
+            ]
+
+        case 2:
+            // 连色彩标记也去掉
+            return [
+                AVVideoCodecKey: tier.codec,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+            ]
+
+        case 3:
+            // 最裸的 ProRes 请求：只要编码器与尺寸
+            if tier.isHEVC {
+                return nil
+            }
+            return [
+                AVVideoCodecKey: AVVideoCodecType.proRes422LT,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+            ]
+
+        default:
+            return nil
+        }
     }
 
     static let hevcProfileLevel = "HEVC_Main10_AutoLevel"
