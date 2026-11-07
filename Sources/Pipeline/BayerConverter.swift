@@ -41,8 +41,12 @@ final class BayerConverter {
         var cvYMax: UInt32 = 0
 
         var isBlack: Bool { cvYMax < 32 }
+        var calibration: String = ""
+
         var summary: String {
-            "GPU \(kernelRan ? "1" : "0") · \(kernelWidth)×\(kernelHeight) · CV[\(cvYMin),\(cvYMax)]"
+            var text = "GPU \(kernelRan ? "1" : "0") · \(kernelWidth)×\(kernelHeight) · CV[\(cvYMin),\(cvYMax)]"
+            if !calibration.isEmpty { text += " · " + calibration }
+            return text
         }
     }
 
@@ -67,6 +71,9 @@ final class BayerConverter {
 
     /// 构造失败的原因，显示在设置页
     private(set) static var compileNote: String?
+
+    /// 第一帧自动标定出来的解包方式与相位
+    private(set) var calibration: BayerCalibration.Outcome?
 
     /// 初始化失败即代表这台设备走不了 Bayer 通路，调用方应降级到系统 ISP 格式。
     init?() {
@@ -190,12 +197,28 @@ final class BayerConverter {
             lastFailureStage = "缓冲缺失"
             return nil
         }
+        // 第一帧先把解包方式与 Bayer 相位定下来：取错排法不会报错，
+        // 只会得到一张浮雕状的图，靠肉眼看是猜不出来的。
+        if calibration == nil {
+            calibration = BayerCalibration.run(
+                base: sourceBase,
+                rowBytes: sourceRowBytes,
+                width: width,
+                height: height,
+                black: parameters.blackLevel,
+                white: parameters.whiteLevel,
+                redGain: parameters.redGain,
+                blueGain: parameters.blueGain,
+                preferredPattern: parameters.pattern
+            )
+        }
+
         memcpy(bayerBuffer.contents(), sourceBase, sourceLength)
 
         // ---- 参数：扁平 uint32，下标即协议 ----
         let floats = [parameters.blackLevel, parameters.whiteLevel,
                       parameters.redGain, parameters.greenGain, parameters.blueGain]
-        var slots = [UInt32](repeating: 0, count: 10)
+        var slots = [UInt32](repeating: 0, count: 11)
         slots[0] = UInt32(width)
         slots[1] = UInt32(height)
         slots[2] = UInt32(sourceRowBytes)
@@ -203,8 +226,9 @@ final class BayerConverter {
         for (index, value) in floats.enumerated() {
             slots[4 + index] = value.bitPattern
         }
-        slots[9] = UInt32(bitPattern: parameters.pattern)
-        slots.withUnsafeBytes { memcpy(paramsBuffer.contents(), $0.baseAddress, 40) }
+        slots[9] = UInt32(bitPattern: calibration?.pattern ?? parameters.pattern)
+        slots[10] = UInt32(bitPattern: calibration?.unpackMode ?? 0)
+        slots.withUnsafeBytes { memcpy(paramsBuffer.contents(), $0.baseAddress, 44) }
         memset(probeBuffer.contents(), 0, 32)
 
         guard let commandBuffer = queue.makeCommandBuffer(),
@@ -246,6 +270,7 @@ final class BayerConverter {
         diagnostics.kernelRan = probe[0] == 1
         diagnostics.kernelWidth = probe[1]
         diagnostics.kernelHeight = probe[2]
+        diagnostics.calibration = calibration?.summary ?? ""
 
         // 纹理引用用完即放，并清一次纹理缓存，避免缓存无限增长
         yTextureRef = nil
@@ -355,12 +380,20 @@ final class BayerConverter {
     // MIPI RAW12：两个像素打包进 3 字节
     //   p0 = (b0 << 4) | (b1 >> 4)
     //   p1 = ((b1 & 0x0F) << 8) | b2
-    inline ushort ac_raw12(const device uchar* base, uint rowBytes, int x, int y) {
+    // mode 0：高位在前（MIPI 常见）
+    // mode 1：低位在前
+    inline ushort ac_raw12(const device uchar* base, uint rowBytes, int x, int y, int mode) {
         const device uchar* q = base + uint(y) * rowBytes + uint(x >> 1) * 3u;
-        if ((x & 1) == 0) {
-            return ushort((ushort(q[0]) << 4) | (ushort(q[1]) >> 4));
+        if (mode == 0) {
+            if ((x & 1) == 0) {
+                return ushort((ushort(q[0]) << 4) | (ushort(q[1]) >> 4));
+            }
+            return ushort((ushort(q[1] & 0x0F) << 8) | ushort(q[2]));
         }
-        return ushort((ushort(q[1] & 0x0F) << 8) | ushort(q[2]));
+        if ((x & 1) == 0) {
+            return ushort(ushort(q[0]) | (ushort(q[1] & 0x0F) << 8));
+        }
+        return ushort((ushort(q[1]) >> 4) | (ushort(q[2]) << 4));
     }
 
     inline float ac_rec709(float v) {
@@ -385,21 +418,21 @@ final class BayerConverter {
 
     inline float3 ac_pixel(const device uchar* src, uint rowBytes, int w, int h,
                            int x, int y, int pattern,
-                           float black, float invRange, float3 gains) {
+                           float black, float invRange, float3 gains, int unpackMode) {
         int xm = ac_clamp(x - 1, 0, w - 1);
         int xp = ac_clamp(x + 1, 0, w - 1);
         int ym = ac_clamp(y - 1, 0, h - 1);
         int yp = ac_clamp(y + 1, 0, h - 1);
 
-        float c  = float(ac_raw12(src, rowBytes, x,  y));
-        float l  = float(ac_raw12(src, rowBytes, xm, y));
-        float r  = float(ac_raw12(src, rowBytes, xp, y));
-        float u  = float(ac_raw12(src, rowBytes, x,  ym));
-        float d  = float(ac_raw12(src, rowBytes, x,  yp));
-        float ul = float(ac_raw12(src, rowBytes, xm, ym));
-        float ur = float(ac_raw12(src, rowBytes, xp, ym));
-        float dl = float(ac_raw12(src, rowBytes, xm, yp));
-        float dr = float(ac_raw12(src, rowBytes, xp, yp));
+        float c  = float(ac_raw12(src, rowBytes, x,  y,  unpackMode));
+        float l  = float(ac_raw12(src, rowBytes, xm, y,  unpackMode));
+        float r  = float(ac_raw12(src, rowBytes, xp, y,  unpackMode));
+        float u  = float(ac_raw12(src, rowBytes, x,  ym, unpackMode));
+        float d  = float(ac_raw12(src, rowBytes, x,  yp, unpackMode));
+        float ul = float(ac_raw12(src, rowBytes, xm, ym, unpackMode));
+        float ur = float(ac_raw12(src, rowBytes, xp, ym, unpackMode));
+        float dl = float(ac_raw12(src, rowBytes, xm, yp, unpackMode));
+        float dr = float(ac_raw12(src, rowBytes, xp, yp, unpackMode));
 
         int phase = (x & 1) | ((y & 1) << 1);
         int color = ac_color_at(pattern, phase);
@@ -448,6 +481,7 @@ final class BayerConverter {
         float white = as_type<float>(p[5]);
         float3 gains = float3(as_type<float>(p[6]), as_type<float>(p[7]), as_type<float>(p[8]));
         int pattern = int(p[9]);
+        int unpackMode = int(p[10]);
 
         if (gid.x == 0u && gid.y == 0u) {
             probe[0] = 1u;
@@ -464,10 +498,10 @@ final class BayerConverter {
         int x1 = min(x0 + 1, int(w) - 1);
         int y1 = min(y0 + 1, int(h) - 1);
 
-        float3 e0 = ac_pixel(src, rowBytes, int(w), int(h), x0, y0, pattern, black, invRange, gains);
-        float3 e1 = ac_pixel(src, rowBytes, int(w), int(h), x1, y0, pattern, black, invRange, gains);
-        float3 e2 = ac_pixel(src, rowBytes, int(w), int(h), x0, y1, pattern, black, invRange, gains);
-        float3 e3 = ac_pixel(src, rowBytes, int(w), int(h), x1, y1, pattern, black, invRange, gains);
+        float3 e0 = ac_pixel(src, rowBytes, int(w), int(h), x0, y0, pattern, black, invRange, gains, unpackMode);
+        float3 e1 = ac_pixel(src, rowBytes, int(w), int(h), x1, y0, pattern, black, invRange, gains, unpackMode);
+        float3 e2 = ac_pixel(src, rowBytes, int(w), int(h), x0, y1, pattern, black, invRange, gains, unpackMode);
+        float3 e3 = ac_pixel(src, rowBytes, int(w), int(h), x1, y1, pattern, black, invRange, gains, unpackMode);
 
         // 10-bit 存在 16-bit 容器的高 10 位：写 unorm 时按 /1023 归一，
         // 硬件量化后正好落到 value << 6。

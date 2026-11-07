@@ -103,21 +103,6 @@ struct WaveformView: View {
     private var topClipped: Bool { reading.isHighlightClipped }
     private var bottomClipped: Bool { reading.isShadowClipped }
 
-    private var statusText: String {
-        switch (topClipped, bottomClipped) {
-        case (true, true): return "过曝 · 死黑"
-        case (true, false): return "过曝"
-        case (false, true): return "死黑"
-        case (false, false): return "正常"
-        }
-    }
-
-    private var statusColor: Color {
-        if topClipped { return Color.red }
-        if bottomClipped { return Color(red: 0.45, green: 0.68, blue: 1.0) }
-        return Color(red: 0.45, green: 0.85, blue: 0.6)
-    }
-
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -163,19 +148,6 @@ struct WaveformView: View {
             }
             .allowsHitTesting(false)
 
-            VStack {
-                HStack {
-                    Text(statusText)
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundStyle(statusColor)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1.5)
-                        .background(Capsule().fill(Color.black.opacity(0.6)))
-                    Spacer(minLength: 0)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(3)
         }
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .overlay(

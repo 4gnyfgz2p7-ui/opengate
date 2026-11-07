@@ -45,7 +45,12 @@ struct RecorderView: View {
 
                 previewPane(rect: zones.preview, degrees: engine.rotationDegrees)
 
-                topBarPane(rect: zones.bar, landscape: landscape)
+                // 横屏：时间码与波形都在镜头那一侧的竖轨上，不压画面
+                if let lens = zones.lens {
+                    lensRail(rect: lens)
+                } else {
+                    topBarPane(rect: zones.bar, landscape: false)
+                }
 
                 controlsPane(rect: zones.controls, landscape: landscape)
             }
@@ -79,6 +84,8 @@ struct RecorderView: View {
         var preview: CGRect
         var bar: CGRect
         var controls: CGRect
+        /// 横屏时的镜头侧竖轨：时间码 + 波形
+        var lens: CGRect?
     }
 
     /// 窗口安全区：横屏时刘海/灵动岛在侧边，不能再按固定 14pt 贴边
@@ -117,34 +124,44 @@ struct RecorderView: View {
         let landscape = size.width > size.height
 
         if landscape {
-            let barHeight: CGFloat = 40
-            let bar = CGRect(
-                x: left,
-                y: max(6, insets.top * 0.4),
-                width: size.width - left - right,
-                height: barHeight
-            )
-            let controlsWidth: CGFloat = min(300, size.width * 0.32)
-            let top = bar.maxY + 6
-            let controls = CGRect(
-                x: size.width - controlsWidth - right,
-                y: top,
-                width: controlsWidth,
-                height: size.height - top - bottom
-            )
+            // 镜头在背面左上角：横拍 A（0°）时在左侧，横拍 B（180°）时在右侧。
+            // 时间码和波形就放在这条轨道上，绕开画面。
+            let lensOnLeading = engine.rotation.degrees != 180
+            let railWidth: CGFloat = 104
+            let controlsWidth: CGFloat = min(300, size.width * 0.30)
+            let top = max(6, insets.top * 0.4)
+            let height = max(120, size.height - top - bottom)
 
-            let freeWidth = controls.minX - left - 10
-            let freeHeight = size.height - top - bottom
-            var height = freeHeight
-            var width = height * aspect
-            if width > freeWidth { width = freeWidth; height = width / aspect }
-            let preview = CGRect(
-                x: left + (freeWidth - width) / 2,
-                y: top + (freeHeight - height) / 2,
-                width: width,
+            let lens = CGRect(
+                x: lensOnLeading ? left : size.width - railWidth - right,
+                y: top,
+                width: railWidth,
                 height: height
             )
-            return Zones(preview: preview, bar: bar, controls: controls)
+            let controls = CGRect(
+                x: lensOnLeading ? size.width - controlsWidth - right : left,
+                y: top,
+                width: controlsWidth,
+                height: height
+            )
+
+            let innerLeft = min(lens.maxX, controls.maxX) + 10
+            let innerRight = max(lens.minX, controls.minX) - 10
+            let freeWidth = max(80, innerRight - innerLeft)
+
+            var previewHeight = height
+            var previewWidth = previewHeight * aspect
+            if previewWidth > freeWidth {
+                previewWidth = freeWidth
+                previewHeight = previewWidth / aspect
+            }
+            let preview = CGRect(
+                x: innerLeft + (freeWidth - previewWidth) / 2,
+                y: top + (height - previewHeight) / 2,
+                width: previewWidth,
+                height: previewHeight
+            )
+            return Zones(preview: preview, bar: .zero, controls: controls, lens: lens)
         }
 
         let top = max(insets.top - 6, 6)
@@ -176,7 +193,33 @@ struct RecorderView: View {
             width: width,
             height: height
         )
-        return Zones(preview: preview, bar: bar, controls: controls)
+        return Zones(preview: preview, bar: bar, controls: controls, lens: nil)
+    }
+
+    /// 横屏的镜头侧竖轨：录制时间码在上，波形在下。
+    private func lensRail(rect: CGRect) -> some View {
+        VStack(spacing: 8) {
+            if isRecording {
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(Color.red)
+                        .frame(width: 7, height: 7)
+                    Text(Self.timecode(engine.elapsed))
+                        .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                        .monospacedDigit()
+                        .foregroundStyle(.white)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(Color.black.opacity(0.45)))
+            }
+
+            waveform
+
+            Spacer(minLength: 0)
+        }
+        .frame(width: rect.width, height: rect.height, alignment: .top)
+        .position(x: rect.midX, y: rect.midY)
     }
 
     // MARK: - 取景
@@ -230,6 +273,14 @@ struct RecorderView: View {
     /// 不再让曝光、白平衡各自漂一块浮层。
     private func standbyControls(landscape: Bool) -> some View {
         VStack(spacing: 8) {
+            if landscape {
+                HStack(spacing: 8) {
+                    statusChip
+                    Spacer(minLength: 0)
+                    topActions
+                }
+            }
+
             if let message = statusMessage {
                 Text(message)
                     .font(.system(size: 10.5))
@@ -801,7 +852,6 @@ struct SettingsSheet: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    frameSection
                     captureSection
                     tierSection
                     storageSection
@@ -821,63 +871,6 @@ struct SettingsSheet: View {
         }
         .preferredColorScheme(.dark)
         .presentationDetents([.medium, .large])
-    }
-
-    /// 两档画幅的视场角对比，用来判断哪一档覆盖整块传感器。
-    private var frameSection: some View {
-        section("画幅") {
-            if let device = engine.capture.videoDevice {
-                ForEach(formatRows(device), id: \.title) { row in
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(row.title)
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(.white)
-                        Spacer(minLength: 8)
-                        Text(row.fieldOfView)
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(.white.opacity(0.7))
-                        if row.isActive {
-                            Text("当前")
-                                .font(.system(size: 9.5, weight: .semibold))
-                                .foregroundStyle(accent)
-                        }
-                    }
-                }
-            } else {
-                Text("会话未就绪")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private struct FrameRow {
-        var title: String
-        var fieldOfView: String
-        var isActive: Bool
-    }
-
-    private func formatRows(_ device: AVCaptureDevice) -> [FrameRow] {
-        var seen = Set<String>()
-        var rows: [FrameRow] = []
-        let activeWidth = Int(engine.captureConfiguration?.width ?? 0)
-        let activeHeight = Int(engine.captureConfiguration?.height ?? 0)
-
-        for format in device.formats {
-            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-            let width = Int(dims.width)
-            let height = Int(dims.height)
-            guard (width == 4224 && height == 3024) || (width == 4032 && height == 3024) else { continue }
-            let title = "\(width)×\(height)"
-            guard !seen.contains(title) else { continue }
-            seen.insert(title)
-            rows.append(FrameRow(
-                title: title,
-                fieldOfView: String(format: "%.1f°", format.videoFieldOfView),
-                isActive: width == activeWidth && height == activeHeight
-            ))
-        }
-        return rows.sorted { $0.title > $1.title }
     }
 
     private var captureSection: some View {
