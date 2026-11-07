@@ -14,6 +14,9 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
     case hevcAllIntra
     case proResLT
     case proResHQ
+    /// 原始 Bayer 直录：不 demosaic，字节原样进容器，解码交给
+    /// Apple 的 ProRes RAW 解码器（Final Cut / DaVinci）
+    case proResRAW
 
     var id: String { rawValue }
 
@@ -26,6 +29,7 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
         case .hevcAllIntra: return "hevc-all-intra"
         case .proResLT: return "prores422lt"
         case .proResHQ: return "prores422hq"
+        case .proResRAW: return "proresraw"
         }
     }
 
@@ -35,6 +39,7 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
         case .hevcAllIntra: return "HEVC 全 I 帧"
         case .proResLT: return "ProRes 422 LT"
         case .proResHQ: return "ProRes 422 HQ"
+        case .proResRAW: return "ProRes RAW"
         }
     }
 
@@ -44,6 +49,7 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
         case .hevcAllIntra: return "10-bit 4:2:0 · 全 I 帧"
         case .proResLT: return "10-bit 4:2:2 · 全 I 帧"
         case .proResHQ: return "10-bit 4:2:2 · 全 I 帧"
+        case .proResRAW: return "12-bit Bayer · 未解码"
         }
     }
 
@@ -53,6 +59,7 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
         case .hevcAllIntra: return "逐帧可剪，体积居中"
         case .proResLT: return "ProRes 轻量档"
         case .proResHQ: return "调色母版"
+        case .proResRAW: return "后期软件自行解码"
         }
     }
 
@@ -64,6 +71,9 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
         self == .hevcLongGOP || self == .hevcAllIntra
     }
 
+    /// 原始 Bayer 直录。解码不在本机做，因此不受 btp2 排法影响。
+    var isRawBayer: Bool { self == .proResRAW }
+
     // MARK: - 编码
 
     var codec: AVVideoCodecType {
@@ -71,6 +81,7 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
         case .proResHQ: return .proRes422HQ
         case .proResLT: return .proRes422LT
         case .hevcLongGOP, .hevcAllIntra: return .hevc
+        case .proResRAW: return .proResRAW
         }
     }
 
@@ -79,12 +90,13 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
         case .proResHQ: return "proRes422HQ"
         case .proResLT: return "proRes422LT"
         case .hevcLongGOP, .hevcAllIntra: return "hevc"
+        case .proResRAW: return "proResRAW"
         }
     }
 
     var gopDescription: String {
         switch self {
-        case .proResHQ, .proResLT, .hevcAllIntra: return "all-intra"
+        case .proResHQ, .proResLT, .hevcAllIntra, .proResRAW: return "all-intra"
         case .hevcLongGOP: return "long-gop"
         }
     }
@@ -92,7 +104,7 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
     /// 关键帧间隔（帧数）。ProRes 是全 I 帧结构，不适用该参数，返回 nil。
     var maxKeyFrameInterval: Int? {
         switch self {
-        case .proResHQ, .proResLT: return nil
+        case .proResHQ, .proResLT, .proResRAW: return nil
         case .hevcAllIntra: return 1
         // 10 秒一个 I 帧 @24 fps
         case .hevcLongGOP: return 240
@@ -102,7 +114,7 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
     /// HEVC 目标码率。ProRes 走固定质量档，不设码率，返回 nil。
     var averageBitRate: Int? {
         switch self {
-        case .proResHQ, .proResLT: return nil
+        case .proResHQ, .proResLT, .proResRAW: return nil
         case .hevcLongGOP: return 200_000_000
         case .hevcAllIntra: return 500_000_000
         }
@@ -120,6 +132,8 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .proResHQ: return 135
         case .proResLT: return 95
+        // 4224×3024 12-bit @24fps 裸数据约 458 MB/s，ProRes RAW 压缩后按 2:1 估
+        case .proResRAW: return 230
         default: return 0
         }
     }
@@ -158,6 +172,16 @@ enum VideoSettingsBuilder {
         height: Int,
         appleLog2: Bool
     ) -> [String: Any] {
+
+        // ProRes RAW 存的是未解码的 Bayer，没有色彩空间可标，
+        // 也不接受压缩属性——带上任何一项都会被 canAdd 拒绝。
+        if tier.isRawBayer {
+            return [
+                AVVideoCodecKey: AVVideoCodecType.proResRAW,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+            ]
+        }
 
         // 码率、GOP、profile 这些**必须**放进 AVVideoCompressionPropertiesKey，
         // 放顶层不会被报错，但 AVAssetWriter 会在 canAdd 阶段直接拒绝输入，
@@ -227,8 +251,10 @@ enum VideoSettingsBuilder {
             ]
 
         case 3:
-            // 最裸的 ProRes 请求：只要编码器与尺寸
-            if tier.isHEVC {
+            // 最裸的 ProRes 请求：只要编码器与尺寸。
+            // HEVC 与 ProRes RAW 不降到 422 LT：前者编码器不同，
+            // 后者压根不是 YUV 通路，降过去等于悄悄换了档位。
+            if tier.isHEVC || tier.isRawBayer {
                 return nil
             }
             return [

@@ -85,6 +85,9 @@ final class MovieRecorder {
     /// ProRes 需要 4:2:2 输入，HEVC 只要 4:2:0
     var wantsChroma422: Bool { tier.isProRes }
 
+    /// 原始 Bayer 直录：画面不做 demosaic，字节原样进容器
+    var isRawBayer: Bool { tier.isRawBayer }
+
     var appendFailureDescription: String? {
         stateLock.lock(); defer { stateLock.unlock() }
         return firstAppendFailure
@@ -161,13 +164,25 @@ final class MovieRecorder {
         videoInput = vInput
         settingsLevel = acceptedLevel
 
-        // BGRA 进、由 AVFoundation 转成目标编码格式。
-        // 不指定 sourcePixelBufferAttributes：全幅走 BGRA、系统 ISP 降级走 10-bit YUV，
+        // ProRes RAW 的输入是未解码的 Bayer，必须显式声明格式：
+        // 不声明的话写入器按普通视频缓冲处理，一定拒收。
+        // 其余档位不指定——全幅走 BGRA、系统 ISP 降级走 10-bit YUV，
         // 两条路都要能 append，让 adaptor 保持中立。
-        adaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: vInput,
-            sourcePixelBufferAttributes: nil
-        )
+        if tier.isRawBayer {
+            adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: vInput,
+                sourcePixelBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey as String: BayerConverter.bayerFormat,
+                    kCVPixelBufferWidthKey as String: width,
+                    kCVPixelBufferHeightKey as String: height,
+                ]
+            )
+        } else {
+            adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: vInput,
+                sourcePixelBufferAttributes: nil
+            )
+        }
 
         // ---- 音频输入 ----
         if withAudio {

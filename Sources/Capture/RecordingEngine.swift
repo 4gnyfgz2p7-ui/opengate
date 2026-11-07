@@ -240,6 +240,20 @@ final class RecordingEngine: ObservableObject {
                 // 先按 30 fps 掐一道，重复格点再交给写入端去重。
                 guard gate.passes(CMSampleBufferGetPresentationTimeStamp(buffer)) else { return }
 
+                // ProRes RAW：原始 Bayer 原样进容器，不做 demosaic、不做色彩处理。
+                // 解码责任交给 Apple 的 ProRes RAW 解码器（Final Cut / DaVinci），
+                // 这条路径完全不经过本机的 btp2 解包，因此不受排法问题影响。
+                // 波形图不更新：没有可读的 RGB 画面。
+                if recorder?.isRawBayer == true {
+                    if recorder?.appendImageBuffer(
+                        imageBuffer,
+                        presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(buffer)
+                    ) == true {
+                        statsBox.markAppended()
+                    }
+                    return
+                }
+
                 // 没有转换器时**绝不能**把 btp2 原样交给编码器：
                 // 那正是早先“能录、但成片纯绿”的来源。宁可报错。
                 guard let converter = converter else {
@@ -269,6 +283,13 @@ final class RecordingEngine: ObservableObject {
                     statsBox.markAppended()
                 }
             } else {
+                // ProRes RAW 只认未解码的 Bayer。走到这里说明当前格式是
+                // 系统 ISP 已经处理过的 YUV，再往 RAW 写入器里塞一定被拒，
+                // 与其静默出 0 字节文件，不如把原因说清楚。
+                if recorder?.isRawBayer == true {
+                    statsBox.markFailure("ProRes RAW 需要全幅 Bayer 源，当前格式不支持")
+                    return
+                }
                 // 编码写入必须在采集队列上同步完成，不能异步延后
                 if recorder?.appendVideo(buffer) == true { statsBox.markAppended() }
             }
@@ -560,9 +581,11 @@ final class RecordingEngine: ObservableObject {
                 width: width,
                 height: height,
                 frameRate: VideoSettingsBuilder.frameRate,
-                colorPipeline: self.captureConfiguration?.isBayer == true
-                    ? "bayer12-demosaic-rec709"
-                    : "system-isp-sdr",
+                colorPipeline: selectedTier.isRawBayer
+                    ? "proresraw-bayer-passthrough"
+                    : (self.captureConfiguration?.isBayer == true
+                        ? "bayer12-demosaic-rec709"
+                        : "system-isp-sdr"),
                 audioDescription: AudioSettings.description,
                 locationOutcome: locationOutcome,
                 startedAt: startedAt,
