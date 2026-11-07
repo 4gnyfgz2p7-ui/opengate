@@ -148,7 +148,7 @@ final class BayerCalibration {
                 let neutrality = abs(log(red / blue))
                 let score = entry.energy + neutrality * 4.0
 
-                if score < best.score {
+                if score < Double(best.score) {
                     best.score = Float(score)
                     best.chromaEnergy = Float(entry.energy)
                     best.neutrality = Float(neutrality)
