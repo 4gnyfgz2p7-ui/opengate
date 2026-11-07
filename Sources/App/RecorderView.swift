@@ -409,6 +409,7 @@ struct RecorderView: View {
             VStack(spacing: 8) {
                 ExposureStrip(exposure: engine.exposure, accent: accent, compact: landscape, embedded: true)
                 WhiteBalanceStrip(whiteBalance: engine.whiteBalance, accent: accent, embedded: true)
+                FocusStrip(focus: engine.focus, accent: accent)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 9)

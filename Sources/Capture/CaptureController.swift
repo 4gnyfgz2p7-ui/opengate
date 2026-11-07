@@ -339,11 +339,18 @@ final class CaptureController: NSObject {
                 }
             }
 
-            // 对焦锁在无限远附近，避免录制中拉风箱
-            if device.isFocusModeSupported(.locked) {
-                device.focusMode = .locked
-                result.focusLocked = true
+            // 对焦交给 FocusController，这里只负责回到自动。
+            //
+            // 早先这里写的是 `focusMode = .locked`，注释声称「锁在无限远附近」，
+            // 但 `.locked` 只是**冻结当时的镜头位置**，并不会移到无限远。
+            // 上一次会话停在近处时，之后每次启动都从那个近距离开始并立刻冻住，
+            // 于是远处永远虚焦、转动机身也不重新合焦——这就是「无法对焦」。
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            } else if device.isFocusModeSupported(.autoFocus) {
+                device.focusMode = .autoFocus
             }
+            result.focusLocked = false
 
             device.unlockForConfiguration()
         } catch {

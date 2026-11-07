@@ -176,6 +176,7 @@ final class RecordingEngine: ObservableObject {
     let location = LocationProvider()
     let exposure = ExposureController()
     let whiteBalance = WhiteBalanceController()
+    let focus = FocusController()
     let waveform = WaveformSampler()
     let rotation = CaptureRotation()
 
@@ -330,6 +331,7 @@ final class RecordingEngine: ObservableObject {
         capture.stop()
         exposure.detach()
         whiteBalance.detach()
+        focus.detach()
 
         let config = capture.configure(
             path: .bayerDirect,
@@ -341,6 +343,7 @@ final class RecordingEngine: ObservableObject {
         if let device = capture.videoDevice {
             exposure.attach(to: device)
             whiteBalance.attach(to: device)
+            focus.attach(to: device)
         }
         sessionReady = capture.isRunning
         stats.reset()
@@ -512,6 +515,7 @@ final class RecordingEngine: ObservableObject {
     func teardownSession() {
         exposure.detach()
         whiteBalance.detach()
+        focus.detach()
         capture.stop()
         sessionReady = false
     }
@@ -538,6 +542,7 @@ final class RecordingEngine: ObservableObject {
         capture.stop()
         exposure.detach()
         whiteBalance.detach()
+        focus.detach()
 
         let config = capture.configure(
             path: .systemProcessed,
@@ -549,6 +554,7 @@ final class RecordingEngine: ObservableObject {
         if let device = capture.videoDevice {
             exposure.attach(to: device)
             whiteBalance.attach(to: device)
+            focus.attach(to: device)
         }
         sessionReady = capture.isRunning
         stats.reset()

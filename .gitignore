@@ -21,3 +21,6 @@ project.pbxproj
 
 # 本地装机工具与产物，体积大且不入库
 _local/
+
+# 本地分析产物
+_analysis/
