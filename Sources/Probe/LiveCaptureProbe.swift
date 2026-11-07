@@ -110,6 +110,7 @@ final class LiveCaptureProbe: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         // ---- 步骤 1：锁定精确 24.000 fps 并回读真实值 ----
         var rateCheck: FrameRateCheck?
         var setNote = ""
+        var rateApplied = false
 
         do {
             try device.lockForConfiguration()
@@ -118,8 +119,19 @@ final class LiveCaptureProbe: NSObject, AVCaptureVideoDataOutputSampleBufferDele
             if device.activeFormat != format {
                 device.activeFormat = format
             }
-            device.activeVideoMinFrameDuration = requested
-            device.activeVideoMaxFrameDuration = requested
+
+            // 赋一个不受支持的帧时长会抛 ObjC 异常——Swift 捕获不到，进程直接终止。
+            // 所以先确认该格式的帧率区间真的含 24，再写。
+            let supports24 = device.activeFormat.videoSupportedFrameRateRanges.contains {
+                Double($0.minFrameRate) <= 24.001 && Double($0.maxFrameRate) >= 23.999
+            }
+            if supports24 {
+                device.activeVideoMinFrameDuration = requested
+                device.activeVideoMaxFrameDuration = requested
+                rateApplied = true
+            } else {
+                setNote = "该格式帧率区间不含 24，未写入帧率"
+            }
 
             let actual = device.activeVideoMinFrameDuration
             device.unlockForConfiguration()
@@ -140,7 +152,7 @@ final class LiveCaptureProbe: NSObject, AVCaptureVideoDataOutputSampleBufferDele
                 rangeMax: range.map { Double($0.maxFrameRate) } ?? 0,
                 rangeMinDurationSeconds: range.map { CMTimeGetSeconds($0.minFrameDuration) } ?? 0
             )
-            setNote = "帧率锁定完成"
+            setNote = rateApplied ? "帧率锁定完成" : setNote
         } catch {
             setNote = "帧率锁定失败：\(error.localizedDescription)"
         }
@@ -171,17 +183,30 @@ final class LiveCaptureProbe: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         }
 
         let output = AVCaptureVideoDataOutput()
-        output.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: requestedPixelFormat
-        ]
         output.alwaysDiscardsLateVideoFrames = true
         output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "opengate.live.probe"))
 
         guard session.canAddOutput(output) else {
             session.commitConfiguration()
-            return (rateCheck, emptyResult(note: note + "；会话不接受 btp2 输出"))
+            return (rateCheck, emptyResult(note: note + "；会话不接受视频输出"))
         }
         session.addOutput(output)
+
+        // 顺序很关键：availableVideoPixelFormatTypes 只有在输出挂到会话（且已有输入）
+        // 之后才有内容。直接给 videoSettings 赋一个不受支持的四字符码，
+        // AVFoundation 会抛 ObjC 异常，Swift 捕获不到，进程直接终止。
+        let available = output.availableVideoPixelFormatTypes
+        let fallback = available.first ?? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        if available.contains(requestedPixelFormat) {
+            output.videoSettings = [
+                kCVPixelBufferPixelFormatTypeKey as String: requestedPixelFormat
+            ]
+        } else {
+            output.videoSettings = [
+                kCVPixelBufferPixelFormatTypeKey as String: fallback
+            ]
+            note += "；该输出不提供 btp2（共 \(available.count) 种），已回退 \(FourCC.string(fallback))"
+        }
         session.commitConfiguration()
 
         let wallStart = Date()

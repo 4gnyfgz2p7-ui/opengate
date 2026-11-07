@@ -14,6 +14,7 @@ enum ProbeEngine {
         let environment = environmentInfo()
         let appVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0"
 
+        Diagnostics.beginProgress("探针 \(appVersion)")
         recorder.log("开始探测：环境信息已采集")
 
         guard let device = DeviceProbe.mainDevice() else {

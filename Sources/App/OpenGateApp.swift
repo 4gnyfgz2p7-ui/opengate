@@ -2,6 +2,13 @@ import SwiftUI
 
 @main
 struct OpenGateApp: App {
+
+    init() {
+        // 必须最早安装：AVFoundation 抛的是 ObjC 异常，Swift 接不住，
+        // 只有在进程终止前把原因写进文件，下次打开才有据可查。
+        Diagnostics.installExceptionHandler()
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()

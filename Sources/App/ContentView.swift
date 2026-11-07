@@ -53,6 +53,9 @@ final class ProbeModel: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var model = ProbeModel()
+    /// 上次异常与崩溃前进度，进入页面时从 Documents 读取
+    @State private var crashText: String?
+    @State private var progressText: String?
     /// 非 nil 时在导航栏左侧显示返回按钮，用于从录制主界面进入探针页的场景
     var onClose: (() -> Void)? = nil
 
@@ -90,6 +93,10 @@ struct ContentView: View {
                             .foregroundStyle(.orange)
                     }
 
+                    if let crash = crashText {
+                        crashCard(crash)
+                    }
+
                     if let report = model.report {
                         verdictCard(report)
 
@@ -123,6 +130,10 @@ struct ContentView: View {
             .background(Color.black.ignoresSafeArea())
             .navigationTitle("探针")
             .navigationBarTitleDisplayMode(.inline)
+            .onAppear {
+                crashText = Diagnostics.readCrash()
+                progressText = Diagnostics.readProgress()
+            }
             .toolbar {
                 if let onClose {
                     ToolbarItem(placement: .topBarLeading) {
@@ -318,6 +329,60 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
+            }
+        }
+    }
+
+    // MARK: 崩溃现场
+
+    /// 只在检测到上次异常时出现。内容直接来自 App 自己写下的两份文件，
+    /// 不需要去系统「分析数据」里翻 .ips，也不用连电脑。
+    private func crashCard(_ crash: String) -> some View {
+        Card(title: "上次异常") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(crash)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.red.opacity(0.9))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .lineLimit(14)
+
+                if let progress = progressText {
+                    Divider().overlay(Color.white.opacity(0.1))
+                    Text("崩溃前最后进度")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text(progress)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.orange.opacity(0.9))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .lineLimit(14)
+                }
+
+                HStack(spacing: 10) {
+                    ShareLink(item: crash + "\n\n--- 进度 ---\n" + (progressText ?? "")) {
+                        Text("分享诊断")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(Color(white: 0.17))
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+
+                    Button {
+                        Diagnostics.clear()
+                        crashText = nil
+                        progressText = nil
+                    } label: {
+                        Text("清除")
+                            .font(.caption.weight(.semibold))
+                            .frame(width: 64)
+                            .padding(.vertical, 8)
+                            .background(Color(white: 0.17))
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
+                .foregroundStyle(.white)
             }
         }
     }

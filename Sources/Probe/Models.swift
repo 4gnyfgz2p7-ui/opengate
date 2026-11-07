@@ -232,6 +232,8 @@ struct StepRecorder {
     mutating func log(_ message: String) {
         let stamped = message
         steps.append(stamped)
+        // 同步落盘：闪退后重新打开就能看到最后走到哪一步
+        Diagnostics.mark(stamped)
         onStep(stamped)
     }
 }
