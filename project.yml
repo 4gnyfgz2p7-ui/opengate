@@ -33,8 +33,8 @@ targets:
         INFOPLIST_FILE: Sources/Info.plist
         PRODUCT_BUNDLE_IDENTIFIER: link.aitimes.opengate
         PRODUCT_NAME: OpenGate
-        MARKETING_VERSION: "0.5.16"
-        CURRENT_PROJECT_VERSION: "14"
+        MARKETING_VERSION: "0.5.17"
+        CURRENT_PROJECT_VERSION: "15"
         GENERATE_INFOPLIST_FILE: "NO"
         SUPPORTS_MACCATALYST: "NO"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
