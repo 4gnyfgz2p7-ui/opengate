@@ -1,0 +1,387 @@
+import Foundation
+import AVFoundation
+import CoreMedia
+import CoreVideo
+import UIKit
+
+/// 采集会话的唯一持有者。
+///
+/// 四档共用这一份采集前端：格式、帧率、曝光、白平衡、防抖全部在这里锁死，
+/// 切档时**不重建**这一层（避免一次黑屏和若干丢帧）。
+final class CaptureController: NSObject {
+
+    /// 采集通路
+    enum Path: String, Codable {
+        /// 系统 ISP 输出的 10-bit 全幅画面。当前阶段可跑通端到端的路径。
+        case systemProcessed
+        /// 传感器原始 Bayer（btp2），留给自建 Metal 管线。
+        case bayerDirect
+
+        var displayName: String {
+            switch self {
+            case .systemProcessed: return "系统 ISP · 10-bit"
+            case .bayerDirect: return "Bayer 直出 · btp2"
+            }
+        }
+    }
+
+    /// 配置结果的快照，用于界面展示与报告
+    struct Configuration {
+        var path: Path = .systemProcessed
+        var width: Int32 = 0
+        var height: Int32 = 0
+        var pixelFormat: String = "—"
+        var frameDurationValue: Int64 = 0
+        var frameDurationTimescale: Int32 = 0
+        var isExact24: Bool = false
+        var stabilizationMode: String = "—"
+        var exposureLocked: Bool = false
+        var whiteBalanceLocked: Bool = false
+        var focusLocked: Bool = false
+        var audioEnabled: Bool = false
+        var notes: [String] = []
+
+        var resolutionText: String { "\(width)×\(height)" }
+
+        var frameRateText: String {
+            if isExact24 { return "1/24 精确 24.000" }
+            guard frameDurationTimescale > 0, frameDurationValue > 0 else { return "—" }
+            return "\(frameDurationValue)/\(frameDurationTimescale)"
+        }
+    }
+
+    // MARK: - 状态
+
+    let session = AVCaptureSession()
+
+    private(set) var videoDevice: AVCaptureDevice?
+    private(set) var videoOutput = AVCaptureVideoDataOutput()
+    private(set) var audioOutput = AVCaptureAudioDataOutput()
+    private(set) var configuration = Configuration()
+
+    private var videoInput: AVCaptureDeviceInput?
+    private var audioInput: AVCaptureDeviceInput?
+
+    private let videoQueue = DispatchQueue(label: "acamera.capture.video", qos: .userInitiated)
+    private let audioQueue = DispatchQueue(label: "acamera.capture.audio", qos: .userInitiated)
+
+    /// 每一帧视频（已带原始 PTS）
+    var onVideoSample: ((CMSampleBuffer) -> Void)?
+    /// 每一声频块
+    var onAudioSample: ((CMSampleBuffer) -> Void)?
+
+    /// 采集层回调的帧计数，供引擎算丢帧
+    private(set) var deliveredVideoFrames: Int64 = 0
+
+    // MARK: - 配置
+
+    /// 建立会话。可重复调用，内部会先拆掉旧配置。
+    ///
+    /// - Parameters:
+    ///   - path: 采集通路
+    ///   - audioEnabled: 是否接入麦克风
+    ///   - lockWhiteBalance: 是否在配置阶段锁定白平衡。
+    ///     默认 false——白平衡由 `WhiteBalanceController` 全权接管，
+    ///     支持自动 / 锁定 / 手动色温三种模式，这里若再锁一次会覆盖用户设定。
+    ///     曝光同理，由 `ExposureController` 接管。
+    @discardableResult
+    func configure(
+        path: Path,
+        audioEnabled: Bool,
+        lockWhiteBalance: Bool = false
+    ) -> Configuration {
+
+        var result = Configuration()
+        result.path = path
+
+        session.beginConfiguration()
+        session.sessionPreset = .inputPriority
+
+        // ---- 视频输入 ----
+        guard let device = Self.backWideCamera() else {
+            result.notes.append("找不到后置广角相机")
+            session.commitConfiguration()
+            configuration = result
+            return result
+        }
+
+        guard let format = Self.openGateFormat(in: device) else {
+            result.notes.append("找不到可用视频格式")
+            session.commitConfiguration()
+            configuration = result
+            return result
+        }
+
+        do {
+            let input = try AVCaptureDeviceInput(device: device)
+            guard session.canAddInput(input) else {
+                result.notes.append("会话拒绝视频输入")
+                session.commitConfiguration()
+                configuration = result
+                return result
+            }
+            session.addInput(input)
+            videoInput = input
+            videoDevice = device
+        } catch {
+            result.notes.append("创建视频输入失败：\(error.localizedDescription)")
+            session.commitConfiguration()
+            configuration = result
+            return result
+        }
+
+        // ---- 设备参数：格式、帧率、白平衡、对焦 ----
+        applyDeviceSettings(
+            device: device,
+            format: format,
+            lockWhiteBalance: lockWhiteBalance,
+            result: &result
+        )
+
+        // ---- 视频输出 ----
+        let output = AVCaptureVideoDataOutput()
+        output.alwaysDiscardsLateVideoFrames = true
+
+        guard session.canAddOutput(output) else {
+            result.notes.append("会话拒绝视频输出")
+            session.commitConfiguration()
+            configuration = result
+            return result
+        }
+        session.addOutput(output)
+        videoOutput = output
+
+        // 像素格式必须在 output 进入会话之后才能查到
+        if let chosen = Self.choosePixelFormat(from: output, path: path) {
+            output.videoSettings = [
+                kCVPixelBufferPixelFormatTypeKey as String: chosen
+            ]
+            result.pixelFormat = FourCC.string(chosen)
+        } else {
+            result.notes.append("未找到合适像素格式，沿用系统默认")
+            result.pixelFormat = "默认"
+        }
+
+        output.setSampleBufferDelegate(self, queue: videoQueue)
+
+        // 防抖必须关：任何防抖都会裁切画幅，与"全幅不裁切"直接冲突
+        if let connection = output.connection(with: .video) {
+            if connection.isVideoStabilizationSupported {
+                connection.preferredVideoStabilizationMode = .off
+                result.stabilizationMode = "off"
+            } else {
+                result.stabilizationMode = "不支持关闭"
+                result.notes.append("该连接不支持关闭防抖")
+            }
+            if connection.isVideoRotationAngleSupported(0) {
+                connection.videoRotationAngle = 0
+            }
+        }
+
+        // ---- 音频 ----
+        if audioEnabled {
+            if attachAudio(result: &result) {
+                result.audioEnabled = true
+            }
+        }
+
+        session.commitConfiguration()
+
+        // 帧率回读要在 commit 之后，此时 activeFormat 已生效
+        let duration = device.activeVideoMinFrameDuration
+        result.width = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription).width
+        result.height = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription).height
+        result.frameDurationValue = duration.value
+        result.frameDurationTimescale = duration.timescale
+        result.isExact24 = (duration.value == 1 && duration.timescale == 24)
+
+        configuration = result
+        return result
+    }
+
+    private func applyDeviceSettings(
+        device: AVCaptureDevice,
+        format: AVCaptureDevice.Format,
+        lockWhiteBalance: Bool,
+        result: inout Configuration
+    ) {
+        do {
+            try device.lockForConfiguration()
+
+            if device.activeFormat != format {
+                device.activeFormat = format
+            }
+
+            // 精确 24.000：分子分母都用整数，不取 1001/24000
+            let target = CMTime(value: 1, timescale: CMTimeScale(VideoSettingsBuilder.frameRate))
+            let range = format.videoSupportedFrameRateRanges.first
+            let supportsTarget = range.map {
+                Double($0.minFrameRate) <= 24.0001 && Double($0.maxFrameRate) >= 23.9999
+            } ?? false
+
+            if supportsTarget {
+                device.activeVideoMinFrameDuration = target
+                device.activeVideoMaxFrameDuration = target
+                let applied = device.activeVideoMinFrameDuration
+                result.isExact24 = (applied.value == 1 && applied.timescale == 24)
+                if !result.isExact24 {
+                    result.notes.append("帧率被系统改为 \(applied.value)/\(applied.timescale)")
+                }
+            } else {
+                result.notes.append("该格式帧率范围不含 24，无法锁定")
+            }
+
+            // 曝光交给 ExposureController：这里只确保初始处于自动，
+            // 避免上一次会话残留的 custom 值把画面冻住。
+            if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            }
+            result.exposureLocked = false
+
+            if lockWhiteBalance {
+                if device.isWhiteBalanceModeSupported(.locked) {
+                    device.whiteBalanceMode = .locked
+                    result.whiteBalanceLocked = true
+                } else {
+                    result.notes.append("不支持锁定白平衡")
+                }
+            }
+
+            // 对焦锁在无限远附近，避免录制中拉风箱
+            if device.isFocusModeSupported(.locked) {
+                device.focusMode = .locked
+                result.focusLocked = true
+            }
+
+            device.unlockForConfiguration()
+        } catch {
+            result.notes.append("设备锁定失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func attachAudio(result: inout Configuration) -> Bool {
+        guard let device = AVCaptureDevice.default(for: .audio) else {
+            result.notes.append("找不到麦克风")
+            return false
+        }
+        do {
+            let input = try AVCaptureDeviceInput(device: device)
+            guard session.canAddInput(input) else {
+                result.notes.append("会话拒绝音频输入")
+                return false
+            }
+            session.addInput(input)
+            audioInput = input
+        } catch {
+            result.notes.append("创建音频输入失败：\(error.localizedDescription)")
+            return false
+        }
+
+        let output = AVCaptureAudioDataOutput()
+        output.audioSettings = AudioSettings.captureSettings
+        guard session.canAddOutput(output) else {
+            result.notes.append("会话拒绝音频输出")
+            return false
+        }
+        session.addOutput(output)
+        audioOutput = output
+        output.setSampleBufferDelegate(self, queue: audioQueue)
+        return true
+    }
+
+    // MARK: - 运行
+
+    func start() {
+        guard !session.isRunning else { return }
+        session.startRunning()
+    }
+
+    func stop() {
+        guard session.isRunning else { return }
+        session.stopRunning()
+    }
+
+    var isRunning: Bool { session.isRunning }
+
+    // MARK: - 设备与格式选择
+
+    static func backWideCamera() -> AVCaptureDevice? {
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInWideAngleCamera],
+            mediaType: .video,
+            position: .back
+        )
+        return discovery.devices.first
+    }
+
+    /// 优先 4224×3024（Open Gate）；否则退到面积最大的视频格式。
+    ///
+    /// 注意：任务书把 4224×3024 称作"4:3"，实际比例是 1.397:1。
+    /// 真正的 4:3 全传感器是 4032×3024。这里按**像素面积**取最大，
+    /// 不按 4:3 筛选——否则会把最重要的 4224×3024 排除掉。
+    static func openGateFormat(in device: AVCaptureDevice) -> AVCaptureDevice.Format? {
+        let videoFormats = device.formats.filter { !$0.videoSupportedFrameRateRanges.isEmpty }
+
+        if let exact = videoFormats.first(where: {
+            let dims = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
+            return dims.width == 4224 && dims.height == 3024
+        }) {
+            return exact
+        }
+
+        return videoFormats.max { lhs, rhs in
+            let l = CMVideoFormatDescriptionGetDimensions(lhs.formatDescription)
+            let r = CMVideoFormatDescriptionGetDimensions(rhs.formatDescription)
+            return Int(l.width) * Int(l.height) < Int(r.width) * Int(r.height)
+        }
+    }
+
+    /// 按通路挑像素格式。
+    ///
+    /// systemProcessed 优先 10-bit 全幅 YUV；退到 8-bit；再退 BGRA。
+    /// bayerDirect 只接受 Bayer 四字符码。
+    static func choosePixelFormat(
+        from output: AVCaptureVideoDataOutput,
+        path: Path
+    ) -> OSType? {
+        let available = output.availableVideoPixelFormatTypes
+        guard !available.isEmpty else { return nil }
+
+        switch path {
+        case .systemProcessed:
+            // 只保留确定存在的常量：iOS 采集侧输出以 4:2:0 为主，
+            // 422 10-bit 在 AVCaptureVideoDataOutput 上基本不可得，
+            // 且对应 CV 常量存在 SDK 版本差异，不引入以免编译失败。
+            let preferred: [OSType] = [
+                kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                kCVPixelFormatType_32BGRA,
+            ]
+            return preferred.first { available.contains($0) }
+
+        case .bayerDirect:
+            return available.first { FourCC.isBayer($0) }
+        }
+    }
+}
+
+// MARK: - 输出代理
+
+extension CaptureController: AVCaptureVideoDataOutputSampleBufferDelegate,
+                            AVCaptureAudioDataOutputSampleBufferDelegate {
+
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        if output === videoOutput {
+            deliveredVideoFrames += 1
+            onVideoSample?(sampleBuffer)
+        } else if output === audioOutput {
+            onAudioSample?(sampleBuffer)
+        }
+    }
+}

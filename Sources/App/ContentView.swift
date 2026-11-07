@@ -53,6 +53,8 @@ final class ProbeModel: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var model = ProbeModel()
+    /// 非 nil 时在导航栏左侧显示返回按钮，用于从录制主界面进入探针页的场景
+    var onClose: (() -> Void)? = nil
 
     var body: some View {
         NavigationStack {
@@ -119,8 +121,20 @@ struct ContentView: View {
                 .padding(16)
             }
             .background(Color.black.ignoresSafeArea())
-            .navigationTitle("A camera")
+            .navigationTitle("探针")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                if let onClose {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button(action: onClose) {
+                            HStack(spacing: 3) {
+                                Image(systemName: "chevron.left")
+                                Text("录制")
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

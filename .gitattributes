@@ -1,0 +1,6 @@
+# 统一换行符为 LF：Windows 本地默认 CRLF 会让 plist / yml 在各工具间产生无意义的整体 diff
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ipa binary
