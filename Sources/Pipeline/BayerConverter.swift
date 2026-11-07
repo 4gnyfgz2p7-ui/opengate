@@ -390,10 +390,17 @@ final class BayerConverter {
             }
             return ushort((ushort(q[1] & 0x0F) << 8) | ushort(q[2]));
         }
-        if ((x & 1) == 0) {
-            return ushort(ushort(q[0]) | (ushort(q[1] & 0x0F) << 8));
+        if (mode == 1) {
+            if ((x & 1) == 0) {
+                return ushort(ushort(q[0]) | (ushort(q[1] & 0x0F) << 8));
+            }
+            return ushort((ushort(q[1]) >> 4) | (ushort(q[2]) << 4));
         }
-        return ushort((ushort(q[1]) >> 4) | (ushort(q[2]) << 4));
+        // mode 2：首字节装两个高半字节
+        if ((x & 1) == 0) {
+            return ushort((ushort(q[0] & 0xF0) << 4) | ushort(q[1]));
+        }
+        return ushort((ushort(q[0] & 0x0F) << 8) | ushort(q[2]));
     }
 
     inline float ac_rec709(float v) {
