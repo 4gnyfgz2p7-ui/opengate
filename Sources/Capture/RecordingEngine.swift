@@ -65,6 +65,7 @@ final class FrameStats {
         var converted = 0
         var appended = 0
         var lastFailure: String?
+        var diagnostics: String?
     }
 
     private let lock = NSLock()
@@ -72,6 +73,7 @@ final class FrameStats {
     private var converted = 0
     private var appended = 0
     private var lastFailure: String?
+    private var diagnostics: String?
 
     func markDelivered() { lock.lock(); delivered += 1; lock.unlock() }
     func markConverted() { lock.lock(); converted += 1; lock.unlock() }
@@ -79,9 +81,11 @@ final class FrameStats {
 
     func markFailure(_ stage: String) { lock.lock(); lastFailure = stage; lock.unlock() }
 
+    func markDiagnostics(_ text: String) { lock.lock(); diagnostics = text; lock.unlock() }
+
     func reset() {
         lock.lock()
-        delivered = 0; converted = 0; appended = 0; lastFailure = nil
+        delivered = 0; converted = 0; appended = 0; lastFailure = nil; diagnostics = nil
         lock.unlock()
     }
 
@@ -91,7 +95,8 @@ final class FrameStats {
             delivered: delivered,
             converted: converted,
             appended: appended,
-            lastFailure: lastFailure
+            lastFailure: lastFailure,
+            diagnostics: diagnostics
         )
     }
 }
@@ -231,12 +236,15 @@ final class RecordingEngine: ObservableObject {
                     chroma422: recorder?.wantsChroma422 ?? false,
                     parameters: RecordingEngine.bayerParameters(from: imageBuffer)
                 ) else {
+                    let diag = converter.lastDiagnostics
+                    statsBox.markDiagnostics(diag.summary)
                     if let stage = converter.lastFailureStage { statsBox.markFailure(stage) }
                     return
                 }
 
                 monitorable = converted
                 statsBox.markConverted()
+                statsBox.markDiagnostics(converter.lastDiagnostics.summary)
                 if let rebuilt = RecordingEngine.replacingImageBuffer(of: buffer, with: converted) {
                     if recorder?.appendVideo(rebuilt) == true { statsBox.markAppended() }
                 }
@@ -581,6 +589,9 @@ final class RecordingEngine: ObservableObject {
             self.history.insert(outcome, at: 0)
             self.state = .finished
             self.refreshWrittenBytes()
+            // 计时归零：上一段的时长留在 history 里，屏幕上不该继续挂着
+            self.elapsed = 0
+            self.droppedFrames = 0
         }
     }
 
@@ -673,6 +684,11 @@ final class RecordingEngine: ObservableObject {
         let shortSide = CGFloat(min(config.width, config.height))
         let ratio = shortSide > 0 ? longSide / shortSide : 4.0 / 3.0
         return rotation.isLandscape ? ratio : 1.0 / ratio
+    }
+
+    /// GPU 自检读数：kernel 有没有进来、读到多大、Y 的极值
+    var pipelineBadge: String {
+        stats.snapshot.diagnostics ?? "—"
     }
 
     /// 档位旁的一行小字：画面从哪来、多大

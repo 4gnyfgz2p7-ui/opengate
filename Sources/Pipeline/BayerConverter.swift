@@ -7,14 +7,14 @@ import Metal
 ///
 /// 为什么必须有这一层：4224×3024 这个全幅格式在 `AVCaptureVideoDataOutput` 上
 /// **只暴露 Bayer**，没有任何 YUV 输出（探针实测 availableVideoPixelFormatTypes
-/// 只有 btp2）。Bayer 数据不能直接喂给 HEVC / ProRes 编码器，`append` 会被逐帧
-/// 拒绝——表现就是「计时在走、文件 0 字节、波形图不出」。
+/// 只有 btp2）。Bayer 不能直接喂给 HEVC / ProRes 编码器。
 ///
-/// 着色器在**运行时**编译（`makeLibrary(source:)`）而不是编成 .metal：
-/// 着色器写错只会让转换器初始化失败、走降级通路，不会把整个 App 编挂。
+/// 参数用**扁平 uint32 缓冲**传，不用结构体：结构体一旦有一处对齐/布局判断错，
+/// kernel 读到的 width 就是 0，所有线程立刻 return，而命令缓冲仍然显示 completed——
+/// 成片就是一片绿。扁平数组没有布局歧义，同时把 kernel 看到的值回读出来做探针。
 final class BayerConverter {
 
-    /// 与着色器里的 `Params` 一一对应。全部 4 字节成员，无隐式内边距。
+    /// 与着色器里的 `p[...]` 下标一一对应。
     struct Parameters {
         var blackLevel: Float = 0
         var whiteLevel: Float = 4095
@@ -30,6 +30,24 @@ final class BayerConverter {
         var chroma422: Int32 = 0
     }
 
+    /// 一次转换的自检结果。真机上直接读数，不用猜。
+    struct Diagnostics {
+        /// kernel 是否真的进来了（probe[0] == 1）
+        var kernelRan = false
+        /// kernel 读到的 width / height / rowBytes
+        var kernelWidth: UInt32 = 0
+        var kernelHeight: UInt32 = 0
+        var kernelRowBytes: UInt32 = 0
+        /// 写出后 Y 平面的最小/最大值（10-bit）
+        var yMin: UInt32 = 0
+        var yMax: UInt32 = 0
+
+        var isBlack: Bool { yMax < 32 }
+        var summary: String {
+            "GPU \(kernelRan ? "1" : "0") · \(kernelWidth)×\(kernelHeight) · Y[\(yMin),\(yMax)]"
+        }
+    }
+
     static let bayerFormat: OSType = FourCC.code("btp2")
 
     private let device: MTLDevice
@@ -40,6 +58,8 @@ final class BayerConverter {
     private var sourceCapacity = 0
     private var yPlaneBuffer: MTLBuffer?
     private var cPlaneBuffer: MTLBuffer?
+    private var paramsBuffer: MTLBuffer?
+    private var probeBuffer: MTLBuffer?
     private var pools: [OSType: CVPixelBufferPool] = [:]
     private var poolWidth = 0
     private var poolHeight = 0
@@ -61,13 +81,17 @@ final class BayerConverter {
 
         self.device = device
         self.queue = queue
+        self.paramsBuffer = device.makeBuffer(length: 64, options: .storageModeShared)
+        self.probeBuffer = device.makeBuffer(length: 64, options: .storageModeShared)
+        guard paramsBuffer != nil, probeBuffer != nil else { return nil }
     }
 
     // MARK: - 转换
 
-    /// 最近一次失败发生在哪一步。全幅链路出问题时，这句话直接显示在界面上，
-    /// 不用再靠猜是哪一环。
+    /// 最近一次失败发生在哪一步
     private(set) var lastFailureStage: String?
+    /// 最近一次转换的自检数据
+    private(set) var lastDiagnostics = Diagnostics()
 
     func convert(
         _ source: CVPixelBuffer,
@@ -124,11 +148,24 @@ final class BayerConverter {
             return nil
         }
 
-        var params = parameters
-        params.width = UInt32(width)
-        params.height = UInt32(height)
-        params.sourceBytesPerRow = UInt32(sourceRowBytes)
-        params.chroma422 = chroma422 ? 1 : 0
+        // ---- 参数：扁平 uint32，下标即协议 ----
+        guard let paramsBuffer = paramsBuffer, let probeBuffer = probeBuffer else {
+            lastFailureStage = "参数缓冲缺失"
+            return nil
+        }
+        let floats = [parameters.blackLevel, parameters.whiteLevel,
+                      parameters.redGain, parameters.greenGain, parameters.blueGain]
+        var slots = [UInt32](repeating: 0, count: 10)
+        slots[0] = UInt32(width)
+        slots[1] = UInt32(height)
+        slots[2] = UInt32(sourceRowBytes)
+        slots[3] = chroma422 ? 1 : 0
+        for (index, value) in floats.enumerated() {
+            slots[4 + index] = value.bitPattern
+        }
+        slots[9] = UInt32(bitPattern: parameters.pattern)
+        memcpy(paramsBuffer.contents(), slots, 40)
+        memset(probeBuffer.contents(), 0, 32)
 
         guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder()
@@ -141,13 +178,20 @@ final class BayerConverter {
         encoder.setBuffer(bayerBuffer, offset: 0, index: 0)
         encoder.setBuffer(yBuffer, offset: 0, index: 1)
         encoder.setBuffer(cBuffer, offset: 0, index: 2)
-        encoder.setBytes(&params, length: MemoryLayout<Parameters>.stride, index: 3)
+        encoder.setBuffer(paramsBuffer, offset: 0, index: 3)
+        encoder.setBuffer(probeBuffer, offset: 0, index: 4)
 
-        let threadWidth = pipeline.threadExecutionWidth
-        let threadHeight = max(1, pipeline.maxTotalThreadsPerThreadgroup / threadWidth)
-        encoder.dispatchThreads(
-            MTLSize(width: (width + 1) / 2, height: (height + 1) / 2, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: threadWidth, height: threadHeight, depth: 1)
+        // 每个线程处理 2×2 个像素；用固定 16×16 线程组 + 线程组数派发，
+        // 不用 dispatchThreads（那个接口对超大网格的行为在真机上不好排查）。
+        let groupWidth = 16
+        let groupHeight = 16
+        let gridWidth = (width + 1) / 2
+        let gridHeight = (height + 1) / 2
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (gridWidth + groupWidth - 1) / groupWidth,
+                    height: (gridHeight + groupHeight - 1) / groupHeight,
+                    depth: 1),
+            threadsPerThreadgroup: MTLSize(width: groupWidth, height: groupHeight, depth: 1)
         )
         encoder.endEncoding()
 
@@ -156,6 +200,39 @@ final class BayerConverter {
 
         guard commandBuffer.status == .completed else {
             lastFailureStage = "GPU 未完成（\(commandBuffer.status.rawValue)）"
+            return nil
+        }
+
+        // ---- 自检：kernel 到底进没进来、看到的是多大 ----
+        let probe = probeBuffer.contents().bindMemory(to: UInt32.self, capacity: 8)
+        var diagnostics = Diagnostics()
+        diagnostics.kernelRan = probe[0] == 1
+        diagnostics.kernelWidth = probe[1]
+        diagnostics.kernelHeight = probe[2]
+        diagnostics.kernelRowBytes = probe[3]
+
+        // 稀疏采样求 Y 的极值：全量扫 1277 万样本只为了看有没有画面，没有必要
+        let ySamples = yBuffer.contents().bindMemory(to: UInt16.self, capacity: width * height)
+        var minValue = UInt32.max
+        var maxValue: UInt32 = 0
+        var index = 0
+        let total = width * height
+        while index < total {
+            let value = UInt32(ySamples[index])
+            if value < minValue { minValue = value }
+            if value > maxValue { maxValue = value }
+            index += 509
+        }
+        diagnostics.yMin = minValue == UInt32.max ? 0 : minValue
+        diagnostics.yMax = maxValue
+        lastDiagnostics = diagnostics
+
+        if !diagnostics.kernelRan {
+            lastFailureStage = "kernel 未执行（probe 为 0）"
+            return nil
+        }
+        if diagnostics.isBlack {
+            lastFailureStage = "输出全黑（Y≤\(diagnostics.yMax)）"
             return nil
         }
 
@@ -175,8 +252,6 @@ final class BayerConverter {
         }
 
         // 逐行回写：平面 stride 可以大于紧排字节数，按行搬最稳。
-        // 之前是把平面指针直接包成 MTLBuffer 让 GPU 写（bytesNoCopy 要求页对齐），
-        // 对齐不满足时整条链路静默返回 nil——现在只依赖 memcpy。
         let yStride = CVPixelBufferGetBytesPerRowOfPlane(output, 0)
         let yRowBytes = width * 2
         let ySource = yBuffer.contents()
@@ -263,19 +338,6 @@ final class BayerConverter {
     #include <metal_stdlib>
     using namespace metal;
 
-    struct Params {
-        float blackLevel;
-        float whiteLevel;
-        float redGain;
-        float greenGain;
-        float blueGain;
-        int pattern;
-        uint width;
-        uint height;
-        uint sourceBytesPerRow;
-        int chroma422;
-    };
-
     inline int ac_clamp(int v, int lo, int hi) {
         return v < lo ? lo : (v > hi ? hi : v);
     }
@@ -284,11 +346,11 @@ final class BayerConverter {
     //   p0 = (b0 << 4) | (b1 >> 4)
     //   p1 = ((b1 & 0x0F) << 8) | b2
     inline ushort ac_raw12(const device uchar* base, uint rowBytes, int x, int y) {
-        const device uchar* p = base + uint(y) * rowBytes + uint(x >> 1) * 3u;
+        const device uchar* q = base + uint(y) * rowBytes + uint(x >> 1) * 3u;
         if ((x & 1) == 0) {
-            return ushort((ushort(p[0]) << 4) | (ushort(p[1]) >> 4));
+            return ushort((ushort(q[0]) << 4) | (ushort(q[1]) >> 4));
         }
-        return ushort((ushort(p[1] & 0x0F) << 8) | ushort(p[2]));
+        return ushort((ushort(q[1] & 0x0F) << 8) | ushort(q[2]));
     }
 
     inline float ac_rec709(float v) {
@@ -296,115 +358,149 @@ final class BayerConverter {
         return (v < 0.018f) ? (4.5f * v) : (1.099f * pow(v, 0.45f) - 0.099f);
     }
 
+    // 每个相位是什么颜色：0=R 1=G 2=B
+    inline int ac_color_at(int pattern, int phase) {
+        if (pattern == 0) {          // RGGB
+            const int t[4] = {0, 1, 1, 2};
+            return t[phase];
+        } else if (pattern == 1) {   // BGGR
+            const int t[4] = {2, 1, 1, 0};
+            return t[phase];
+        } else if (pattern == 2) {   // GRBG
+            const int t[4] = {1, 0, 2, 1};
+            return t[phase];
+        }
+        const int t[4] = {1, 2, 0, 1};   // GBRG
+        return t[phase];
+    }
+
+    inline float3 ac_pixel(const device uchar* src, uint rowBytes, int w, int h,
+                                     int x, int y, int pattern,
+                                     float black, float invRange, float3 gains) {
+        int xm = ac_clamp(x - 1, 0, w - 1);
+        int xp = ac_clamp(x + 1, 0, w - 1);
+        int ym = ac_clamp(y - 1, 0, h - 1);
+        int yp = ac_clamp(y + 1, 0, h - 1);
+
+        float c  = float(ac_raw12(src, rowBytes, x,  y));
+        float l  = float(ac_raw12(src, rowBytes, xm, y));
+        float r  = float(ac_raw12(src, rowBytes, xp, y));
+        float u  = float(ac_raw12(src, rowBytes, x,  ym));
+        float d  = float(ac_raw12(src, rowBytes, x,  yp));
+        float ul = float(ac_raw12(src, rowBytes, xm, ym));
+        float ur = float(ac_raw12(src, rowBytes, xp, ym));
+        float dl = float(ac_raw12(src, rowBytes, xm, yp));
+        float dr = float(ac_raw12(src, rowBytes, xp, yp));
+
+        int phase = (x & 1) | ((y & 1) << 1);
+        int color = ac_color_at(pattern, phase);
+
+        float R = 0.0f;
+        float G = 0.0f;
+        float B = 0.0f;
+        if (color == 1) {
+            G = c;
+            int horiz = ac_color_at(pattern, phase ^ 1);
+            if (horiz == 0) {
+                R = 0.5f * (l + r);
+                B = 0.5f * (u + d);
+            } else {
+                B = 0.5f * (l + r);
+                R = 0.5f * (u + d);
+            }
+        } else if (color == 0) {
+            R = c;
+            G = 0.25f * (l + r + u + d);
+            B = 0.25f * (ul + ur + dl + dr);
+        } else {
+            B = c;
+            G = 0.25f * (l + r + u + d);
+            R = 0.25f * (ul + ur + dl + dr);
+        }
+
+        float3 linear = clamp(float3((R - black) * invRange,
+                                     (G - black) * invRange,
+                                     (B - black) * invRange), 0.0f, 1.0f);
+        linear = clamp(linear * gains, 0.0f, 1.0f);
+        return float3(ac_rec709(linear.r), ac_rec709(linear.g), ac_rec709(linear.b));
+    }
+
     kernel void bayer_to_yuv(const device uchar* src [[buffer(0)]],
                              device ushort* yPlane [[buffer(1)]],
                              device ushort* cPlane [[buffer(2)]],
-                             constant Params& p [[buffer(3)]],
+                             constant uint* p [[buffer(3)]],
+                             device uint* probe [[buffer(4)]],
                              uint2 gid [[thread_position_in_grid]]) {
-        int w = int(p.width);
-        int h = int(p.height);
-        int x0 = int(gid.x) * 2;
-        int y0 = int(gid.y) * 2;
-        if (x0 >= w || y0 >= h) { return; }
+        uint w = p[0];
+        uint h = p[1];
+        uint rowBytes = p[2];
+        int chroma422 = int(p[3]);
+        float black = as_type<float>(p[4]);
+        float white = as_type<float>(p[5]);
+        float3 gains = float3(as_type<float>(p[6]), as_type<float>(p[7]), as_type<float>(p[8]));
+        int pattern = int(p[9]);
 
-        // 每个相位分别是什么颜色：0=R 1=G 2=B
-        const int colors[16] = {
-            0, 1, 1, 2,   // RGGB
-            2, 1, 1, 0,   // BGGR
-            1, 0, 2, 1,   // GRBG
-            1, 2, 0, 1    // GBRG
-        };
-
-        float invRange = 1.0f / max(p.whiteLevel - p.blackLevel, 1.0f);
-        float3 gains = float3(p.redGain, p.greenGain, p.blueGain);
-
-        float encR[4];
-        float encG[4];
-        float encB[4];
-
-        for (int k = 0; k < 4; k++) {
-            int x = min(x0 + (k & 1), w - 1);
-            int y = min(y0 + (k >> 1), h - 1);
-
-            int xm = ac_clamp(x - 1, 0, w - 1);
-            int xp = ac_clamp(x + 1, 0, w - 1);
-            int ym = ac_clamp(y - 1, 0, h - 1);
-            int yp = ac_clamp(y + 1, 0, h - 1);
-
-            float c  = float(ac_raw12(src, p.sourceBytesPerRow, x,  y));
-            float l  = float(ac_raw12(src, p.sourceBytesPerRow, xm, y));
-            float r  = float(ac_raw12(src, p.sourceBytesPerRow, xp, y));
-            float u  = float(ac_raw12(src, p.sourceBytesPerRow, x,  ym));
-            float d  = float(ac_raw12(src, p.sourceBytesPerRow, x,  yp));
-            float ul = float(ac_raw12(src, p.sourceBytesPerRow, xm, ym));
-            float ur = float(ac_raw12(src, p.sourceBytesPerRow, xp, ym));
-            float dl = float(ac_raw12(src, p.sourceBytesPerRow, xm, yp));
-            float dr = float(ac_raw12(src, p.sourceBytesPerRow, xp, yp));
-
-            int phase = (x & 1) | ((y & 1) << 1);
-            int color = colors[p.pattern * 4 + phase];
-
-            float R, G, B;
-            if (color == 1) {
-                G = c;
-                int horizontal = colors[p.pattern * 4 + (phase ^ 1)];
-                if (horizontal == 0) {
-                    R = 0.5f * (l + r);
-                    B = 0.5f * (u + d);
-                } else {
-                    B = 0.5f * (l + r);
-                    R = 0.5f * (u + d);
-                }
-            } else if (color == 0) {
-                R = c;
-                G = 0.25f * (l + r + u + d);
-                B = 0.25f * (ul + ur + dl + dr);
-            } else {
-                B = c;
-                G = 0.25f * (l + r + u + d);
-                R = 0.25f * (ul + ur + dl + dr);
-            }
-
-            float3 linear = clamp(float3((R - p.blackLevel) * invRange,
-                                         (G - p.blackLevel) * invRange,
-                                         (B - p.blackLevel) * invRange), 0.0f, 1.0f);
-            linear = clamp(linear * gains, 0.0f, 1.0f);
-
-            float3 enc = float3(ac_rec709(linear.r), ac_rec709(linear.g), ac_rec709(linear.b));
-            float Y = dot(enc, float3(0.2126f, 0.7152f, 0.0722f));
-
-            yPlane[uint(y) * p.width + uint(x)] = ushort(clamp(64.0f + Y * 876.0f, 64.0f, 940.0f));
-
-            encR[k] = enc.r;
-            encG[k] = enc.g;
-            encB[k] = enc.b;
+        if (gid.x == 0u && gid.y == 0u) {
+            probe[0] = 1u;
+            probe[1] = w;
+            probe[2] = h;
+            probe[3] = rowBytes;
         }
 
-        if (p.chroma422 == 1) {
-            for (int k = 0; k < 4; k++) {
-                int x = min(x0 + (k & 1), w - 1);
-                int y = min(y0 + (k >> 1), h - 1);
-                float Y = 0.2126f * encR[k] + 0.7152f * encG[k] + 0.0722f * encB[k];
-                float cb = (encB[k] - Y) / 1.8556f;
-                float cr = (encR[k] - Y) / 1.5748f;
-                uint index = (uint(y) * p.width + uint(x)) * 2u;
-                cPlane[index] = ushort(clamp(512.0f + cb * 896.0f, 64.0f, 960.0f));
-                cPlane[index + 1] = ushort(clamp(512.0f + cr * 896.0f, 64.0f, 960.0f));
-            }
-        } else {
-            float3 average = float3(
-                (encR[0] + encR[1] + encR[2] + encR[3]) * 0.25f,
-                (encG[0] + encG[1] + encG[2] + encG[3]) * 0.25f,
-                (encB[0] + encB[1] + encB[2] + encB[3]) * 0.25f
-            );
-            float Y = 0.2126f * average.r + 0.7152f * average.g + 0.0722f * average.b;
-            float cb = (average.b - Y) / 1.8556f;
-            float cr = (average.r - Y) / 1.5748f;
+        int x0 = int(gid.x) * 2;
+        int y0 = int(gid.y) * 2;
+        if (x0 >= int(w) || y0 >= int(h)) { return; }
 
-            uint chromaWidth = p.width / 2u;
+        float invRange = 1.0f / max(white - black, 1.0f);
+
+        int x1 = min(x0 + 1, int(w) - 1);
+        int y1 = min(y0 + 1, int(h) - 1);
+
+        float3 e0 = ac_pixel(src, rowBytes, int(w), int(h), x0, y0, pattern, black, invRange, gains);
+        float3 e1 = ac_pixel(src, rowBytes, int(w), int(h), x1, y0, pattern, black, invRange, gains);
+        float3 e2 = ac_pixel(src, rowBytes, int(w), int(h), x0, y1, pattern, black, invRange, gains);
+        float3 e3 = ac_pixel(src, rowBytes, int(w), int(h), x1, y1, pattern, black, invRange, gains);
+
+        ushort y0v = ushort(clamp(64.0f + dot(e0, float3(0.2126f, 0.7152f, 0.0722f)) * 876.0f, 64.0f, 940.0f));
+        ushort y1v = ushort(clamp(64.0f + dot(e1, float3(0.2126f, 0.7152f, 0.0722f)) * 876.0f, 64.0f, 940.0f));
+        ushort y2v = ushort(clamp(64.0f + dot(e2, float3(0.2126f, 0.7152f, 0.0722f)) * 876.0f, 64.0f, 940.0f));
+        ushort y3v = ushort(clamp(64.0f + dot(e3, float3(0.2126f, 0.7152f, 0.0722f)) * 876.0f, 64.0f, 940.0f));
+
+        yPlane[uint(y0) * w + uint(x0)] = y0v;
+        yPlane[uint(y0) * w + uint(x1)] = y1v;
+        yPlane[uint(y1) * w + uint(x0)] = y2v;
+        yPlane[uint(y1) * w + uint(x1)] = y3v;
+
+        if (chroma422 == 1) {
+            float3 list0 = e0;
+            float3 list1 = e1;
+            float3 list2 = e2;
+            float3 list3 = e3;
+            float yv0 = dot(list0, float3(0.2126f, 0.7152f, 0.0722f));
+            float yv1 = dot(list1, float3(0.2126f, 0.7152f, 0.0722f));
+            float yv2 = dot(list2, float3(0.2126f, 0.7152f, 0.0722f));
+            float yv3 = dot(list3, float3(0.2126f, 0.7152f, 0.0722f));
+
+            uint i0 = (uint(y0) * w + uint(x0)) * 2u;
+            uint i1 = (uint(y0) * w + uint(x1)) * 2u;
+            uint i2 = (uint(y1) * w + uint(x0)) * 2u;
+            uint i3 = (uint(y1) * w + uint(x1)) * 2u;
+
+            cPlane[i0] = ushort(clamp(512.0f + (list0.b - yv0) / 1.8556f * 896.0f, 64.0f, 960.0f));
+            cPlane[i0 + 1] = ushort(clamp(512.0f + (list0.r - yv0) / 1.5748f * 896.0f, 64.0f, 960.0f));
+            cPlane[i1] = ushort(clamp(512.0f + (list1.b - yv1) / 1.8556f * 896.0f, 64.0f, 960.0f));
+            cPlane[i1 + 1] = ushort(clamp(512.0f + (list1.r - yv1) / 1.5748f * 896.0f, 64.0f, 960.0f));
+            cPlane[i2] = ushort(clamp(512.0f + (list2.b - yv2) / 1.8556f * 896.0f, 64.0f, 960.0f));
+            cPlane[i2 + 1] = ushort(clamp(512.0f + (list2.r - yv2) / 1.5748f * 896.0f, 64.0f, 960.0f));
+            cPlane[i3] = ushort(clamp(512.0f + (list3.b - yv3) / 1.8556f * 896.0f, 64.0f, 960.0f));
+            cPlane[i3 + 1] = ushort(clamp(512.0f + (list3.r - yv3) / 1.5748f * 896.0f, 64.0f, 960.0f));
+        } else {
+            float3 average = (e0 + e1 + e2 + e3) * 0.25f;
+            float yv = dot(average, float3(0.2126f, 0.7152f, 0.0722f));
+            uint chromaWidth = w / 2u;
             uint index = ((uint(y0) / 2u) * chromaWidth + (uint(x0) / 2u)) * 2u;
-            cPlane[index] = ushort(clamp(512.0f + cb * 896.0f, 64.0f, 960.0f));
-            cPlane[index + 1] = ushort(clamp(512.0f + cr * 896.0f, 64.0f, 960.0f));
+            cPlane[index] = ushort(clamp(512.0f + (average.b - yv) / 1.8556f * 896.0f, 64.0f, 960.0f));
+            cPlane[index + 1] = ushort(clamp(512.0f + (average.r - yv) / 1.5748f * 896.0f, 64.0f, 960.0f));
         }
     }
     """#

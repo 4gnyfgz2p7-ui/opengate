@@ -38,13 +38,8 @@ struct RecorderView: View {
             let zones = layoutZones(size: size)
             let landscape = size.width > size.height
 
-            // 不再整层旋转。
-            //
-            // 早先是"采集方向与窗口方向不一致就把整个界面转 90°"，
-            // 结果是用户在竖着拿手机时看到一屏横躺的控件，
-            // 而取景框又被转了第二次（父层 -90 + 图层 +90），
-            // 画面被压成中间一条。窗口本身是支持横屏的，
-            // 用户把手机转过来系统会自己转，界面跟着窗口尺寸走就够了。
+            // 界面跟着「拍摄方向」按钮走：按一下让窗口本身转过去，
+            // 而不是把内容层转 90°（那会把取景和控件各转一次，画面压成一条）。
             ZStack(alignment: .topLeading) {
                 Color.black
 
@@ -57,12 +52,21 @@ struct RecorderView: View {
             .frame(width: size.width, height: size.height)
         }
         .ignoresSafeArea()
-        .onAppear { engine.prepareSession() }
+        .onAppear {
+            engine.prepareSession()
+            forceInterface(engine.rotationDegrees)
+        }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { engine.resumeSession() }
+            if phase == .active {
+                engine.resumeSession()
+                forceInterface(engine.rotationDegrees)
+            }
+        }
+        .onChange(of: engine.rotationDegrees) { _, degrees in
+            forceInterface(degrees)
         }
         .preferredColorScheme(.dark)
-        .statusBarHidden(isRecording)
+        .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .sheet(isPresented: $showSettings) {
             SettingsSheet(engine: engine, onShowProbe: onShowProbe)
@@ -77,62 +81,89 @@ struct RecorderView: View {
         var controls: CGRect
     }
 
-    /// 顶部安全区。取景铺满全屏，拿不到安全区就会把顶栏塞进灵动岛里。
-    private var topInset: CGFloat {
+    /// 窗口安全区：横屏时刘海/灵动岛在侧边，不能再按固定 14pt 贴边
+    private var windowInsets: UIEdgeInsets {
         (UIApplication.shared.connectedScenes.first as? UIWindowScene)?
-            .keyWindow?.safeAreaInsets.top ?? 59
+            .keyWindow?.safeAreaInsets ?? UIEdgeInsets(top: 59, left: 0, bottom: 34, right: 0)
+    }
+
+    /// 把窗口转到与拍摄方向一致。角度即 `CaptureRotation.degrees`。
+    private func forceInterface(_ degrees: CGFloat) {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+        guard let scene = scene else { return }
+
+        let mask: UIInterfaceOrientationMask
+        switch Int(degrees.rounded()) {
+        case 0:   mask = .landscapeRight
+        case 180: mask = .portraitUpsideDown
+        case 270: mask = .landscapeLeft
+        default:  mask = .portrait
+        }
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { _ in }
     }
 
     /// 三块互不重叠的矩形：顶栏、取景、控件。
     ///
-    /// 取景按**真实画幅**算尺寸，短边方向贴满。竖拍 3024×4224 时左右贴满，
-    /// 横拍 4224×3024 时是一块扁的，竖直居中——黑边来自几何本身，不是布局错误。
+    /// 取景按**真实画幅**算尺寸（4224:3024），短边方向贴满；
+    /// 黑边只出现在几何上必然出现的那一侧，控件永远落在黑区里。
     private func layoutZones(size: CGSize) -> Zones {
-        let margin: CGFloat = 14
+        let insets = windowInsets
+        let margin: CGFloat = 12
+        let left = max(margin, insets.left + margin)
+        let right = max(margin, insets.right + margin)
+        let bottom = max(8, insets.bottom)
         let aspect = engine.captureAspect
         let landscape = size.width > size.height
 
         if landscape {
-            let barHeight: CGFloat = 44
-            let bar = CGRect(x: margin, y: 8, width: size.width - margin * 2, height: barHeight)
-            let controlsWidth: CGFloat = min(320, size.width * 0.36)
-            let controls = CGRect(
-                x: size.width - controlsWidth - margin,
-                y: bar.maxY + 8,
-                width: controlsWidth,
-                height: size.height - bar.maxY - 8 - 10
+            let barHeight: CGFloat = 40
+            let bar = CGRect(
+                x: left,
+                y: max(6, insets.top * 0.4),
+                width: size.width - left - right,
+                height: barHeight
             )
-            let freeWidth = controls.minX - margin - 10
-            let freeHeight = size.height - bar.maxY - 8 - 10
-            var width = min(freeWidth, freeHeight * aspect)
-            var height = width / aspect
-            if height > freeHeight {
-                height = freeHeight
-                width = height * aspect
-            }
+            let controlsWidth: CGFloat = min(300, size.width * 0.32)
+            let top = bar.maxY + 6
+            let controls = CGRect(
+                x: size.width - controlsWidth - right,
+                y: top,
+                width: controlsWidth,
+                height: size.height - top - bottom
+            )
+
+            let freeWidth = controls.minX - left - 10
+            let freeHeight = size.height - top - bottom
+            var height = freeHeight
+            var width = height * aspect
+            if width > freeWidth { width = freeWidth; height = width / aspect }
             let preview = CGRect(
-                x: margin,
-                y: bar.maxY + 8 + (freeHeight - height) / 2,
+                x: left + (freeWidth - width) / 2,
+                y: top + (freeHeight - height) / 2,
                 width: width,
                 height: height
             )
             return Zones(preview: preview, bar: bar, controls: controls)
         }
 
-        let top = max(topInset - 6, 6)
-        let barHeight: CGFloat = 48
-        let bar = CGRect(x: margin, y: top, width: size.width - margin * 2, height: barHeight)
+        let top = max(insets.top - 6, 6)
+        let barHeight: CGFloat = 44
+        let bar = CGRect(x: left, y: top, width: size.width - left - right, height: barHeight)
 
-        // 控件区高度压到 228：一块面板 + 一行录制条，
-        // 换来的是取景能在竖拍时左右贴满（440×614 刚好放得下）。
-        let controlsHeight: CGFloat = 228
-        let controls = CGRect(x: 0, y: size.height - controlsHeight, width: size.width, height: controlsHeight)
+        let controlsHeight: CGFloat = 224
+        let controls = CGRect(
+            x: 0,
+            y: size.height - controlsHeight - max(0, bottom - 18),
+            width: size.width,
+            height: controlsHeight
+        )
 
         let freeTop = bar.maxY + 8
         let freeBottom = controls.minY - 8
         let freeHeight = max(80, freeBottom - freeTop)
 
-        var width = min(size.width, freeHeight * aspect)
+        var width = min(size.width - left - right, freeHeight * aspect)
         var height = width / aspect
         if height > freeHeight {
             height = freeHeight
@@ -662,11 +693,6 @@ struct WhiteBalanceStrip: View {
                     }
                 )
 
-                Text("按住滑块拖动，松手即生效。关闭面板后参数保持不变。")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
                 Spacer(minLength: 0)
             }
             .padding(20)
@@ -779,8 +805,7 @@ struct SettingsSheet: View {
         .presentationDetents([.medium, .large])
     }
 
-    /// 画幅对比：视场角更大的那一档才是整块传感器读出的。
-    /// 这一块是为了把"到底哪个是真全幅"从推测变成可读的数字。
+    /// 两档画幅的视场角对比，用来判断哪一档覆盖整块传感器。
     private var frameSection: some View {
         section("画幅") {
             if let device = engine.capture.videoDevice {
@@ -800,10 +825,6 @@ struct SettingsSheet: View {
                         }
                     }
                 }
-                Text("视场角更大的那档才覆盖更多传感器；数字相同说明只是同一块画幅换了比例。")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 Text("会话未就绪")
                     .font(.system(size: 11))
@@ -848,6 +869,7 @@ struct SettingsSheet: View {
             row("音频", "LPCM 48 kHz / 16-bit / 2 ch")
             row("画面通路", engine.captureConfiguration?.pipelineText ?? "—")
             row("像素格式", engine.captureConfiguration?.pixelFormat ?? "—")
+            row("GPU 自检", engine.pipelineBadge)
             row("定位", engine.lastLocationText)
             if let note = engine.thermalNote {
                 row("机身温度", note)
@@ -882,7 +904,7 @@ struct SettingsSheet: View {
                             Text(tier.displayName)
                                 .font(.system(size: 13, weight: .medium))
                                 .foregroundStyle(.white)
-                            Text("\(tier.subtitle) · \(Int(tier.estimatedMegabytesPerSecond)) MB/s · \(tier.roleDescription)")
+                            Text("\(tier.subtitle) · \(Int(tier.estimatedMegabytesPerSecond)) MB/s")
                                 .font(.system(size: 10.5))
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -902,9 +924,6 @@ struct SettingsSheet: View {
             row("本档可录", RecorderView.durationText(engine.remainingSeconds))
             row("已写入", String(format: "%.1f MB", Double(engine.writtenBytes) / 1_000_000))
             if engine.remainingSeconds < 60 && engine.remainingSeconds > 0 {
-                Text("空间紧张：开录约 1 分钟后会触发自动停止并保存")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.orange)
             }
         }
     }
@@ -915,9 +934,6 @@ struct SettingsSheet: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("波形监看")
                         .font(.system(size: 13))
-                    Text("关闭后连采样都不做，省电")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.secondary)
                 }
             }
             .tint(accent)
