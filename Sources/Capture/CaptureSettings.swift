@@ -81,7 +81,7 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
         case .proResHQ: return .proRes422HQ
         case .proResLT: return .proRes422LT
         case .hevcLongGOP, .hevcAllIntra: return .hevc
-        case .proResRAW: return .proResRAW
+        case .proResRAW: return .proResRawCompat
         }
     }
 
@@ -177,7 +177,7 @@ enum VideoSettingsBuilder {
         // 也不接受压缩属性——带上任何一项都会被 canAdd 拒绝。
         if tier.isRawBayer {
             return [
-                AVVideoCodecKey: AVVideoCodecType.proResRAW,
+                AVVideoCodecKey: AVVideoCodecType.proResRawCompat,
                 AVVideoWidthKey: width,
                 AVVideoHeightKey: height,
             ]
@@ -334,4 +334,15 @@ enum AudioSettings {
     static var bytesPerSecond: Double {
         sampleRate * Double(channelCount) * Double(bitDepth / 8)
     }
+}
+
+// MARK: - ProRes RAW 编解码器
+
+extension AVVideoCodecType {
+    /// `AVVideoCodecType.proResRAW` 这个符号 iOS 26 才公开，而本工程的
+    /// deployment target 是 17.0，直接写常量编译不过。
+    ///
+    /// 编解码器在容器里就是 FourCC，值本身是稳定的，用原始值构造即可：
+    /// 系统不认识时有 `canApply` 会把它挡下来，不会静默写坏文件。
+    static let proResRawCompat = AVVideoCodecType(rawValue: "aprn")
 }
