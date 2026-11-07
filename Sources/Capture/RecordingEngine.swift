@@ -142,6 +142,15 @@ final class RecordingEngine: ObservableObject {
             // 录制中不允许切档：四档编码器参数不同，必须停录重建
             if state.isBusy && tier != oldValue {
                 tier = oldValue
+                return
+            }
+            guard tier != oldValue else { return }
+            // ProRes RAW 的前提是全幅 Bayer 直通。会话一旦降级成系统 ISP，
+            // 再切回来也不会自动恢复，必须在切档的这一刻重建会话。
+            if tier.isRawBayer {
+                Task { [weak self] in
+                    await self?.rebuildSessionForRawIfNeeded()
+                }
             }
         }
     }
@@ -307,6 +316,39 @@ final class RecordingEngine: ObservableObject {
         capture.onAudioSample = { buffer in
             box.get()?.appendAudio(buffer)
         }
+    }
+
+    /// 切到 ProRes RAW 时，如果会话还在系统 ISP 通路上就重建一次。
+    ///
+    /// 降级到 420v 是一次性的——`recoverPipelineIfNeeded` 不会自己升回来，
+    /// 而 RAW 写入器只认 Bayer，所以这一档必须先强制走 `bayerDirect`。
+    private func rebuildSessionForRawIfNeeded() async {
+        guard !recovering, !state.isBusy else { return }
+        guard captureConfiguration?.isBayer != true else { return }
+
+        recovering = true
+        capture.stop()
+        exposure.detach()
+        whiteBalance.detach()
+
+        let config = capture.configure(
+            path: .bayerDirect,
+            audioEnabled: true,
+            canProcessBayer: bayerConverter != nil
+        )
+        captureConfiguration = config
+        capture.start()
+        if let device = capture.videoDevice {
+            exposure.attach(to: device)
+            whiteBalance.attach(to: device)
+        }
+        sessionReady = capture.isRunning
+        stats.reset()
+        recovering = false
+        pipelineNote = config.isBayer
+            ? ""
+            : "ProRes RAW 档没拿到全幅 Bayer 通路"
+        if !state.isBusy { state = .idle }
     }
 
     /// 从 Bayer 帧的附件里取黑电平 / 白电平 / 白平衡增益。
@@ -479,10 +521,16 @@ final class RecordingEngine: ObservableObject {
     /// 判据刻意做得保守：三秒内**一帧都没转换出来**才算失败。
     /// 降级后分辨率为 4032×3024（真 4:3），但录制能出片——
     /// 比留一个打不开的 0 字节文件有用。
+    ///
+    /// ProRes RAW 例外：那一档本来就不做 demosaic，`converted` 恒为 0。
+    /// 若照旧用它当判据，会话会在三秒后自己切到系统 ISP，
+    /// 而 RAW 写入器只收 Bayer，于是第一次点录制必定失败。
+    /// 这一档改看「已写入帧数」。
     private func recoverPipelineIfNeeded(force: Bool = false) async {
         guard !recovering, captureConfiguration?.isBayer == true else { return }
         let snap = stats.snapshot
-        guard force || snap.converted == 0 else { return }
+        let progress = tier.isRawBayer ? snap.appended : snap.converted
+        guard force || progress == 0 else { return }
 
         recovering = true
         let stage = snap.lastFailure ?? "未知"
@@ -543,6 +591,14 @@ final class RecordingEngine: ObservableObject {
         guard state.canStart else { return }
         guard sessionReady else {
             state = .failed("采集会话未就绪")
+            return
+        }
+        // ProRes RAW 依赖全幅 Bayer 直通。若会话已经降级成系统 ISP 格式，
+        // 写入器一定拒收——在这里就说清楚，而不是录了两秒再报错。
+        if tier.isRawBayer, captureConfiguration?.isBayer != true {
+            let width = captureConfiguration?.width ?? 0
+            let height = captureConfiguration?.height ?? 0
+            state = .failed("ProRes RAW 需要全幅 Bayer 通路，当前会话是系统 ISP（\(width)×\(height)）。切走再切回该档位可重建会话。")
             return
         }
 
@@ -675,7 +731,11 @@ final class RecordingEngine: ObservableObject {
                             let snap = self.stats.snapshot
                             let detail = recorder.appendFailureDescription ?? "编码器未接受该画面格式"
                             self.autoStopReason = "画面未能写入（收帧 \(snap.delivered) · 转换 \(snap.converted) · 写入 \(snap.appended)）：\(detail)"
-                            let needsFallback = self.captureConfiguration?.isBayer == true && snap.appended == 0
+                            // ProRes RAW 只认 Bayer：切到系统 ISP 也喂不进去，
+                            // 降级只会把同一个错误重演一遍，不如原地报明原因。
+                            let needsFallback = self.captureConfiguration?.isBayer == true
+                                && snap.appended == 0
+                                && !self.tier.isRawBayer
                             self.stopRecording()
                             // 全幅通路写不进去：这次收尾之后直接换成系统 ISP，
                             // 下一次按录制键就能出片，而不是再失败一遍。

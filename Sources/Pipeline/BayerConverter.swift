@@ -444,7 +444,7 @@ final class BayerConverter {
     }
 
     // btp2 的字节排列没有公开文档。唯一确定的是 bytesPerRow = 4224 × 1.5，
-    // 即每像素 1.5 字节；这 12 位由哪几个字节拼成有九种讲得通的排法，
+    // 即每像素 1.5 字节；这 12 位由哪几个字节拼成有十一种讲得通的排法，
     // 尺寸验算全都成立，只有真数据上的统计性质能分辨。
     //
     // 排法由 CPU 侧标定后通过 p[10] 传进来（见 BayerCalibration.unpack），
@@ -490,12 +490,24 @@ final class BayerConverter {
             uint nib = ((k & 1) == 0) ? (lo >> 4) : (lo & 0x0Fu);
             return ushort((uint(blk[2 + k]) << 4) | nib);
         }
-        {
+        if (mode == 8) {
             int g = x >> 3, k = x & 7;
             const device uchar* blk = row + uint(g) * 12u;
             uint lo = uint(blk[k >> 1]);
             uint nib = ((k & 1) == 0) ? (lo >> 4) : (lo & 0x0Fu);
             return ushort((uint(blk[4 + k]) << 4) | nib);
+        }
+        {
+            // 9 / 10：2 像素 3 字节，前两个字节各做一个像素的高 8 位，
+            // 第三个字节装两个低 4 位。
+            int g = x >> 1;
+            const device uchar* blk = row + uint(g) * 3u;
+            uint b0 = uint(blk[0]), b1 = uint(blk[1]), b2 = uint(blk[2]);
+            bool even = (x & 1) == 0;
+            if (mode == 9) {
+                return ushort(even ? ((b0 << 4) | (b2 >> 4)) : ((b1 << 4) | (b2 & 0x0Fu)));
+            }
+            return ushort(even ? ((b0 << 4) | (b2 & 0x0Fu)) : ((b1 << 4) | (b2 >> 4)));
         }
     }
 
