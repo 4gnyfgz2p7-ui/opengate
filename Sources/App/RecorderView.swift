@@ -55,7 +55,7 @@ struct RecorderView: View {
 
                 previewView(
                     available: contentSize,
-                    physicalLandscape: contentLandscape,
+                    anchor: previewAnchor(rotated: rotateAll, contentLandscape: contentLandscape),
                     aspect: aspect,
                     degrees: previewDegrees
                 )
@@ -79,12 +79,23 @@ struct RecorderView: View {
 
     // MARK: - 取景
 
-    /// 取景画面贴向镜头模组一侧：竖持贴顶、横持贴左。
-    /// 居中会让两侧黑边对半分，参数面板反而没地方放；
-    /// 贴边之后另一侧自然形成一整块可用区域。
+    /// 取景画面永远贴向镜头模组一侧，绝不在中间居中。
+    ///
+    /// 后置模组在机身背面左上角，换算到屏幕就是：竖拍贴顶、横 A（0°）贴左、
+    /// 横 B（180°）贴右、倒置（270°）贴底。
+    /// 整层旋转模式下坐标已经转过 90°，所以"贴顶"在旋转坐标里就等于物理上的
+    /// 对应侧边，直接用 .top 即可——这一步搞错就会贴到握持手那一侧去。
+    private func previewAnchor(rotated: Bool, contentLandscape: Bool) -> Alignment {
+        if rotated { return .top }
+        if contentLandscape {
+            return engine.rotation.degrees == 180 ? .trailing : .leading
+        }
+        return engine.rotation.degrees == 270 ? .bottom : .top
+    }
+
     private func previewView(
         available: CGSize,
-        physicalLandscape: Bool,
+        anchor: Alignment,
         aspect: CGFloat,
         degrees: CGFloat
     ) -> some View {
@@ -100,11 +111,7 @@ struct RecorderView: View {
             rotationDegrees: degrees
         )
         .frame(width: width, height: height)
-        .frame(
-            maxWidth: .infinity,
-            maxHeight: .infinity,
-            alignment: physicalLandscape ? .leading : .top
-        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: anchor)
     }
 
     // MARK: - 控件层
