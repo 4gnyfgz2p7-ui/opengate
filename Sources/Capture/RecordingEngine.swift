@@ -281,6 +281,11 @@ final class RecordingEngine: ObservableObject {
             // 全幅格式只吐 Bayer：先 demosaic 成 BGRA 再交给编码器。
             // 不做这一步 append 会被逐帧拒绝，文件停在 0 字节。
             if CVPixelBufferGetPixelFormatType(imageBuffer) == BayerConverter.bayerFormat {
+                // 一次性诊断：把设备交付的 btp2 原始字节原样落盘（前两帧）。
+                // 自研解包与官方 ProRes RAW 解码器对不上，只能拿真字节在 PC 上
+                // 逐种排法还原比对，判据在这件事上已经不可信了。
+                BayerDump.capture(imageBuffer)
+
                 // 设备实际按 60 fps 供帧（会话启动会把帧时长改回默认），
                 // 而写入只要 24 帧/秒。逐帧 demosaic 等于白烧 2.5 倍算力，
                 // 先按 30 fps 掐一道，重复格点再交给写入端去重。

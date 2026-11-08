@@ -66,18 +66,21 @@ final class BayerConverter {
 
         /// 写进视频文件的诊断串，ffprobe 直接可读
         var metadataText: String {
+            // 顺序即优先级：QuickTime 的元数据字段有长度上限，超出部分会被静默截掉。
+            // 之前把 512 字节的 head 放在中间，结果 cal（相位与白平衡增益）和 pixels
+            // 全被切掉——恰恰是最该看的两项。所以决定性字段必须排在前面，
+            // head 只留前 48 字节（够看出解包对不对）。
             [
+                "cal=\(calibration)",
+                "raw=\(rawRange)",
+                "rgb_mean=\(outMean[0]),\(outMean[1]),\(outMean[2])",
+                "rgb_max=\(outMax[0]),\(outMax[1]),\(outMax[2])",
+                "first=\(firstPixel)",
                 "gpu=\(kernelRan ? 1 : 0)",
                 "size=\(kernelWidth)x\(kernelHeight)",
                 "row=\(sourceRowBytes)",
-                "rgb_min=\(outMin[0]),\(outMin[1]),\(outMin[2])",
-                "rgb_max=\(outMax[0]),\(outMax[1]),\(outMax[2])",
-                "rgb_mean=\(outMean[0]),\(outMean[1]),\(outMean[2])",
-                "first=\(firstPixel)",
-                "raw=\(rawRange)",
-                "head=\(rawHead)",
                 "pixels=\(firstPixels)",
-                "cal=\(calibration)",
+                "head=\(String(rawHead.prefix(96)))",
             ].joined(separator: ";")
         }
     }
