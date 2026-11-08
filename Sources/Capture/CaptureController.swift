@@ -387,14 +387,22 @@ final class CaptureController: NSObject {
             return RawPreparation(settings: nil, metadata: nil, reason: "没有可用的视频设备")
         }
 
-        // ---- 第一条：锁定白平衡到当前增益 ----
+        // ---- 第一条：确认白平衡已锁定 ----
+        //
+        // Apple 要求 RAW 在查询元数据前白平衡必须是 locked 状态。
+        // 进入 RAW 档时 WhiteBalanceController 已经把手动档切好并写入了
+        // `setWhiteBalanceModeLocked`，这里只做校验——**不能无条件再锁一次**，
+        // 那会把用户刚设的色温色调覆盖成设备当前增益，
+        // 手动白平衡就等于白调了。
         do {
             try device.lockForConfiguration()
             if device.isWhiteBalanceModeSupported(.locked) {
-                device.setWhiteBalanceModeLocked(
-                    with: device.deviceWhiteBalanceGains,
-                    completionHandler: nil
-                )
+                if device.whiteBalanceMode != .locked {
+                    device.setWhiteBalanceModeLocked(
+                        with: device.deviceWhiteBalanceGains,
+                        completionHandler: nil
+                    )
+                }
             } else {
                 device.unlockForConfiguration()
                 return RawPreparation(settings: nil, metadata: nil,
@@ -426,15 +434,11 @@ final class CaptureController: NSObject {
             return RawPreparation(settings: nil, metadata: nil,
                                   reason: "系统未给出 ProRes RAW 的建议编码设置")
         }
-        // 这个 API 的符号到 iOS 26 才公开，而本工程部署目标是 17.0，
-        // 不包可用性判断编译就过不去。设备实际跑 iOS 27，运行时能进这一支。
-        var metadata: [AVMetadataItem]?
-        if #available(iOS 26.0, *) {
-            metadata = videoOutput.recommendedMovieMetadata(
-                forVideoCodecType: codec,
-                assetWriterOutputFileType: .mov
-            )
-        }
+        // 部署目标是 iOS 27，这个 API（iOS 26 起）可以直接调，不需要可用性判断
+        let metadata = videoOutput.recommendedMovieMetadata(
+            forVideoCodecType: codec,
+            assetWriterOutputFileType: .mov
+        )
         return RawPreparation(settings: settings, metadata: metadata, reason: nil)
     }
 

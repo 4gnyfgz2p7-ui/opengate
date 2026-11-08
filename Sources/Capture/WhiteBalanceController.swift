@@ -117,6 +117,53 @@ final class WhiteBalanceController: ObservableObject {
         device = nil
     }
 
+    // MARK: - RAW 档隔离
+
+    /// RAW 档要求的白平衡是「手动锁定」，而其它档允许自动。
+    ///
+    /// 这两件事必须隔离：进入 RAW 时把用户原来的档位记下来并强制切到手动，
+    /// 退出时原样恢复。否则录完 RAW 回到 HEVC，白平衡会一直停在被锁住的
+    /// 那个值上，看起来像"自动白平衡坏了"。
+    ///
+    /// 切手动不是随便切：起点取设备当前实际的白平衡，换算成色温色调填进滑块，
+    /// 这样画面在切档瞬间不会跳色。
+    private var rawSavedMode: Mode?
+
+    func enterRawMode() {
+        guard rawSavedMode == nil else { return }
+        rawSavedMode = mode
+
+        if let device = device, let gains = Self.readableGains(of: device) {
+            let current = device.temperatureAndTintValues(for: gains)
+            if current.temperature.isFinite, current.temperature > 0 {
+                temperature = min(max(current.temperature, Self.temperatureRange.lowerBound),
+                                  Self.temperatureRange.upperBound)
+            }
+            tint = min(max(current.tint, Self.tintRange.lowerBound), Self.tintRange.upperBound)
+        }
+
+        if mode == .manual {
+            // 已经在手动：赋值不会触发 didSet，显式重写一次，
+            // 确保设备真的落在 .locked 且增益就是滑块上的值
+            applyMode()
+        } else {
+            mode = .manual
+        }
+    }
+
+    func exitRawMode() {
+        guard let saved = rawSavedMode else { return }
+        rawSavedMode = nil
+        if mode == saved {
+            applyMode()
+        } else {
+            mode = saved
+        }
+    }
+
+    /// 是否正在 RAW 档的强制手动状态
+    var isForcedManualForRaw: Bool { rawSavedMode != nil }
+
     // MARK: - 应用
 
     private func applyMode() {

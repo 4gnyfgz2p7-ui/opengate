@@ -145,6 +145,15 @@ final class RecordingEngine: ObservableObject {
                 return
             }
             guard tier != oldValue else { return }
+
+            // 白平衡按档位隔离：RAW 强制手动锁定，其它档恢复用户原来的设定。
+            // 两边必须成对调用，否则录完 RAW 回到 HEVC 会一直停在锁死的白平衡上。
+            if tier.isRawBayer {
+                whiteBalance.enterRawMode()
+            } else {
+                whiteBalance.exitRawMode()
+            }
+
             // ProRes RAW 的前提是全幅 Bayer 直通。会话一旦降级成系统 ISP，
             // 再切回来也不会自动恢复，必须在切档的这一刻重建会话。
             if tier.isRawBayer {
