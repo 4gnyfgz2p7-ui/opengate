@@ -856,7 +856,19 @@ final class RecordingEngine: ObservableObject {
 
     /// 写进视频文件的诊断串，录完直接从文件读，不用再截图
     var pipelineDiagnosticsText: String {
-        stats.snapshot.diagnosticsDetail ?? "—"
+        var text = stats.snapshot.diagnosticsDetail ?? "—"
+        // EV 滑块失效、手动对焦没滑块，两个现象都可能是「这条格式下系统
+        // 不给这项能力」。把实测能力值写进容器，一次录制就能判定，
+        // 不用靠猜：
+        //   eb  = min/maxExposureTargetBias，两者相等说明 EV 完全无效
+        //   fp  = isLockingFocusWithCustomLensPositionSupported，false 说明只能冻结位置
+        if let device = capture.videoDevice {
+            text += String(format: "·eb%.1f/%.1f",
+                           device.minExposureTargetBias, device.maxExposureTargetBias)
+            text += "·fp\(device.isLockingFocusWithCustomLensPositionSupported ? 1 : 0)"
+            text += "·fpi\(device.isFocusPointOfInterestSupported ? 1 : 0)"
+        }
+        return text
     }
 
     /// 档位旁的一行小字：画面从哪来、多大

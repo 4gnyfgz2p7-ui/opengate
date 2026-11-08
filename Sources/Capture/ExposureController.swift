@@ -189,6 +189,17 @@ final class ExposureController: ObservableObject {
     private var minEV: Float { device?.minExposureTargetBias ?? -8 }
     private var maxEV: Float { device?.maxExposureTargetBias ?? 8 }
 
+    /// 这条格式下系统到底给不给曝光补偿。
+    ///
+    /// btp2 这类绕过 ISP 的全幅格式里，`maxExposureTargetBias` 可能等于
+    /// `minExposureTargetBias`（都为 0）。那种情况下 `setExposureTargetBias`
+    /// 不报错也不生效——这正是「EV 滑块拖了没反应」的成因。
+    /// 不支持时改由闭环吞下这个偏移，见 `servoStep`。
+    private var supportsExposureBias: Bool {
+        guard let device = device else { return false }
+        return device.maxExposureTargetBias > device.minExposureTargetBias + 0.001
+    }
+
     private func applyMode() {
         guard let device = device else { return }
 
@@ -269,8 +280,12 @@ final class ExposureController: ObservableObject {
     private func applyEV() {
         guard let device = device else { return }
         let clamped = min(max(ev, minEV), maxEV)
-        // 自动与手动/混合模式都要写 target bias：
-        // 前者直接改变系统测光目标，后者改变闭环的收敛目标（offset → 0 即命中新目标）
+
+        // 支持就用系统 bias（它对自动与半自动都直接生效）。
+        // 不支持时什么都不写——`servoStep` 会把 ev 当作闭环目标，
+        // 从 ISO/快门那一维补出来。
+        guard supportsExposureBias else { return }
+
         try? device.lockForConfiguration()
         device.setExposureTargetBias(clampBias(clamped, on: device), completionHandler: nil)
         device.unlockForConfiguration()
@@ -303,10 +318,16 @@ final class ExposureController: ObservableObject {
         let offset = device.exposureTargetOffset
         guard offset.isFinite else { return }
 
-        // 偏差过小就别动，避免在目标附近来回抖
-        guard abs(offset) > 0.08 else { return }
+        // 闭环目标：支持系统 bias 时目标是 0（bias 已经表达过 EV），
+        // 不支持时目标就是 EV 本身 —— 系统不给补偿，就由这一维补出来。
+        // 这是 EV 滑块在 btp2 格式下能生效的关键。
+        let targetOffset: Float = supportsExposureBias ? 0 : ev
+        let error = offset - targetOffset
 
-        let step = min(max(-offset * servoDamping, -maxStepEV), maxStepEV)
+        // 偏差过小就别动，避免在目标附近来回抖
+        guard abs(error) > 0.08 else { return }
+
+        let step = min(max(-error * servoDamping, -maxStepEV), maxStepEV)
         let factor = powf(2.0, step)
 
         try? device.lockForConfiguration()

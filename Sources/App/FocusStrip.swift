@@ -37,7 +37,12 @@ struct FocusStrip: View {
                     .frame(width: 34, alignment: .trailing)
             }
 
-            if focus.mode == .manual && focus.supportsManualFocus {
+            // 只要选到手动就出滑块。
+            // 早先还要求 supportsManualFocus，那条来自
+            // isLockingFocusWithCustomLensPositionSupported —— 在 btp2 这类
+            // 全幅格式下系统可能返回 false，滑块于是整个不出现，
+            // 看起来就是"根本没法手动对焦"。先给出来，能力值已写进诊断。
+            if focus.mode == .manual {
                 HStack(spacing: 8) {
                     Text("近")
                         .font(.system(size: 10))

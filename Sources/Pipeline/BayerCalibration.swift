@@ -55,8 +55,10 @@ final class BayerCalibration {
         var bestVariation: Double = 0
         /// 各排法的 mod-8 同色方差。只作历史对照，不参与选择
         var modePeriodicities: [Double] = []
-        /// 各排法的相邻差均值，最小者即选中（真正的主判据）
+        /// 各排法的相邻差均方根，最小者即选中（真正的主判据）
         var modeCross: [Double] = []
+        /// 四种相位各自的 R/G、B/G（八个数），用于在设备值与图像统计冲突时裁决
+        var patternLevels: [Double] = []
 
         var summary: String {
             let patterns = ["RGGB", "BGGR", "GRBG", "GBRG"]
@@ -73,6 +75,8 @@ final class BayerCalibration {
             text += String(format: "·lv%.2f/%.2f", min(levelRed, 9.99), min(levelBlue, 9.99))
             text += String(format: "·bw%.0f/%.0f", blackLevel, whiteLevel)
             text += "·dev" + patterns[Int(max(0, min(3, devicePattern)))]
+            let pl = patternLevels.map { String(format: "%.2f", min($0, 9.99)) }
+            text += "·p4" + pl.joined(separator: "/")
             text += String(format: "·tv%.4f", bestVariation)
             if !modeCross.isEmpty {
                 // 各排法的相邻差均值，最小者即选中。真实数据上的分离度约 14 倍
@@ -248,6 +252,8 @@ final class BayerCalibration {
         // 前几个像素是无效区（实测会出现 3000 以上的孤立值），拿它当判据会误导。
         var sameDiff = [Double](repeating: 0, count: candidateCount)
         var crossDiff = [Double](repeating: 0, count: candidateCount)
+        // 相邻差的平方和。判据用它而不是均值，原因见下面的说明
+        var crossSqDiff = [Double](repeating: 0, count: candidateCount)
         var minSample = [Double](repeating: .greatestFiniteMagnitude, count: candidateCount)
         var maxSample = [Double](repeating: 0, count: candidateCount)
         var sampleCount = 0.0
@@ -260,9 +266,12 @@ final class BayerCalibration {
                     let center = value(mode, sampleX, sampleY)
                     let right = value(mode, sampleX + 1, sampleY)
                     let down = value(mode, sampleX, sampleY + 1)
+                    let toRight = abs(center - right)
+                    let toDown = abs(center - down)
                     sameDiff[mode] += abs(center - value(mode, sampleX + 2, sampleY))
                                    + abs(center - value(mode, sampleX, sampleY + 2))
-                    crossDiff[mode] += abs(center - right) + abs(center - down)
+                    crossDiff[mode] += toRight + toDown
+                    crossSqDiff[mode] += toRight * toRight + toDown * toDown
                     if center < minSample[mode] { minSample[mode] = center }
                     if center > maxSample[mode] { maxSample[mode] = center }
                 }
@@ -353,21 +362,36 @@ final class BayerCalibration {
         // 「同色差 ÷ 异色差」，比值里的分母被噪声撑大，正确排法反而吃亏；
         // 0.5.19 换成总变差、0.5.19b 换成 mod-8，都是在合成数据上调的，
         // 而合成数据里没有真实噪声，两种错法的差距被磨平了。
+        // 用**均方根**而不是均值，这一处是 0.5.27 失败的根因：
+        //
+        // 采样是稀疏的整幅扫，暗场景里大片像素扣掉黑电平后是 0，
+        // 所有排法在这些点上差值也都是 0。均值把它们算进去，
+        // 等于用「一片零」稀释掉真正有信息的高光区——0.5.27 的诊断里
+        //   cx = 0.010/0.010/0.308/0.459/0.422/0.773/0.010/0.802/0.484/0.011/0.009
+        // 四个排法挤在 0.009-0.011，判据完全失去分辨力。
+        //
+        // 同一份 512 字节真实数据在 PC 上跑：
+        //   均值：mode10=62.6  mode6=897   → 14 倍
+        //   均方根：mode10=68.3  mode6=1455 → 21 倍
+        // 且均方根对「大片零」免疫：零仍是零，高光区的跳变被放大。
         var crossMeans = [Double](repeating: .greatestFiniteMagnitude, count: candidateCount)
+        var crossRms = [Double](repeating: .greatestFiniteMagnitude, count: candidateCount)
         for mode in 0..<candidateCount {
             guard maxSample[mode] - minSample[mode] > 0.02 else { continue }
-            crossMeans[mode] = crossDiff[mode] / max(sampleCount, 1)
+            let n = max(sampleCount * 2, 1)
+            crossMeans[mode] = crossDiff[mode] / n
+            crossRms[mode] = (crossSqDiff[mode] / n).squareRoot()
         }
 
         // 取最优；与最优相差 15% 以内的视为并列。
         // 并列时按固定优先级挑：9 优先于 10——两者只差低 4 位归谁，
         // 对图像的影响上限是 15/4095 ≈ 0.4%，肉眼不可见，但必须固定，
         // 否则同一次录制前后可能来回跳。
-        let finite = crossMeans.filter { $0 < .greatestFiniteMagnitude }
+        let finite = crossRms.filter { $0 < .greatestFiniteMagnitude }
         var bestMode = 9
         if let low = finite.min() {
-            let threshold = low * 1.15
-            let tied = (0..<candidateCount).filter { crossMeans[$0] <= threshold }
+            let threshold = low * 1.20
+            let tied = (0..<candidateCount).filter { crossRms[$0] <= threshold }
             bestMode = tied.min(by: { rank($0) < rank($1) }) ?? tied.first ?? 9
         }
         let bestVariation = (crossDiff[bestMode] + sameDiff[bestMode]) / max(sampleCount, 1)
@@ -402,6 +426,12 @@ final class BayerCalibration {
         var bestPatternScore = Double.greatestFiniteMagnitude
         var bestGreenPair = 0.0
         var bestNeutrality = 0.0
+        // 四种相位各自解出的 R/G、B/G，按 pattern 顺序排：
+        // [RGGB_R/G, RGGB_B/G, BGGR_…, GRBG_…, GBRG_…]。
+        // 暖光下 R 应当高于 B；哪一组同时满足「R>B 且 G 不是最弱」，
+        // 哪一组就是真实相位。设备给的 BayerPattern 和图像统计冲突时，
+        // 靠这八个数直接裁决。
+        var patternLevels = [Double](repeating: 0, count: 8)
 
         for pattern in 0..<4 {
             let table = colors[pattern]
@@ -414,6 +444,10 @@ final class BayerCalibration {
             var greenPair = 0.0
             var redSum = 0.0
             var blueSum = 0.0
+            // 原始（未加增益）的三通道和，用来给每种相位算 R/G、B/G
+            var redRaw = 0.0
+            var blueRaw = 0.0
+            var greenRaw = 0.0
             var count = 0.0
 
             var y = step
@@ -427,6 +461,9 @@ final class BayerCalibration {
                     greenPair += abs(quad[greenA] - quad[greenB])
                     redSum += quad[redIndex] * Double(redGain)
                     blueSum += quad[blueIndex] * Double(blueGain)
+                    redRaw += quad[redIndex]
+                    blueRaw += quad[blueIndex]
+                    greenRaw += (quad[greenA] + quad[greenB]) * 0.5
                     count += 1
                     x += step
                 }
@@ -434,6 +471,10 @@ final class BayerCalibration {
             }
 
             guard count > 0 else { continue }
+            if greenRaw > 1e-9 {
+                patternLevels[pattern * 2] = redRaw / greenRaw
+                patternLevels[pattern * 2 + 1] = blueRaw / greenRaw
+            }
             let normalizedPair = greenPair / count
             let neutrality = abs(log(max(redSum, 1e-6) / max(blueSum, 1e-6)))
             let score = normalizedPair + neutrality * 0.5
@@ -546,7 +587,8 @@ final class BayerCalibration {
         outcome.whiteLevel = Double(white)
         outcome.bestVariation = bestVariation
         outcome.modePeriodicities = periodicities
-        outcome.modeCross = crossMeans
+        outcome.modeCross = crossRms
+        outcome.patternLevels = patternLevels
         return outcome
     }
 }
