@@ -17,9 +17,41 @@ final class FileProcessor: ObservableObject {
     @Published private(set) var busy = false
     @Published private(set) var status = "尚未选择文件"
     @Published private(set) var output: URL?
+    /// 转码日志（最近若干行）。转码每一步都写进 transcode.log，
+    /// 这里直接读出来显示，不必再去「文件」App 里拷。
+    @Published private(set) var logLines: [String] = []
 
     /// 输出固定用 HEVC 长 GOP：文件小、编码快，便于快速比对。
     private let tier: QualityTier = .hevcLongGOP
+
+    /// 处理期间轮询日志文件。转码是同步阻塞的一段流程，回调只报进度，
+    /// 真正的失败原因写在日志里，所以按固定间隔读。
+    /// `nonisolated(unsafe)` 只为能在 deinit 里 invalidate：
+    /// Timer 只在主线程被创建和失效，不存在并发写。
+    nonisolated(unsafe) private var logTimer: Timer?
+
+    deinit {
+        logTimer?.invalidate()
+    }
+
+    private func startLogPolling() {
+        logTimer?.invalidate()
+        refreshLog()
+        logTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshLog() }
+        }
+    }
+
+    private func stopLogPolling() {
+        logTimer?.invalidate()
+        logTimer = nil
+        refreshLog()
+    }
+
+    func refreshLog() {
+        let lines = TranscodeLog.recentLines(18)
+        if lines != logLines { logLines = lines }
+    }
 
     /// 选择器本身失败（权限、文件被移除等），不进入处理流程
     func reportPickerFailure(_ error: Error) {
@@ -32,6 +64,7 @@ final class FileProcessor: ObservableObject {
         busy = true
         output = nil
         status = "正在处理 \(url.lastPathComponent)…"
+        startLogPolling()
 
         let tier = self.tier
 
@@ -60,12 +93,14 @@ final class FileProcessor: ObservableObject {
                         result.frames, result.elapsed,
                         Double(size) / 1_000_000, result.probe
                     )
+                    self.stopLogPolling()
                 }
             } catch {
                 await MainActor.run {
                     guard let self else { return }
                     self.busy = false
                     self.status = "失败：\(error.localizedDescription)"
+                    self.stopLogPolling()
                 }
             }
         }

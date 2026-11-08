@@ -677,3 +677,63 @@ if (peak > 1.0) tone /= peak;
 **通道比平衡不能证明颜色正确。** 白平衡的作用就是把均值拉平，
 它同时会掩盖逐像素比例被后续曲线改写的痕迹。判断颜色要看
 饱和度、有色像素占比这类分布量，不能只看均值。
+
+## 十六、iOS 不给 Bayer：改用系统转码器（0.5.44）
+
+### 实测结论
+
+在真机上跑离线处理（0.5.42），日志给出：
+
+```
+解码：请求 bp16，系统实际给 p420
+失败：像素转换失败：系统解码输出 p420，当前管线只支持 bp16
+```
+
+`p420` = `kCVPixelFormatType_420YpCbCr8Planar`，8-bit 4:2:0 三平面。
+
+**这说明 iOS 的 ProRes RAW 解码器不做 Bayer 输出。** 它是内部走完
+RAW 处理（demosaic + 色彩矩阵 + 色调映射），直接给成品视频。
+`bp16` 只在 macOS 上出现，iOS 上请求它会被静默降级。
+
+之前 0.5.38 那次"成功"，实际是没走到这一步；真正的解码输出从来没
+被验证过是不是 Bayer，直到把 `pf=` 打进日志才看见。
+
+### 为什么这反而是好事
+
+输出是成品视频，意味着**颜色由 Apple 自己的 RAW 管线决定**，
+不是我们用 3×3 矩阵和 0.40 次幂白平衡拼出来的近似。这一段的
+正确性不需要我们证明。
+
+代价只有一个：位深 8-bit、色度 4:2:0。对最终 HEVC 交付（本来就是
+4:2:0）几乎没有影响。
+
+### 决策：先问系统，别自己拆
+
+`AVAssetExportSession` 一个 API 完成解码 + 编码 + 封装：
+
+```swift
+let session = AVAssetExportSession(asset: asset,
+                                   presetName: AVAssetExportPresetHEVCHighestQuality)
+session.outputURL = outputURL
+session.outputFileType = .mov
+session.exportAsynchronously { ... }
+```
+
+`init` 返回 nil 就是 preset 与该文件不兼容——这个判断由系统给，
+不用我们猜。这比自己搭 Reader/Writer、探测输出格式、分派
+Bayer/YUV 要少一个数量级的出错面。
+
+所以链路改成：
+
+```
+官方转码器成功  → 直接用它的产物（颜色由系统保证）
+官方转码器失败  → 回退到自建链路（bp16 Bayer 管线 / YUV 直通）
+```
+
+### 教训
+
+前十几版都在"自己实现解码"，而系统本来就有现成的。遇到私有格式
+（btp2、aprn）时，先看系统有没有一条**能接受这个文件**的现成通路，
+比研究它的字节布局更划算。
+
+`pf=` 这个字段早该打进日志——没有它，一直在假设"拿到的是 bp16"。

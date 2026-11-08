@@ -39,4 +39,16 @@ enum TranscodeLog {
     static func reset() {
         try? FileManager.default.removeItem(at: fileURL)
     }
+
+    /// 读最近若干行，供界面直接显示。
+    ///
+    /// 以前只能把 `transcode.log` 从「文件」App 里拷出来才能看，多一步就
+    /// 多一次放弃的可能。转码每一步都写在这里，读出来就能看到卡在哪。
+    static func recentLines(_ limit: Int = 16) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { return [] }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        return Array(lines.suffix(limit))
+    }
 }

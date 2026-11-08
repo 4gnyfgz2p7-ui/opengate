@@ -1217,6 +1217,32 @@ struct SettingsSheet: View {
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(processor.status.hasPrefix("失败") ? Color.red : Color.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                // 转码日志。每一步都写进 transcode.log，这里直接显示，
+                // 不必再跑一次「文件」App 去拷贝。出问题时第一现场就在这里。
+                if !processor.logLines.isEmpty {
+                    ScrollViewReader { proxy in
+                        ScrollView(.vertical, showsIndicators: true) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                ForEach(Array(processor.logLines.enumerated()), id: \.offset) { index, line in
+                                    Text(line)
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .id(index)
+                                }
+                            }
+                            .padding(6)
+                        }
+                        .frame(height: 108)
+                        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                        .onChange(of: processor.logLines.count) { _, _ in
+                            guard let last = processor.logLines.indices.last else { return }
+                            proxy.scrollTo(last, anchor: .bottom)
+                        }
+                    }
+                }
             }
         }
     }

@@ -167,6 +167,106 @@ final class RawTranscoder {
         }
     }
 
+    // MARK: - 官方转码器
+
+    /// 用 `AVAssetExportSession` 转码：一句话完成解码、编码、封装。
+    ///
+    /// 自己搭 Reader/Writer 要处理格式探测、像素格式、色彩标记、音画交错
+    /// 一堆事，每一步都可能出错；而系统本来就有这个 API。对 ProRes RAW
+    /// 这种私有格式，**能交给系统就别自己拆**——它内部怎么做我们看不见，
+    /// 但只要它认这个文件，出来的东西就一定是它认为正确的样子。
+    ///
+    /// preset 选 HEVC 最高质量：分辨率保持 4224×3024，不缩放。
+    /// 返回 nil 表示系统不支持这个文件，调用方走回退路径。
+    private static func runExportSession(
+        rawURL: URL,
+        outputURL: URL,
+        tier: QualityTier,
+        started: Date
+    ) -> Outcome? {
+
+        let asset = AVURLAsset(url: rawURL)
+
+        // 按质量从高到低试。init 返回 nil 即 preset 与该 asset 不兼容，
+        // 这个判断是系统的，不用我们猜。
+        let candidates: [String] = tier.isHEVC
+            ? [AVAssetExportPresetHEVCHighestQuality, AVAssetExportPresetHighestQuality]
+            : [AVAssetExportPresetHighestQuality]
+
+        var session: AVAssetExportSession?
+        var usedPreset = ""
+        for preset in candidates {
+            guard let candidate = AVAssetExportSession(asset: asset, presetName: preset) else {
+                TranscodeLog.write("官方转码：preset \(preset) 不兼容，跳过")
+                continue
+            }
+            guard candidate.supportedFileTypes.contains(.mov) else {
+                TranscodeLog.write("官方转码：preset \(preset) 不支持 .mov，跳过")
+                continue
+            }
+            session = candidate
+            usedPreset = preset
+            break
+        }
+        guard let session else { return nil }
+
+        try? FileManager.default.removeItem(at: outputURL)
+        session.outputURL = outputURL
+        session.outputFileType = .mov
+        session.shouldOptimizeForNetworkUse = false
+
+        TranscodeLog.write("官方转码：preset=\(usedPreset) → \(outputURL.lastPathComponent)")
+
+        let semaphore = DispatchSemaphore(value: 0)
+        session.exportAsynchronously { semaphore.signal() }
+        // 给一个上限，别让界面永远停在"处理中"。
+        // ProRes RAW 解 4K 一分钟素材通常 20–60 秒，15 分钟足够宽。
+        guard semaphore.wait(timeout: .now() + 900) == .success else {
+            TranscodeLog.write("官方转码超时（900s）")
+            session.cancelExport()
+            try? FileManager.default.removeItem(at: outputURL)
+            return nil
+        }
+
+        guard session.status == .completed else {
+            let detail = session.error?.localizedDescription ?? "状态 \(session.status.rawValue)"
+            TranscodeLog.write("官方转码失败：\(detail)")
+            try? FileManager.default.removeItem(at: outputURL)
+            return nil
+        }
+
+        // 用实际产出的文件信息回填，不猜
+        let size = MovieRecorder.fileSize(at: outputURL)
+        guard size > 0 else {
+            TranscodeLog.write("官方转码完成但文件为 0 字节")
+            try? FileManager.default.removeItem(at: outputURL)
+            return nil
+        }
+
+        let produced = AVURLAsset(url: outputURL)
+        let track = produced.tracks(withMediaType: .video).first
+        var outcome = Outcome()
+        // duration 可能是 invalid，CMTimeGetSeconds 会给 nan，
+        // 直接转 Int 会崩，先挡掉。
+        let seconds = CMTimeGetSeconds(produced.duration)
+        let fps = Double(track?.nominalFrameRate ?? 24)
+        outcome.frames = (seconds.isFinite && seconds > 0)
+            ? Int((seconds * fps).rounded())
+            : 0
+        outcome.elapsed = Date().timeIntervalSince(started)
+        outcome.probe = String(
+            format: "%@ · %.0f×%.0f · %@",
+            usedPreset,
+            track?.naturalSize.width ?? 0,
+            track?.naturalSize.height ?? 0,
+            "系统 RAW 管线"
+        )
+        outcome.gains = "直通（系统解码 + 编码）"
+        outcome.outputURL = outputURL
+        TranscodeLog.write("官方转码完成 \(outcome.frames) 帧 / \(String(format: "%.1f", outcome.elapsed))s / \(size) 字节")
+        return outcome
+    }
+
     /// 同步转码。调用方应放在后台队列，不要在采集队列上跑。
     static func run(
         rawURL: URL,
@@ -178,6 +278,29 @@ final class RawTranscoder {
     ) throws -> Outcome {
 
         let started = Date()
+        TranscodeLog.reset()
+        TranscodeLog.write("开始转码 \(tier.identifier) src=\(rawURL.lastPathComponent)")
+
+        // ---- 官方转码器优先 ----
+        //
+        // 系统有一个 API 就能完成「解码 + 编码 + 封装」，不用我们碰任何一个
+        // 像素。之前自己搭 Reader/Writer、探测输出格式、分派 Bayer/YUV，
+        // 全是因为没想到这一步。它成功，后面一整段都不执行。
+        //
+        // 只对 HEVC 档用它：ExportSession 的 preset 只能给「最高质量 HEVC」
+        // 这一种，给不了 ProRes 422 LT / HQ 的分档，那两档仍走自建链路。
+        if tier.isHEVC,
+           let official = runExportSession(
+               rawURL: rawURL,
+               outputURL: outputURL,
+               tier: tier,
+               started: started
+           ) {
+            progress?(1.0)
+            return official
+        }
+        TranscodeLog.write("官方转码不可用，回退到自建链路")
+
         guard let converter = BayerConverter() else {
             throw TranscoderError.converterUnavailable
         }
@@ -212,48 +335,43 @@ final class RawTranscoder {
             throw TranscoderError.noFrames
         }
 
-        // ---- 先探一帧 ----
+        // ---- 先探一帧，确定系统到底给什么 ----
         //
         // 必须放在建 writer 之前。MovieRecorder 的 init 里会 startWriting()，
         // 文件当场生成；如果之后解码才失败，就会留下一个 0 字节的 .mov，
-        // 让人以为录成了。先确认系统真能按 bp16 解出这一帧，再建写入器。
-        TranscodeLog.reset()
-        TranscodeLog.write("开始转码 \(tier.identifier) src=\(rawURL.lastPathComponent)")
-
-        var probeFrame: ProResRAWReader.Probe?
-        var usedFormat: OSType? = BayerConverter.planar16Format
-
+        // 让人以为录成了。
+        // 先要 bp16：只有它能进 Bayer 管线（每 sensel 一个 16-bit 值，
+        // 相位由 attachment 声明）。
+        var bayerProbe: ProResRAWReader.Probe?
         do {
             let result = try ProResRAWReader.decode(url: rawURL, limit: 1) { _, _, _ in true }
-            probeFrame = result.probe
+            if result.probe?.pixelFormat == "bp16" {
+                bayerProbe = result.probe
+                TranscodeLog.write("解码：bp16 可用 \(result.probe?.summary ?? "")")
+            } else {
+                TranscodeLog.write("解码：请求 bp16 被降级为 \(result.probe?.pixelFormat ?? "—")")
+            }
         } catch {
             let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            TranscodeLog.write("bp16 解码失败：\(reason)，改试系统默认格式")
-            usedFormat = nil
-            do {
-                let result = try ProResRAWReader.decode(url: rawURL, limit: 1, format: nil) { _, _, _ in true }
-                probeFrame = result.probe
-            } catch {
-                let again = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                TranscodeLog.write("默认格式也失败：\(again)")
-                throw TranscoderError.conversionFailed("系统解码不可用：\(again)")
-            }
+            TranscodeLog.write("解码：bp16 不可用（\(reason)）")
         }
 
-        guard let probeFrame else {
+        // 拿不到 Bayer 就直通：系统内部已经走完 RAW 处理，输出是成品视频，
+        // 颜色由 Apple 的管线决定，我们只换编码，不碰像素。
+        var yuvSource: (format: OSType, name: String, probe: ProResRAWReader.Probe)?
+        if bayerProbe == nil {
+            guard let detected = ProResRAWReader.detectYUVFormat(url: rawURL) else {
+                TranscodeLog.write("系统没有给出任何可用解码输出")
+                throw TranscoderError.conversionFailed("系统解不出任何格式，文件可能损坏")
+            }
+            yuvSource = detected
+        }
+
+        guard let probeFrame = bayerProbe ?? yuvSource?.probe else {
             TranscodeLog.write("探测未返回帧信息")
             throw TranscoderError.noFrames
         }
         TranscodeLog.write("解码探测成功 \(probeFrame.summary)")
-
-        // 当前像素管线只吃 bp16。如果系统给的是别的格式（例如 RGBA half-float），
-        // 必须明确拒绝而不是拿错的数据硬跑——那只会得到一张颜色全错的图。
-        guard probeFrame.pixelFormat == "bp16" else {
-            TranscodeLog.write("解码输出是 \(probeFrame.pixelFormat)，不是 bp16，管线无法消费")
-            throw TranscoderError.conversionFailed(
-                "系统解码输出 \(probeFrame.pixelFormat)，当前管线只支持 bp16"
-            )
-        }
 
         let width = probeFrame.width
         let height = probeFrame.height
@@ -292,41 +410,73 @@ final class RawTranscoder {
         }
 
         var outcome = Outcome()
-        var parameters = BayerConverter.Parameters()
-        parameters.planar16 = true
-        parameters.blackLevel = 256       // bp16 与 ffmpeg 同构：黑 0x1000>>4
-        parameters.whiteLevel = 4095
+        let count: Int
+        let probe: ProResRAWReader.Probe?
 
-        let (count, probe) = try ProResRAWReader.decode(url: rawURL, format: usedFormat) { buffer, pts, index in
-            if index == 1 {
-                // 相位：优先用系统在 attachment 里声明的
-                let declared = ProResRAWReader.declaredPattern(of: buffer)
-                parameters.pattern = declared ?? 0
-                let gains = measureGains(buffer, pattern: parameters.pattern)
-                parameters.redGain = gains.red
-                parameters.greenGain = gains.green
-                parameters.blueGain = gains.blue
-                outcome.gains = String(
-                    format: "R=%.3f B=%.3f pat=%d%@",
-                    gains.red, gains.blue, parameters.pattern,
-                    declared == nil ? "（未声明，按 RGGB）" : ""
-                )
-            }
+        if bayerProbe != nil {
+            // ---- 有 Bayer：走已验证的色彩管线 ----
+            var parameters = BayerConverter.Parameters()
+            parameters.planar16 = true
+            parameters.blackLevel = 256       // bp16 与 ffmpeg 同构：黑 0x1000>>4
+            parameters.whiteLevel = 4095
 
-            guard let bgra = converter.convert(buffer, parameters: parameters) else {
-                throw TranscoderError.conversionFailed(
-                    converter.lastFailureStage ?? "未知"
-                )
-            }
-            if !recorder.appendImageBuffer(bgra, presentationTimeStamp: pts) {
-                outcome.dropped += 1
-            }
-            feeder?.drain(until: pts, into: recorder)
+            let result = try ProResRAWReader.decode(url: rawURL, format: nil) { buffer, pts, index in
+                if index == 1 {
+                    // 相位：优先用系统在 attachment 里声明的
+                    let declared = ProResRAWReader.declaredPattern(of: buffer)
+                    parameters.pattern = declared ?? 0
+                    let gains = measureGains(buffer, pattern: parameters.pattern)
+                    parameters.redGain = gains.red
+                    parameters.greenGain = gains.green
+                    parameters.blueGain = gains.blue
+                    outcome.gains = String(
+                        format: "R=%.3f B=%.3f pat=%d%@",
+                        gains.red, gains.blue, parameters.pattern,
+                        declared == nil ? "（未声明，按 RGGB）" : ""
+                    )
+                }
 
-            if index % 12 == 0 {
-                progress?(min(0.99, Double(index) / Double(max(expected, 1))))
+                guard let bgra = converter.convert(buffer, parameters: parameters) else {
+                    throw TranscoderError.conversionFailed(
+                        converter.lastFailureStage ?? "未知"
+                    )
+                }
+                if !recorder.appendImageBuffer(bgra, presentationTimeStamp: pts) {
+                    outcome.dropped += 1
+                }
+                feeder?.drain(until: pts, into: recorder)
+
+                if index % 12 == 0 {
+                    progress?(min(0.99, Double(index) / Double(max(expected, 1))))
+                }
+                return true
             }
-            return true
+            count = result.count
+            probe = result.probe
+        } else {
+            // ---- 没有 Bayer：直通，像素一个都不碰 ----
+            //
+            // 系统给什么就编什么。颜色是 Apple 自己的 RAW 处理结果，
+            // 我们在这里做任何"再校正"都只会把它弄坏。
+            guard let yuvSource else {
+                throw TranscoderError.conversionFailed("没有可用的解码源")
+            }
+            outcome.gains = "直通 \(yuvSource.name)（系统 RAW 管线）"
+            TranscodeLog.write("直通转码：\(yuvSource.name) \(probeFrame.width)×\(probeFrame.height)")
+
+            let result = try ProResRAWReader.decodeYUV(url: rawURL, format: yuvSource.format) { buffer, pts, index in
+                if !recorder.appendImageBuffer(buffer, presentationTimeStamp: pts) {
+                    outcome.dropped += 1
+                }
+                feeder?.drain(until: pts, into: recorder)
+
+                if index % 12 == 0 {
+                    progress?(min(0.99, Double(index) / Double(max(expected, 1))))
+                }
+                return true
+            }
+            count = result.count
+            probe = result.probe
         }
 
         TranscodeLog.write("全量解出 \(count) 帧，丢弃 \(outcome.dropped) 帧，增益 \(outcome.gains)")

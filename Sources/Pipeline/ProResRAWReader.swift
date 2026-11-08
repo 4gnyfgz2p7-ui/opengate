@@ -197,8 +197,7 @@ final class ProResRAWReader {
 
     /// 系统在 buffer attachment 里声明的 Bayer 排布。
     /// 这是 bp16 相比 btp2 最省事的一点：相位不用猜，解码器直接告诉。
-    static func declaredPattern(of buffer: CVPixelBuffer) -> Int32? {
-        guard let attachments = CVBufferCopyAttachments(buffer, .shouldPropagate) as? [String: Any] else {
+    static func declaredPattern(of buffer: CVPixelBuffer) -> Int32? {        guard let attachments = CVBufferCopyAttachments(buffer, .shouldPropagate) as? [String: Any] else {
             return nil
         }
         for key in ["ProResRAW_BayerPattern", "BayerPattern", "kCVImageBufferBayerPatternKey"] {
@@ -252,6 +251,130 @@ final class ProResRAWReader {
             probe.note = "非 bp16，系统没有按请求给格式"
         }
         return probe
+    }
+
+    // MARK: - YUV 直读
+
+    /// 系统解码器能给的 YUV 输出，按位深从高到低排。
+    ///
+    /// 实测这台机器上请求 `bp16` 会被静默降级成 `p420`（8-bit 4:2:0），
+    /// 也就是 iOS 的 ProRes RAW 解码器**不做 Bayer 输出**，而是内部走完
+    /// RAW 处理，直接给成品视频。既然如此，与其拒绝，不如按它给的处理：
+    /// 颜色由 Apple 自己的管线决定，我们只负责换编码。
+    static let yuvCandidates: [(format: OSType, name: String)] = [
+        (kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, "x420"),
+        (kCVPixelFormatType_420YpCbCr10BiPlanarFullRange, "xf20"),
+        (kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, "420v"),
+        (kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, "420f"),
+        (kCVPixelFormatType_420YpCbCr8Planar, "p420"),
+    ]
+
+    /// 让 AVAssetReader 自己解码成指定 YUV 格式。
+    ///
+    /// 和 `decode` 的区别：那条路只要压缩样本、自己接 VideoToolbox，
+    /// 目的是拿 Bayer；这条路把解码交给 AVFoundation，只要它解码后的
+    /// 像素缓冲，因为目标格式本来就是成品视频。
+    @discardableResult
+    static func decodeYUV(
+        url: URL,
+        format: OSType?,
+        limit: Int = .max,
+        onFrame: (CVPixelBuffer, CMTime, Int) throws -> Bool
+    ) throws -> (count: Int, probe: Probe?) {
+
+        let asset = AVURLAsset(url: url)
+        guard let track = asset.tracks(withMediaType: .video).first else {
+            throw ReaderError.noVideoTrack
+        }
+
+        let reader: AVAssetReader
+        do {
+            reader = try AVAssetReader(asset: asset)
+        } catch {
+            throw ReaderError.cannotStart(error.localizedDescription)
+        }
+
+        var settings: [String: Any]?
+        if let format {
+            settings = [kCVPixelBufferPixelFormatTypeKey as String: format]
+        }
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else {
+            throw ReaderError.readerRejected("YUV 输出配置不被接受")
+        }
+        reader.add(output)
+        guard reader.startReading() else {
+            throw ReaderError.cannotStart(reader.error?.localizedDescription ?? "未知原因")
+        }
+        defer { reader.cancelReading() }
+
+        var count = 0
+        var probe: Probe?
+        while let sample = output.copyNextSampleBuffer() {
+            guard let buffer = CMSampleBufferGetImageBuffer(sample) else { continue }
+            if probe == nil { probe = inspect(buffer) }
+            count += 1
+            let keepGoing = try onFrame(
+                buffer,
+                CMSampleBufferGetPresentationTimeStamp(sample),
+                count
+            )
+            if !keepGoing { break }
+            if count >= limit { break }
+        }
+
+        if probe == nil {
+            let status = reader.status
+            let detail = reader.error?.localizedDescription ?? "无错误信息"
+            throw ReaderError.cannotStart("未解出帧（reader=\(status.rawValue) \(detail)）")
+        }
+        return (count, probe)
+    }
+
+    /// 逐个试 YUV 候选，返回第一个系统真的给出的格式。
+    ///
+    /// 必须比对**实际输出**而不是请求值：这次就是请求 bp16、系统静默给
+    /// p420，只在请求侧判断会一直以为自己在拿 Bayer。
+    static func detectYUVFormat(url: URL) -> (format: OSType, name: String, probe: Probe)? {
+        for candidate in yuvCandidates {
+            do {
+                var actual: OSType = 0
+                var seen: Probe?
+                let result = try decodeYUV(url: url, format: candidate.format, limit: 1) { buffer, _, _ in
+                    actual = CVPixelBufferGetPixelFormatType(buffer)
+                    seen = inspect(buffer)
+                    return false
+                }
+                _ = result
+                if actual == candidate.format, let seen {
+                    TranscodeLog.write("YUV 探测：请求 \(candidate.name) 得到 \(seen.pixelFormat) \(seen.width)×\(seen.height)")
+                    return (actual, seen.pixelFormat, seen)
+                }
+                TranscodeLog.write("YUV 探测：请求 \(candidate.name) 实际得到 \(fourCC(actual))，继续下一个")
+            } catch {
+                let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                TranscodeLog.write("YUV 探测：\(candidate.name) 不可用（\(reason)）")
+            }
+        }
+        // 最后一个兜底：不指定格式，让系统自己挑
+        do {
+            var actual: OSType = 0
+            var seen: Probe?
+            _ = try decodeYUV(url: url, format: nil, limit: 1) { buffer, _, _ in
+                actual = CVPixelBufferGetPixelFormatType(buffer)
+                seen = inspect(buffer)
+                return false
+            }
+            if let seen {
+                TranscodeLog.write("YUV 探测：系统默认 \(seen.pixelFormat) \(seen.width)×\(seen.height)")
+                return (actual, seen.pixelFormat, seen)
+            }
+        } catch {
+            let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            TranscodeLog.write("YUV 探测：系统默认也失败（\(reason)）")
+        }
+        return nil
     }
 
     private static func fourCC(_ code: OSType) -> String {

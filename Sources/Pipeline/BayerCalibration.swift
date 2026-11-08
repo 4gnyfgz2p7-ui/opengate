@@ -647,6 +647,21 @@ final class BayerCalibration {
             }
         }
 
+        // ---- 中性轴微调：向绿 2% ----
+        //
+        // 上面两条来源（设备 AWB / 灰度世界）定的是**色温轴**，即 R 与 B
+        // 各自相对 G 的水平。它们管不了品红↔绿这个正交方向：同一组通道比
+        // 既可以解读成「偏品红 3%」，也可以解读成「暖光本来如此」，
+        // 单靠统计分不出来——实拍校准时这条轴上残留了一点偏紫。
+        //
+        // 所以这里按观感定一个固定偏移：R/B 各乘 0.98，等价于把
+        // 品红轴 m = sqrt((R/G)·(B/G)) 压低 2%，画面往绿侧走一点点。
+        // 必须放在两条来源之后统一施加，否则设备 AWB 与灰度世界会走出
+        // 两种不同的中性轴，同一个场景换档位就换色调。
+        let neutralAxisTrim: Float = 0.98
+        whiteBalanceRed *= neutralAxisTrim
+        whiteBalanceBlue *= neutralAxisTrim
+
         var outcome = Outcome()
         outcome.unpackMode = Int32(bestMode)
         outcome.pattern = Int32(bestPattern)
