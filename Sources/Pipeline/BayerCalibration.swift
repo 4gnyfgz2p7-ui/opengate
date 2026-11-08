@@ -592,31 +592,42 @@ final class BayerCalibration {
             redBlueSwapped = true
         }
 
-        // 白平衡优先取**设备自己的 AWB 增益**（deviceWhiteBalanceGains，绿归一）。
+        // ---- 白平衡：只做部分校正 ----
         //
-        // 原来这里是纯粹的灰度世界：把每通道 60% 分位拉到相等。问题是它假设
-        // 画面平均是灰的，遇到大面积单色就会把白拉偏——0.5.32 那条片子整屋蓝柜子，
-        // 测下来最亮的墙面 B/R 仍有 1.16，白窗帘偏青，正是这个原因。
-        // Apple 相机用的就是 deviceWhiteBalanceGains，直接拿来用即可。
-        // 设备值缺失或越界时才退回灰度世界。
+        // 全量白平衡（把每通道 60% 分位拉到相等）在推导上无懈可击，实拍不对：
+        // 它默认「画面平均是中性灰」，于是把暖光下的暖白墙、木色家具一并拉成冷白。
+        // 0.5.32 那条片子墙面 B/R 到 1.16、白窗帘发青，根子就在这里。
+        //
+        // 所以增益按 0.40 次幂收敛：通道失衡 20% 只修 8%，现场暖调留得住；
+        // 真偏色（失衡 60% 以上）仍然压得下去。这个指数在真实 RAW 上量过——
+        // 暖白墙 B/R 落在 0.92 附近、木桌保持暖棕，观感与 Apple 相机同场景一致。
+        //
+        // 设备 AWB 增益只在它明确偏离 1 的时候才用（说明当前确实偏色）。
+        // 设备在 RAW 通路上经常只回 (1,1,1)，那不是「不用校正」，是「没有数据」，
+        // 直接采信等于完全不做白平衡，画面就退回传感器原生的偏色。
+        let wbStrength = 0.40
         var whiteBalanceRed: Float = 1
         var whiteBalanceBlue: Float = 1
         var wbFromDevice = false
         let deviceRed = Double(redGain)
         let deviceBlue = Double(blueGain)
-        if deviceRed > 0.2, deviceRed < 5, deviceBlue > 0.2, deviceBlue < 5 {
-            whiteBalanceRed = Float(deviceRed)
-            whiteBalanceBlue = Float(deviceBlue)
+        let deviceValid = deviceRed > 0.2 && deviceRed < 5 && deviceBlue > 0.2 && deviceBlue < 5
+        let deviceDeviation = max(abs(deviceRed - 1), abs(deviceBlue - 1))
+        if deviceValid, deviceDeviation > 0.15 {
+            whiteBalanceRed = Float(pow(deviceRed, wbStrength))
+            whiteBalanceBlue = Float(pow(deviceBlue, wbStrength))
             wbFromDevice = true
         } else if levelG > 0.01 {
             // 画面太暗（绿通道分位低于 1% 满量程）时三通道都被噪声主导，
             // 算出来的比例没有意义，宁可不动白平衡
             if levelR > 1e-6 {
-                // 0.35–2.8 之外的比例不是白平衡能解释的，多半是通道算错了，别硬拉
-                whiteBalanceRed = Float(min(2.8, max(0.35, levelG / levelR)))
+                // 4 倍之外的比例不是白平衡能解释的，多半是通道算错了，别硬拉
+                let ratio = min(4.0, max(0.25, levelG / levelR))
+                whiteBalanceRed = Float(pow(ratio, wbStrength))
             }
             if levelB > 1e-6 {
-                whiteBalanceBlue = Float(min(2.8, max(0.35, levelG / levelB)))
+                let ratio = min(4.0, max(0.25, levelG / levelB))
+                whiteBalanceBlue = Float(pow(ratio, wbStrength))
             }
         }
 

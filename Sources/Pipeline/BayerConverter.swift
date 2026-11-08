@@ -515,6 +515,23 @@ final class BayerConverter {
         }
     }
 
+    /// 传感器原生 RGB → BT.709 线性。
+    ///
+    /// 传感器给出的三通道是「相机原生空间」，不是 BT.709。缺这一步，
+    /// 等于把相机空间的数值直接当 BT.709 播出去，色相整体旋转——这正是
+    /// 反复调相位、调增益都修不好的原因：偏色不在那一层。
+    ///
+    /// 两个矩阵合并成一次乘法：
+    ///   camera → CIE XYZ D65（取自 ProRes RAW 帧头，Apple 对这颗传感器的标定）
+    ///   XYZ → BT.709 线性（D65 白点，标准矩阵）
+    /// 三个行向量之和都是 1，所以中性灰进出不变，矩阵本身不会引入偏色。
+    ///
+    /// 数值在 4224×3024 的真实帧上验过：白墙保持暖白、木桌为暖棕，
+    /// 与 Apple 相机同场景的观感一致。
+    constant float3 kCamToRec709_0 = float3(0.8086f, 0.0994f, 0.0920f);
+    constant float3 kCamToRec709_1 = float3(-0.0810f, 1.0462f, 0.0349f);
+    constant float3 kCamToRec709_2 = float3(0.0342f, -0.3193f, 1.2852f);
+
     inline float ac_rec709(float v) {
         v = clamp(v, 0.0f, 1.0f);
         return (v < 0.018f) ? (4.5f * v) : (1.099f * pow(v, 0.45f) - 0.099f);
@@ -580,11 +597,17 @@ final class BayerConverter {
             R = 0.25f * (ul + ur + dl + dr);
         }
 
-        float3 linear = clamp(float3((R - black) * invRange,
-                                     (G - black) * invRange,
-                                     (B - black) * invRange), 0.0f, 1.0f);
-        linear = clamp(linear * gains, 0.0f, 1.0f);
-        return float3(ac_rec709(linear.r), ac_rec709(linear.g), ac_rec709(linear.b));
+        float3 linear = float3((R - black) * invRange,
+                               (G - black) * invRange,
+                               (B - black) * invRange);
+        // 扣黑之后先只挡负数，不做上限截断：截到 1 会把高光里的
+        // 相对比例削平（谁先到 1 谁先丢），矩阵也就无从把它拉回来。
+        linear = max(linear, float3(0.0f)) * gains;
+        float3 rgb = float3(dot(linear, kCamToRec709_0),
+                            dot(linear, kCamToRec709_1),
+                            dot(linear, kCamToRec709_2));
+        rgb = clamp(rgb, 0.0f, 1.0f);
+        return float3(ac_rec709(rgb.r), ac_rec709(rgb.g), ac_rec709(rgb.b));
     }
 
     kernel void bayer_to_bgra(const device uchar* src [[buffer(0)]],

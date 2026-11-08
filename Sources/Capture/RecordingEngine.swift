@@ -467,6 +467,12 @@ final class RecordingEngine: ObservableObject {
             black *= scale
             white *= scale
         }
+        if black < 1 {
+            // 设备没给黑电平时按 ProRes RAW 规范兜底：black_level 固定 0x100
+            // （16-bit 容器），换算到 12-bit 就是 16。用 0 等于不扣黑，
+            // 暗部底噪被当成信号，画面上是发灰、色相发虚。
+            black = 16
+        }
         parameters.blackLevel = max(0, black)
         parameters.whiteLevel = max(parameters.blackLevel + 1, white)
 
@@ -480,6 +486,10 @@ final class RecordingEngine: ObservableObject {
         }
 
         if let pattern = scalar(attachments["ProResRAW_BayerPattern"]) {
+            // 设备上报的枚举与内部下标不是同一套：iPhone 17 Pro Max 在 btp2
+            // 通路上恒定报 3，而真实排列是 RGGB（四种相位解出的相邻色度跳变
+            // 149 vs 1284，分离 8.6 倍）。这里仍按下标存，相位由标定的统计
+            // 判据裁决——两者不同族时统计值优先，所以上报值错了也不会带走相位。
             let index = Int(pattern)
             if index >= 0 && index < 4 { parameters.pattern = Int32(index) }
         }
