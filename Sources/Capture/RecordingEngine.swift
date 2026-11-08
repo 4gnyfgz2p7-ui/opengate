@@ -146,6 +146,8 @@ final class RecordingEngine: ObservableObject {
             }
             guard tier != oldValue else { return }
 
+            resetTierScopedState()
+
             // 白平衡按档位隔离：RAW 强制手动锁定，其它档恢复用户原来的设定。
             // 两边必须成对调用，否则录完 RAW 回到 HEVC 会一直停在锁死的白平衡上。
             if tier.isRawBayer {
@@ -326,6 +328,26 @@ final class RecordingEngine: ObservableObject {
         capture.onAudioSample = { buffer in
             box.get()?.appendAudio(buffer)
         }
+    }
+
+    /// 切档时清掉所有「只对某一档成立」的临时状态。
+    ///
+    /// 不清会串味，而且串得很难查：
+    /// - `pipelineNote`：HEVC 降级留下「已切到系统 ISP」，切到 RAW 时若会话
+    ///   本来就在 Bayer 通路上（不需要重建），这句会一直挂着，与实际状态矛盾；
+    ///   反过来 RAW 失败留下的「没拿到全幅 Bayer」也会挂到 HEVC 上。
+    /// - 帧统计：上一档累计的 converted 会让新档的 3 秒自查误判「通路是通的」，
+    ///   该降级的场景不降级。
+    /// - 波形：RAW 档不解码也就没有波形，不清会停在上一个档的最后一张图上。
+    private func resetTierScopedState() {
+        stats.reset()
+        pipelineNote = nil
+        autoStopReason = nil
+        elapsed = 0
+        writtenBytes = 0
+        droppedFrames = 0
+        waveformImage = nil
+        waveformReading = .empty
     }
 
     /// 切到 ProRes RAW 时，如果会话还在系统 ISP 通路上就重建一次。
