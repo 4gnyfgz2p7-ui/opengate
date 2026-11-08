@@ -55,6 +55,26 @@ final class RecorderBox {
     }
 }
 
+/// 跨线程持有内存转码器的盒子。
+///
+/// `RecordingEngine` 是 `@MainActor`，而采集回调在后台队列——
+/// 闭包里直接碰 `self` 的属性会触发隔离检查。装进这个非隔离盒子，
+/// 闭包只捕获盒子本身，编译和运行时都不会跨域。
+final class LiveBox {
+    private let lock = NSLock()
+    private var value: LiveRawTranscoder?
+
+    func set(_ transcoder: LiveRawTranscoder?) {
+        lock.lock(); defer { lock.unlock() }
+        value = transcoder
+    }
+
+    func get() -> LiveRawTranscoder? {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+}
+
 /// 采集通路的计数快照。
 ///
 /// 出问题时把「收帧 / 转换 / 写入」三个数字直接写在界面上，
@@ -224,14 +244,13 @@ final class RecordingEngine: ObservableObject {
 
     private let recorderBox = RecorderBox()
 
-    /// 副路写入器：RAW 档录制时同时产出的成品文件。
-    /// 与主路是两个独立的 AVAssetWriter，同一帧时间戳、同一曝光。
-    /// 走 RecorderBox 是因为写线程在采集队列、创建/收尾在主线程。
-    private let companionBox = RecorderBox()
+    /// 内存转码器：RAW 档录制时把同一份 btp2 样本解成画面，另写一份 HEVC。
+    /// 采集队列高频读、主线程只写，装进非隔离盒子避免跨域访问。
+    private let liveBox = LiveBox()
     private(set) var companionURL: URL?
-    /// 副路当前状态，界面显示用
+    /// 内存转码状态，界面显示用
     @Published private(set) var companionNote: String?
-    /// 副路成功时删除 RAW 母版，只留成品
+    /// 转码成功时删除 RAW 母版，只留成品
     @Published var discardRAWWhenCompanionSucceeds = false
 
     /// 中转任务：录制时落 ProRes RAW，停止后转成用户选的档位。
@@ -285,13 +304,7 @@ final class RecordingEngine: ObservableObject {
         let gate = FrameGate()
         let statsBox = stats
         let wbBox = wbGains
-
-        // 副路：系统 ISP 已经处理好的 YUV，直接进第二个写入器。
-        // 不解码、不转色彩——编码器要的就是这个格式，硬件编码器接住即可。
-        capture.onCompanionSample = { [weak self] buffer in
-            guard let self, let rec = self.companionBox.get() else { return }
-            _ = rec.appendVideo(buffer)
-        }
+        let liveBox = self.liveBox
 
         capture.onVideoSample = { [weak self] buffer in
             let recorder = box.get()
@@ -321,6 +334,9 @@ final class RecordingEngine: ObservableObject {
                 // 这条路径完全不经过本机的 btp2 解包，因此不受排法问题影响。
                 // 波形图不更新：没有可读的 RGB 画面。
                 if recorder?.isRawBayer == true {
+                    // 内存分叉：同一份样本先交给解码器（submit 立即返回），
+                    // 再写进 RAW。解码跟不上只会丢成品帧，RAW 一个字节都不少。
+                    liveBox.get()?.submit(buffer)
                     if recorder?.appendImageBuffer(
                         imageBuffer,
                         presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(buffer)
@@ -868,40 +884,37 @@ final class RecordingEngine: ObservableObject {
                 )
                 self.recorderBox.set(recorder)
 
-                // ---- 双路：RAW 档同时产出一份成品 ----
+                // ---- 内存分叉：一边落 RAW，一边解成成品 ----
                 //
-                // 主路存 btp2 原始 Bayer，副路拿系统 ISP 处理好的 10-bit YUV，
-                // 直接交给 HEVC 硬件编码器。两路都是直通，没有解码再编码，
-                // 所以 24 fps 实时跑得动——离线解 RAW 只有 1-2 fps，那条路不行。
-                self.companionBox.set(nil)
+                // 只有一路采集。同一份 btp2 样本进两个去处：
+                //   1) RAW 写入器，原始字节原样落盘
+                //   2) VideoToolbox 解码 → HEVC 写入器
+                // 解码在独立串行队列，跟不上就丢帧，主路不受影响。
+                self.liveBox.set(nil)
                 self.companionURL = nil
                 self.companionNote = nil
                 if recordingTier.isRawBayer {
-                    if self.capture.enableCompanionOutput() {
-                        let stem = finalURL.deletingPathExtension().lastPathComponent
-                        let companion = finalURL.deletingLastPathComponent()
-                            .appendingPathComponent(stem + "_Log2")
-                            .appendingPathExtension("mov")
-                        do {
-                            let rec = try MovieRecorder(
-                                outputURL: companion,
-                                tier: .hevcLongGOP,
-                                width: width,
-                                height: height,
-                                metadata: metadata,
-                                withAudio: false,
-                                appleLog2: true,
-                                videoTransform: CGAffineTransform(rotationAngle: degrees * .pi / 180)
-                            )
-                            self.companionBox.set(rec)
-                            self.companionURL = companion
-                            self.companionNote = "副路：HEVC Log 2 · 与 RAW 同帧"
-                        } catch {
-                            self.capture.disableCompanionOutput()
-                            self.companionNote = "副路写入器被拒，只录 RAW：\(error.localizedDescription)"
-                        }
-                    } else {
-                        self.companionNote = "系统不允许第二路视频输出，只录 RAW"
+                    let stem = finalURL.deletingPathExtension().lastPathComponent
+                    let companion = finalURL.deletingLastPathComponent()
+                        .appendingPathComponent(stem + "_Log2")
+                        .appendingPathExtension("mov")
+                    do {
+                        let rec = try MovieRecorder(
+                            outputURL: companion,
+                            tier: .hevcLongGOP,
+                            width: width,
+                            height: height,
+                            metadata: metadata,
+                            withAudio: false,
+                            appleLog2: true,
+                            videoTransform: CGAffineTransform(rotationAngle: degrees * .pi / 180)
+                        )
+                        let live = LiveRawTranscoder(recorder: rec)
+                        self.liveBox.set(live)
+                        self.companionURL = companion
+                        self.companionNote = "内存转码中 · HEVC Log 2"
+                    } catch {
+                        self.companionNote = "成品写入器被拒，只录 RAW：\(error.localizedDescription)"
                     }
                 }
                 self.relayPending = relay
@@ -940,18 +953,22 @@ final class RecordingEngine: ObservableObject {
             self.recorderBox.set(nil)
             var outcome = await recorder.finish()
 
-            // 副路收尾：与主路同一次 stop，不额外等待。
-            // 先摘回调再拆输出，避免收尾期间还有帧进来写已关闭的 writer。
+            // 内存转码收尾：先停采集里的分叉，再等解码队列排空，
+            // 最后关成品写入器。RAW 已经写完，这里怎么做都不影响它。
+            let live = self.liveBox.get()
+            self.liveBox.set(nil)
+
             var companionOutcome: MovieRecorder.Outcome?
-            if let companion = self.companionBox.get() {
-                self.companionBox.set(nil)
-                companionOutcome = await companion.finish()
-            }
-            self.capture.disableCompanionOutput()
-            if let result = companionOutcome, result.finishedCleanly {
-                self.companionNote = "副路已保存 \(result.url.lastPathComponent) · \(result.writtenVideoFrames) 帧"
+            if let live {
+                let stats = await live.finish()
+                companionOutcome = await live.recorder.finish()
+                if let result = companionOutcome, result.finishedCleanly {
+                    self.companionNote = "成品 \(result.url.lastPathComponent) · \(stats.summary)"
+                } else {
+                    self.companionNote = "成品没写成功（\(stats.summary)），RAW 不受影响"
+                }
             } else if self.companionURL != nil {
-                self.companionNote = "副路没有写成功，RAW 不受影响"
+                self.companionNote = "成品没有写成功，RAW 不受影响"
             }
 
             // ---- 中转：把刚录的 ProRes RAW 转成用户选的档位 ----
