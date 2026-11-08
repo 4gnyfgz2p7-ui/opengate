@@ -1221,6 +1221,7 @@ struct SettingsSheet: View {
         }
     }
 
+    @ViewBuilder
     private var historySection: some View {
         if !engine.history.isEmpty {
             section("最近录制") {
