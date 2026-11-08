@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import UIKit
 import AVFoundation
 
@@ -1010,6 +1011,10 @@ struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     private let accent = Color(red: 0.42, green: 0.85, blue: 0.82)
 
+    /// 离线处理本地文件：输入固定成一个文件，改一版就能对同一段素材比对一次。
+    @StateObject private var processor = FileProcessor()
+    @State private var showImporter = false
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -1020,12 +1025,25 @@ struct SettingsSheet: View {
                     displaySection
                     rotationSection
                     historySection
+                    offlineSection
                 }
                 .padding(18)
             }
             .background(Color.black.ignoresSafeArea())
             .navigationTitle("设置")
             .navigationBarTitleDisplayMode(.inline)
+            .fileImporter(
+                isPresented: $showImporter,
+                allowedContentTypes: [.movie],
+                allowsMultipleSelection: false
+            ) { result in
+                switch result {
+                case .success(let urls):
+                    if let url = urls.first { processor.process(url) }
+                case .failure(let error):
+                    processor.reportPickerFailure(error)
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("完成") { dismiss() }
@@ -1170,6 +1188,39 @@ struct SettingsSheet: View {
     }
 
     @ViewBuilder
+    private var offlineSection: some View {
+        section("离线处理") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("选一个 ProRes RAW 文件，走官方解码重编码。同一个文件可以反复处理，不必重录。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button {
+                    showImporter = true
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "folder")
+                        Text(processor.busy ? "处理中…" : "选择文件")
+                        Spacer(minLength: 0)
+                        if processor.busy {
+                            ProgressView().scaleEffect(0.7)
+                        }
+                    }
+                    .font(.system(size: 12))
+                    .padding(.vertical, 9)
+                    .padding(.horizontal, 10)
+                    .frame(maxWidth: .infinity)
+                    .background(Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                }
+                .disabled(processor.busy)
+                Text(processor.status)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(processor.status.hasPrefix("失败") ? Color.red : Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
     private var historySection: some View {
         if !engine.history.isEmpty {
             section("最近录制") {

@@ -19,6 +19,9 @@ final class BayerCalibration {
 
     /// 候选排法数量
     static let candidateCount = 11
+    /// 数组槽位数。btp2 只有 0–10 这 11 种候选，但 bp16 用 mode 15，
+    /// 槽位必须留够，否则 `crossRms[15]` 会越界崩溃。
+    private static let slotCount = 16
 
     struct Outcome {
         /// 选中的排法下标，与 `unpack(mode:)` 和着色器里的分支一一对应
@@ -282,12 +285,12 @@ final class BayerCalibration {
         //
         // 采样从 step 起步、只取偶数坐标：y = 0 贴着传感器边缘，
         // 前几个像素是无效区（实测会出现 3000 以上的孤立值），拿它当判据会误导。
-        var sameDiff = [Double](repeating: 0, count: candidateCount)
-        var crossDiff = [Double](repeating: 0, count: candidateCount)
+        var sameDiff = [Double](repeating: 0, count: slotCount)
+        var crossDiff = [Double](repeating: 0, count: slotCount)
         // 相邻差的平方和。判据用它而不是均值，原因见下面的说明
-        var crossSqDiff = [Double](repeating: 0, count: candidateCount)
-        var minSample = [Double](repeating: .greatestFiniteMagnitude, count: candidateCount)
-        var maxSample = [Double](repeating: 0, count: candidateCount)
+        var crossSqDiff = [Double](repeating: 0, count: slotCount)
+        var minSample = [Double](repeating: .greatestFiniteMagnitude, count: slotCount)
+        var maxSample = [Double](repeating: 0, count: slotCount)
         var sampleCount = 0.0
 
         var sampleY = scanStep
@@ -314,7 +317,7 @@ final class BayerCalibration {
         }
 
         // 每种排法的同色/异色比，只作为诊断留档
-        var ratios = [Double](repeating: .greatestFiniteMagnitude, count: candidateCount)
+        var ratios = [Double](repeating: .greatestFiniteMagnitude, count: slotCount)
         for mode in modes {
             guard crossDiff[mode] > 1e-9 * max(sampleCount, 1) else { continue }
             ratios[mode] = sameDiff[mode] / crossDiff[mode]
@@ -328,7 +331,7 @@ final class BayerCalibration {
         // 同色方差被判成 0，于是六种排法并列 0.00，谁也没赢。
         // 0.5.21 的实测就是这么选中 mode 2 的（诊断里 p 全为 0.00）。
         // 留着只为对照历史，决策一律看上面的相邻差。
-        var mod8Sums = [[Double]](repeating: [Double](repeating: 0, count: 8), count: candidateCount)
+        var mod8Sums = [[Double]](repeating: [Double](repeating: 0, count: 8), count: slotCount)
         var mod8Rows = 0.0
         var sampleRow = step
         while sampleRow < height {
@@ -345,7 +348,7 @@ final class BayerCalibration {
             sampleRow += 60
         }
 
-        var periodicities = [Double](repeating: .greatestFiniteMagnitude, count: candidateCount)
+        var periodicities = [Double](repeating: .greatestFiniteMagnitude, count: slotCount)
         if mod8Rows > 0 {
             for mode in modes {
                 var means = [Double](repeating: 0, count: 8)
@@ -406,8 +409,8 @@ final class BayerCalibration {
         //   均值：mode10=62.6  mode6=897   → 14 倍
         //   均方根：mode10=68.3  mode6=1455 → 21 倍
         // 且均方根对「大片零」免疫：零仍是零，高光区的跳变被放大。
-        var crossMeans = [Double](repeating: .greatestFiniteMagnitude, count: candidateCount)
-        var crossRms = [Double](repeating: .greatestFiniteMagnitude, count: candidateCount)
+        var crossMeans = [Double](repeating: .greatestFiniteMagnitude, count: slotCount)
+        var crossRms = [Double](repeating: .greatestFiniteMagnitude, count: slotCount)
         for mode in modes {
             guard maxSample[mode] - minSample[mode] > 0.02 else { continue }
             let n = max(sampleCount * 2, 1)
@@ -423,7 +426,7 @@ final class BayerCalibration {
         var bestMode = 9
         if let low = finite.min() {
             let threshold = low * 1.20
-            let tied = (0..<candidateCount).filter { crossRms[$0] <= threshold }
+            let tied = (0..<slotCount).filter { crossRms[$0] <= threshold }
             bestMode = tied.min(by: { rank($0) < rank($1) }) ?? tied.first ?? 9
         }
         let bestVariation = (crossDiff[bestMode] + sameDiff[bestMode]) / max(sampleCount, 1)

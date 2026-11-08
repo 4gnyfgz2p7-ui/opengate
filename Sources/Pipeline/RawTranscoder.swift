@@ -173,6 +173,7 @@ final class RawTranscoder {
         outputURL: URL,
         tier: QualityTier,
         metadata: [AVMetadataItem],
+        selfCalibrate: Bool = true,
         progress: ((Double) -> Void)? = nil
     ) throws -> Outcome {
 
@@ -190,7 +191,10 @@ final class RawTranscoder {
         //
         // 成立后写进 UserDefaults，下次录制直接走自研解包，恢复实时。
         var calibrationNote = ""
-        if BayerDump.loadSlices().count >= 2 {
+        // 离线处理任意文件时**不能**跑自校准：dump 切片来自上一次录制，
+        // 与手上这个文件不同源。拿不同源的两帧做对照，算出来的是垃圾，
+        // 还会覆盖掉已经成立的正确位序。
+        if selfCalibrate, BayerDump.loadSlices().count >= 2 {
             if let solution = BayerSelfCalibration.calibrate(rawURL: rawURL) {
                 BayerSelfCalibration.saved = solution
                 calibrationNote = " 自校准 " + solution.summary

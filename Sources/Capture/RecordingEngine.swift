@@ -833,7 +833,11 @@ final class RecordingEngine: ObservableObject {
                 self.relayMetadata = metadata
                 // 中转的这一次顺便把 btp2 原始字节存下来，
                 // 转码时用官方解码结果反推位序，成功后就不必再中转
-                if relay { BayerDump.enable() }
+                if relay {
+                    // 先清掉上一次的残留：混进新切片会让帧序号冲突
+                    BayerDump.clear()
+                    BayerDump.enable()
+                }
             } catch {
                 self.state = .failed(error.localizedDescription)
                 return

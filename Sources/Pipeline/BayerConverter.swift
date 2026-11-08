@@ -257,10 +257,13 @@ final class BayerConverter {
 
         // 第一帧把解包方式与 Bayer 相位定下来：取错排法不会报错，
         // 只会得到一张浮雕状的图，靠肉眼看是猜不出来的。
-        // bp16 跳过标定：数据已经是每个 sensel 一个值，既没有位序要猜，
-        // 相位也由系统在 buffer attachment 里声明。再跑一遍排法搜索只会
-        // 把系统给的正确答案覆盖掉——这正是 btp2 时代反复出错的地方。
-        if !parameters.planar16, calibration == nil {
+        // bp16 也必须走标定器，只是把位序钉死在 15。
+        //
+        // 早先这里直接跳过，相位与白平衡另算了一套——结果是同一次曝光
+        // 在「离线处理文件」和「实时录制」两条路上得到不同的白平衡，
+        // 拿离线结果去判断实时画面就没有意义了。测试工具必须和被测量对象
+        // 是同一套代码，否则验证的是两件事。
+        if calibration == nil {
             calibration = BayerCalibration.run(
                 base: sourceBase,
                 rowBytes: sourceRowBytes,
@@ -271,7 +274,7 @@ final class BayerConverter {
                 redGain: parameters.redGain,
                 blueGain: parameters.blueGain,
                 preferredPattern: parameters.pattern,
-                forceMode: parameters.lockMode
+                forceMode: parameters.lockMode ?? (parameters.planar16 ? 15 : nil)
             )
         }
 
@@ -294,14 +297,15 @@ final class BayerConverter {
         var blueGain = parameters.blueGain
         var activePattern = parameters.pattern
         var activeUnpack: Int32 = parameters.planar16 ? 15 : 0
-        if parameters.planar16 {
-            // bp16：调用方给的相位与增益直接生效，不被标定覆盖
-        } else if let calibrated = calibration {
+        if let calibrated = calibration {
             redGain = calibrated.whiteBalanceRed
             greenGain = 1
             blueGain = calibrated.whiteBalanceBlue
-            // 锁了位序说明自校准给了完整答案，相位也以它为准
-            activePattern = parameters.lockMode != nil ? parameters.pattern : calibrated.pattern
+            // 位序被锁死（自校准）或走 bp16（系统已声明相位）时，
+            // 相位以外部给定的为准，不让标定再猜一次
+            activePattern = (parameters.lockMode != nil || parameters.planar16)
+                ? parameters.pattern
+                : calibrated.pattern
             activeUnpack = calibrated.unpackMode
         }
         let floats = [parameters.blackLevel, parameters.whiteLevel,
