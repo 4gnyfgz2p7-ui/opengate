@@ -610,7 +610,18 @@ final class BayerConverter {
                             dot(linear, kCamToRec709_1),
                             dot(linear, kCamToRec709_2));
         rgb = clamp(rgb, 0.0f, 1.0f);
-        return float3(ac_rec709(rgb.r), ac_rec709(rgb.g), ac_rec709(rgb.b));
+        // 高光滚降 + 阴影提升，再进 REC.709 传递函数。
+        //
+        // 线性直出会瘫在暗部：本机桌面这条片子的线性中位数只有 0.039，
+        // 白色鼠标出来是灰的。系统预览走 ISP 的 S 曲线，所以预览正常、
+        // 成片发暗——「HEVC 变亮度」说的就是这一层。
+        //
+        // 膝点 0.25 是在官方解码的真实帧上标出来的，不是估的：
+        //   中位亮度 41 → 91，白鼠标回到白；p95 108 → 167；
+        //   p99 仍留 226，高光不削顶（纯线性直出时 p99 已经 247）。
+        // Reinhard 对亮度自适应，暗场景提得多、亮场景提得少，不需要按场景换参数。
+        float3 tone = rgb / (rgb + 0.25f);
+        return float3(ac_rec709(tone.r), ac_rec709(tone.g), ac_rec709(tone.b));
     }
 
     kernel void bayer_to_bgra(const device uchar* src [[buffer(0)]],
