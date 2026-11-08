@@ -663,7 +663,25 @@ final class BayerConverter {
         //   中位亮度 41 → 91，白鼠标回到白；p95 108 → 167；
         //   p99 仍留 226，高光不削顶（纯线性直出时 p99 已经 247）。
         // Reinhard 对亮度自适应，暗场景提得多、亮场景提得少，不需要按场景换参数。
-        float3 tone = rgb / (rgb + 0.25f);
+        //
+        // 但必须**只对亮度施加，三通道同步缩放**。
+        // 早先写成 rgb / (rgb + 0.25) 对每个通道各自施加，通道值越大压得越狠，
+        // 比例于是被重排：紫色 (0.35,0.20,0.45) 会变成 (0.58,0.44,0.64)，
+        // R/G 从 1.75 掉到 1.32、B/G 从 2.25 掉到 1.45——饱和度掉四分之一，
+        // 色相也跟着偏。表现为「通道比全是 1.00 但画面发灰发闷」：
+        // 白平衡把均值拉平了，掩盖了每个像素比例已经被改写的事实。
+        float luma = dot(rgb, float3(0.2126f, 0.7152f, 0.0722f));
+        float mapped = luma / (luma + 0.25f);
+        float scale = (luma > 1e-5f) ? (mapped / luma) : 0.0f;
+        float3 tone = rgb * scale;
+
+        // 缩放后可能越过 1。按峰值整体压回来，保持三通道比例——
+        // 逐通道 clamp 会把高光重新去饱和，等于把上面修的问题又引回来一次。
+        float peak = max(tone.r, max(tone.g, tone.b));
+        if (peak > 1.0f) {
+            tone /= peak;
+        }
+        tone = max(tone, float3(0.0f));
         return float3(ac_rec709(tone.r), ac_rec709(tone.g), ac_rec709(tone.b));
     }
 
