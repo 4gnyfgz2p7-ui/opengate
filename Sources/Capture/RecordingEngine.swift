@@ -895,6 +895,12 @@ final class RecordingEngine: ObservableObject {
                         note: "官方解码中转 · \(result.probe) · \(result.gains)"
                     )
                 } catch {
+                    // 目标文件可能已经建出来但一帧没写（0 字节）。
+                    // 留着只会让人以为录成了，直接删掉。
+                    if MovieRecorder.fileSize(at: relay.final) == 0 {
+                        try? FileManager.default.removeItem(at: relay.final)
+                    }
+                    TranscodeLog.write("转码中止：\(error.localizedDescription)")
                     // 失败时把 RAW 交回给用户，并把原因写进记录
                     outcome = MovieRecorder.Outcome(
                         url: relay.raw,

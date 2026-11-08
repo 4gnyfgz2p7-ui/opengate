@@ -203,10 +203,60 @@ final class RawTranscoder {
         let asset = AVURLAsset(url: rawURL)
         let videoTrack = asset.tracks(withMediaType: .video).first
         let audioTrack = asset.tracks(withMediaType: .audio).first
+        guard videoTrack != nil else {
+            TranscodeLog.write("源文件没有视频轨：\(rawURL.lastPathComponent)")
+            throw TranscoderError.noFrames
+        }
 
-        let width = videoTrack.map { Int($0.naturalSize.width.rounded()) } ?? 0
-        let height = videoTrack.map { Int($0.naturalSize.height.rounded()) } ?? 0
-        guard width > 1, height > 1 else { throw TranscoderError.noFrames }
+        // ---- 先探一帧 ----
+        //
+        // 必须放在建 writer 之前。MovieRecorder 的 init 里会 startWriting()，
+        // 文件当场生成；如果之后解码才失败，就会留下一个 0 字节的 .mov，
+        // 让人以为录成了。先确认系统真能按 bp16 解出这一帧，再建写入器。
+        TranscodeLog.reset()
+        TranscodeLog.write("开始转码 \(tier.identifier) src=\(rawURL.lastPathComponent)")
+
+        var probeFrame: ProResRAWReader.Probe?
+        var usedFormat: OSType? = BayerConverter.planar16Format
+
+        do {
+            let result = try ProResRAWReader.decode(url: rawURL, limit: 1) { _, _, _ in true }
+            probeFrame = result.probe
+        } catch {
+            let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            TranscodeLog.write("bp16 解码失败：\(reason)，改试系统默认格式")
+            usedFormat = nil
+            do {
+                let result = try ProResRAWReader.decode(url: rawURL, limit: 1, format: nil) { _, _, _ in true }
+                probeFrame = result.probe
+            } catch {
+                let again = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                TranscodeLog.write("默认格式也失败：\(again)")
+                throw TranscoderError.conversionFailed("系统解码不可用：\(again)")
+            }
+        }
+
+        guard let probeFrame else {
+            TranscodeLog.write("探测未返回帧信息")
+            throw TranscoderError.noFrames
+        }
+        TranscodeLog.write("解码探测成功 \(probeFrame.summary)")
+
+        // 当前像素管线只吃 bp16。如果系统给的是别的格式（例如 RGBA half-float），
+        // 必须明确拒绝而不是拿错的数据硬跑——那只会得到一张颜色全错的图。
+        guard probeFrame.pixelFormat == "bp16" else {
+            TranscodeLog.write("解码输出是 \(probeFrame.pixelFormat)，不是 bp16，管线无法消费")
+            throw TranscoderError.conversionFailed(
+                "系统解码输出 \(probeFrame.pixelFormat)，当前管线只支持 bp16"
+            )
+        }
+
+        let width = probeFrame.width
+        let height = probeFrame.height
+        guard width > 1, height > 1 else {
+            TranscodeLog.write("探测尺寸异常 \(width)×\(height)")
+            throw TranscoderError.noFrames
+        }
 
         let totalSeconds = CMTimeGetSeconds(asset.duration)
         let fps = max(1.0, Double(videoTrack?.nominalFrameRate ?? 24))
@@ -228,6 +278,7 @@ final class RawTranscoder {
                 realTime: false
             )
         } catch {
+            TranscodeLog.write("写入器创建失败：\(error.localizedDescription)")
             throw TranscoderError.recorderFailed(error.localizedDescription)
         }
 
@@ -242,7 +293,7 @@ final class RawTranscoder {
         parameters.blackLevel = 256       // bp16 与 ffmpeg 同构：黑 0x1000>>4
         parameters.whiteLevel = 4095
 
-        let (count, probe) = try ProResRAWReader.decode(url: rawURL) { buffer, pts, index in
+        let (count, probe) = try ProResRAWReader.decode(url: rawURL, format: usedFormat) { buffer, pts, index in
             if index == 1 {
                 // 相位：优先用系统在 attachment 里声明的
                 let declared = ProResRAWReader.declaredPattern(of: buffer)
@@ -274,7 +325,11 @@ final class RawTranscoder {
             return true
         }
 
-        guard count > 0 else { throw TranscoderError.noFrames }
+        TranscodeLog.write("全量解出 \(count) 帧，丢弃 \(outcome.dropped) 帧，增益 \(outcome.gains)")
+        guard count > 0 else {
+            TranscodeLog.write("全量解码得到 0 帧")
+            throw TranscoderError.noFrames
+        }
         feeder?.finish(into: recorder)
 
         // finish 前的等待交给信号量：MovieRecorder.finish 是 async 的
@@ -297,6 +352,7 @@ final class RawTranscoder {
                 recorder.appendFailureDescription ?? "写入器未正常结束"
             )
         }
+        TranscodeLog.write("转码完成 \(outcome.frames) 帧 / \(String(format: "%.1f", outcome.elapsed))s → \(outputURL.lastPathComponent) \(MovieRecorder.fileSize(at: outputURL)) 字节")
         progress?(1.0)
         return outcome
     }

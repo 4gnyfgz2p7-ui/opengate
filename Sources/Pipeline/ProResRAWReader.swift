@@ -84,10 +84,13 @@ final class ProResRAWReader {
     /// `onFrame` 返回 false 表示调用方要求提前停止。抛错即中断。
     /// 返回实际解码帧数与首帧自检信息。
     @discardableResult
+    /// `format` 为 nil 时不指定输出格式，交给解码器自己决定。
+    /// 这一点很重要：如果设备不认 bp16，指定就会直接失败，
+    /// 而不指定至少能看出它原生给的是什么。
     static func decode(
         url: URL,
         limit: Int = .max,
-        probeFrames: Int = 0,
+        format: OSType? = BayerConverter.planar16Format,
         onFrame: (CVPixelBuffer, CMTime, Int) throws -> Bool
     ) throws -> (count: Int, probe: Probe?) {
 
@@ -125,20 +128,24 @@ final class ProResRAWReader {
         var probe: Probe?
 
         while let sample = output.copyNextSampleBuffer() {
-            guard let format = CMSampleBufferGetFormatDescription(sample) else { continue }
+            guard let description = CMSampleBufferGetFormatDescription(sample) else { continue }
 
             if session == nil {
-                // 只要 bp16。这是 ProRes RAW 的「全尺寸解码」输出：
-                // 单平面、16-bit little-endian、每个 sensel 一个样本。
-                let attributes: [CFString: Any] = [
-                    kCVPixelBufferPixelFormatTypeKey: BayerConverter.planar16Format,
-                ]
+                // 首选 bp16：单平面、16-bit、每 sensel 一个样本，
+                // 不需要解包，相位还由 attachment 声明。
+                // 传 nil 则不指定，让解码器给它的原生格式——
+                // WWDC 2020 提到 ProRes RAW 最原生的输出是 RGBA half-float，
+                // 如果这台设备不认 bp16，至少能看出它实际给什么。
+                var attributes: CFDictionary?
+                if let format {
+                    attributes = [kCVPixelBufferPixelFormatTypeKey: format] as CFDictionary
+                }
                 var created: VTDecompressionSession?
                 let status = VTDecompressionSessionCreate(
                     allocator: kCFAllocatorDefault,
-                    formatDescription: format,
+                    formatDescription: description,
                     decoderSpecification: nil,
-                    imageBufferAttributes: attributes as CFDictionary,
+                    imageBufferAttributes: attributes,
                     outputCallback: nil,
                     decompressionSessionOut: &created
                 )
@@ -180,8 +187,10 @@ final class ProResRAWReader {
             if count >= limit { break }
         }
 
-        if probe == nil, reader.status == .failed {
-            throw ReaderError.cannotStart(reader.error?.localizedDescription ?? "读取中断")
+        if probe == nil {
+            let status = reader.status
+            let detail = reader.error?.localizedDescription ?? "无错误信息"
+            throw ReaderError.cannotStart("未解出帧（reader=\(status.rawValue) \(detail)）")
         }
         return (count, probe)
     }

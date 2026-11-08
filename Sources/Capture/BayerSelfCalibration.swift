@@ -93,9 +93,14 @@ enum BayerSelfCalibration {
                 return true
             }
         } catch {
+            let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            TranscodeLog.write("自校准：官方解码失败 \(reason)")
             return nil
         }
-        guard official.count >= 2 else { return nil }
+        guard official.count >= 2 else {
+            TranscodeLog.write("自校准：官方帧不足（\(official.count)）")
+            return nil
+        }
 
         // 采样点：x 取 16 的倍数，保证 8px/12B 与 2px/3B 的块边界同时对齐
         let stepX = 16
@@ -136,7 +141,11 @@ enum BayerSelfCalibration {
             }
         }
 
-        guard let best, best.score > 0.90 else { return nil }
+        guard let best, best.score > 0.90 else {
+            TranscodeLog.write("自校准未成立：最高 ρ=\(String(format: "%.3f", best?.score ?? 0)) mode=\(best?.mode ?? -1)")
+            return nil
+        }
+        TranscodeLog.write("自校准成立：mode=\(best.mode) ρ=\(String(format: "%.4f", best.score)) offset=\(best.offset)")
 
         // 相位：官方如果声明了就用它，否则沿用 RGGB
         let pattern = Int32(BayerSelfCalibration.detectPattern(
