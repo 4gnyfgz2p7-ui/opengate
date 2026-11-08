@@ -167,105 +167,19 @@ final class RawTranscoder {
         }
     }
 
-    // MARK: - 官方转码器
-
-    /// 用 `AVAssetExportSession` 转码：一句话完成解码、编码、封装。
-    ///
-    /// 自己搭 Reader/Writer 要处理格式探测、像素格式、色彩标记、音画交错
-    /// 一堆事，每一步都可能出错；而系统本来就有这个 API。对 ProRes RAW
-    /// 这种私有格式，**能交给系统就别自己拆**——它内部怎么做我们看不见，
-    /// 但只要它认这个文件，出来的东西就一定是它认为正确的样子。
-    ///
-    /// preset 选 HEVC 最高质量：分辨率保持 4224×3024，不缩放。
-    /// 返回 nil 表示系统不支持这个文件，调用方走回退路径。
-    private static func runExportSession(
-        rawURL: URL,
-        outputURL: URL,
-        tier: QualityTier,
-        started: Date
-    ) -> Outcome? {
-
-        let asset = AVURLAsset(url: rawURL)
-
-        // 按质量从高到低试。init 返回 nil 即 preset 与该 asset 不兼容，
-        // 这个判断是系统的，不用我们猜。
-        let candidates: [String] = tier.isHEVC
-            ? [AVAssetExportPresetHEVCHighestQuality, AVAssetExportPresetHighestQuality]
-            : [AVAssetExportPresetHighestQuality]
-
-        var session: AVAssetExportSession?
-        var usedPreset = ""
-        for preset in candidates {
-            guard let candidate = AVAssetExportSession(asset: asset, presetName: preset) else {
-                TranscodeLog.write("官方转码：preset \(preset) 不兼容，跳过")
-                continue
-            }
-            guard candidate.supportedFileTypes.contains(.mov) else {
-                TranscodeLog.write("官方转码：preset \(preset) 不支持 .mov，跳过")
-                continue
-            }
-            session = candidate
-            usedPreset = preset
-            break
-        }
-        guard let session else { return nil }
-
-        try? FileManager.default.removeItem(at: outputURL)
-        session.outputURL = outputURL
-        session.outputFileType = .mov
-        session.shouldOptimizeForNetworkUse = false
-
-        TranscodeLog.write("官方转码：preset=\(usedPreset) → \(outputURL.lastPathComponent)")
-
-        let semaphore = DispatchSemaphore(value: 0)
-        session.exportAsynchronously { semaphore.signal() }
-        // 给一个上限，别让界面永远停在"处理中"。
-        // ProRes RAW 解 4K 一分钟素材通常 20–60 秒，15 分钟足够宽。
-        guard semaphore.wait(timeout: .now() + 900) == .success else {
-            TranscodeLog.write("官方转码超时（900s）")
-            session.cancelExport()
-            try? FileManager.default.removeItem(at: outputURL)
-            return nil
-        }
-
-        guard session.status == .completed else {
-            let detail = session.error?.localizedDescription ?? "状态 \(session.status.rawValue)"
-            TranscodeLog.write("官方转码失败：\(detail)")
-            try? FileManager.default.removeItem(at: outputURL)
-            return nil
-        }
-
-        // 用实际产出的文件信息回填，不猜
-        let size = MovieRecorder.fileSize(at: outputURL)
-        guard size > 0 else {
-            TranscodeLog.write("官方转码完成但文件为 0 字节")
-            try? FileManager.default.removeItem(at: outputURL)
-            return nil
-        }
-
-        let produced = AVURLAsset(url: outputURL)
-        let track = produced.tracks(withMediaType: .video).first
-        var outcome = Outcome()
-        // duration 可能是 invalid，CMTimeGetSeconds 会给 nan，
-        // 直接转 Int 会崩，先挡掉。
-        let seconds = CMTimeGetSeconds(produced.duration)
-        let fps = Double(track?.nominalFrameRate ?? 24)
-        outcome.frames = (seconds.isFinite && seconds > 0)
-            ? Int((seconds * fps).rounded())
-            : 0
-        outcome.elapsed = Date().timeIntervalSince(started)
-        outcome.probe = String(
-            format: "%@ · %.0f×%.0f · %@",
-            usedPreset,
-            track?.naturalSize.width ?? 0,
-            track?.naturalSize.height ?? 0,
-            "系统 RAW 管线"
-        )
-        outcome.gains = "直通（系统解码 + 编码）"
-        outcome.outputURL = outputURL
-        TranscodeLog.write("官方转码完成 \(outcome.frames) 帧 / \(String(format: "%.1f", outcome.elapsed))s / \(size) 字节")
-        return outcome
-    }
+    // MARK: - 为什么不用 AVAssetExportSession
+    //
+    // 它确实是"一句话完成解码+编码+封装"，但两个致命限制：
+    //
+    // 1. **码率不可控**。preset 是系统定的，给不了本项目要求的
+    //    20–90 Mbps 区间；同一个 preset 在不同机型上还会给不同结果。
+    // 2. **分辨率可能被改写**。preset 隐含了缩放策略，4224×3024 这种
+    //    非标准尺寸不保证原样保留。
+    //
+    // 而这两项恰恰是这台机器的核心指标。所以改用下面这条路：解码交给
+    // 系统（AVAssetReader 指定输出格式，内部就是 VideoToolbox），
+    // 编码交给系统（AVAssetWriter，参数由我们给），**像素一个不碰**。
+    // 颜色仍然是系统 RAW 处理的结果，只是包装层由我们控制。
 
     /// 同步转码。调用方应放在后台队列，不要在采集队列上跑。
     static func run(
@@ -280,26 +194,6 @@ final class RawTranscoder {
         let started = Date()
         TranscodeLog.reset()
         TranscodeLog.write("开始转码 \(tier.identifier) src=\(rawURL.lastPathComponent)")
-
-        // ---- 官方转码器优先 ----
-        //
-        // 系统有一个 API 就能完成「解码 + 编码 + 封装」，不用我们碰任何一个
-        // 像素。之前自己搭 Reader/Writer、探测输出格式、分派 Bayer/YUV，
-        // 全是因为没想到这一步。它成功，后面一整段都不执行。
-        //
-        // 只对 HEVC 档用它：ExportSession 的 preset 只能给「最高质量 HEVC」
-        // 这一种，给不了 ProRes 422 LT / HQ 的分档，那两档仍走自建链路。
-        if tier.isHEVC,
-           let official = runExportSession(
-               rawURL: rawURL,
-               outputURL: outputURL,
-               tier: tier,
-               started: started
-           ) {
-            progress?(1.0)
-            return official
-        }
-        TranscodeLog.write("官方转码不可用，回退到自建链路")
 
         guard let converter = BayerConverter() else {
             throw TranscoderError.converterUnavailable
