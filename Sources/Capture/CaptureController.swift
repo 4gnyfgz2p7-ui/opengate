@@ -426,10 +426,15 @@ final class CaptureController: NSObject {
             return RawPreparation(settings: nil, metadata: nil,
                                   reason: "系统未给出 ProRes RAW 的建议编码设置")
         }
-        let metadata = videoOutput.recommendedMovieMetadata(
-            forVideoCodecType: codec,
-            assetWriterOutputFileType: .mov
-        )
+        // 这个 API 的符号到 iOS 26 才公开，而本工程部署目标是 17.0，
+        // 不包可用性判断编译就过不去。设备实际跑 iOS 27，运行时能进这一支。
+        var metadata: [AVMetadataItem]?
+        if #available(iOS 26.0, *) {
+            metadata = videoOutput.recommendedMovieMetadata(
+                forVideoCodecType: codec,
+                assetWriterOutputFileType: .mov
+            )
+        }
         return RawPreparation(settings: settings, metadata: metadata, reason: nil)
     }
 
