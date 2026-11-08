@@ -635,6 +635,22 @@ final class RecordingEngine: ObservableObject {
 
             // ---- 步骤 3：建 writer 并写入元数据 ----
             self.state = .preparing("正在准备编码器…")
+
+            // ProRes RAW 需要先完成三件系统要求的事，任何一件不满足都开不了录。
+            // 放在建 writer 之前做，是因为白平衡必须先锁定、元数据必须从当前
+            // 已启动的会话里取，而且失败原因能直接报给用户，不用等录完发现 0 字节。
+            var rawSettings: [String: Any]?
+            var rawMetadata: [AVMetadataItem]?
+            if selectedTier.isRawBayer {
+                let prep = self.capture.prepareProResRAW()
+                if let reason = prep.reason {
+                    self.state = .failed("ProRes RAW 无法开录：\(reason)")
+                    return
+                }
+                rawSettings = prep.settings
+                rawMetadata = prep.metadata
+            }
+
             let startedAt = Date()
             let outputURL = MovieRecorder.makeOutputURL(tier: selectedTier, date: startedAt)
 
@@ -665,7 +681,9 @@ final class RecordingEngine: ObservableObject {
                     metadata: metadata,
                     withAudio: self.captureConfiguration?.audioEnabled ?? false,
                     appleLog2: false,
-                    videoTransform: CGAffineTransform(rotationAngle: degrees * .pi / 180)
+                    videoTransform: CGAffineTransform(rotationAngle: degrees * .pi / 180),
+                    rawSettings: rawSettings,
+                    rawMetadata: rawMetadata
                 )
                 self.recorderBox.set(recorder)
             } catch {

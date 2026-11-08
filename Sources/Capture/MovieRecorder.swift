@@ -31,7 +31,7 @@ final class MovieRecorder {
 
     enum RecorderError: LocalizedError {
         case writerCreationFailed(String)
-        case videoInputRejected
+        case videoInputRejected(String)
         case audioInputRejected
         case startWritingFailed(String)
         case insufficientSpace(requiredMB: Int64, availableMB: Int64)
@@ -40,8 +40,8 @@ final class MovieRecorder {
             switch self {
             case .writerCreationFailed(let reason):
                 return "无法创建写入器：\(reason)"
-            case .videoInputRejected:
-                return "写入器不接受该档的视频参数"
+            case .videoInputRejected(let detail):
+                return "写入器不接受该档的视频参数：\(detail)"
             case .audioInputRejected:
                 return "写入器不接受 LPCM 音轨"
             case .startWritingFailed(let reason):
@@ -61,6 +61,9 @@ final class MovieRecorder {
 
     private var writer: AVAssetWriter
     private var videoInput: AVAssetWriterInput
+    /// ProRes RAW 的容器级元数据（相机标定、白平衡增益等），由系统给出。
+    /// 必须与自定义元数据合并后一次写入，后写的会覆盖先写的。
+    private var rawMovieMetadata: [AVMetadataItem] = []
     private var audioInput: AVAssetWriterInput?
     /// 直接追加 CVPixelBuffer 的标准通道。
     /// 早先是自己拼 CMSampleBuffer 再 append，格式描述与时间戳都由我们构造，
@@ -105,7 +108,9 @@ final class MovieRecorder {
         metadata: [AVMetadataItem],
         withAudio: Bool,
         appleLog2: Bool,
-        videoTransform: CGAffineTransform = .identity
+        videoTransform: CGAffineTransform = .identity,
+        rawSettings: [String: Any]? = nil,
+        rawMetadata: [AVMetadataItem]? = nil
     ) throws {
 
         self.outputURL = outputURL
@@ -132,57 +137,78 @@ final class MovieRecorder {
         var accepted: AVAssetWriterInput?
         var acceptedLevel = -1
 
-        for level in 0...3 {
-            guard let settings = VideoSettingsBuilder.fallbackSettings(
-                tier: tier,
-                width: width,
-                height: height,
-                appleLog2: appleLog2,
-                level: level
-            ) else { continue }
-
-            guard writer.canApply(outputSettings: settings, forMediaType: .video) else { continue }
-
+        // ProRes RAW 不接受自拼参数，也不存在"降级到更宽松的一套"——
+        // 系统给的 recommendedVideoSettings 就是唯一答案，换任何一套都会被拒。
+        // 拿不到就直接失败，让调用方把原因报出来。
+        if tier.isRawBayer {
+            guard let settings = rawSettings else {
+                throw RecorderError.videoInputRejected("系统没有给出 ProRes RAW 的编码设置")
+            }
+            guard writer.canApply(outputSettings: settings, forMediaType: .video) else {
+                throw RecorderError.videoInputRejected("canApply 拒绝系统给出的 RAW 设置")
+            }
             let candidate = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
             candidate.expectsMediaDataInRealTime = true
-            // 拍摄方向只作为显示矩阵写入容器，**不旋转像素**。
-            // 4224×3024 是传感器原生画幅，旋转像素要么改变实际存储尺寸，
-            // 要么引入一次全画幅重采样，与「全幅不裁切、不改几何」冲突。
             candidate.transform = videoTransform
-
-            if writer.canAdd(candidate) {
-                writer.add(candidate)
-                accepted = candidate
-                acceptedLevel = level
-                break
+            guard writer.canAdd(candidate) else {
+                throw RecorderError.videoInputRejected("canAdd 拒绝 RAW 视频轨，输出文件类型 \(tier.fileType.rawValue)")
             }
+            writer.add(candidate)
+            accepted = candidate
+            acceptedLevel = 0
+            // RAW 容器里必须写相机标定、白平衡增益等元数据，解码器靠它还原色彩。
+            // 这一步来自 Apple 文档要求，缺了文件能写但打不开。
+            // 这里只暂存，等 start() 里与自定义元数据合并后一次写入。
+            rawMovieMetadata = rawMetadata ?? []
         }
 
+        if accepted == nil {
+            for level in 0...3 {
+                guard let settings = VideoSettingsBuilder.fallbackSettings(
+                    tier: tier,
+                    width: width,
+                    height: height,
+                    appleLog2: appleLog2,
+                    level: level
+                ) else { continue }
+
+                guard writer.canApply(outputSettings: settings, forMediaType: .video) else { continue }
+
+                let candidate = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+                candidate.expectsMediaDataInRealTime = true
+                // 拍摄方向只作为显示矩阵写入容器，**不旋转像素**。
+                // 4224×3024 是传感器原生画幅，旋转像素要么改变实际存储尺寸，
+                // 要么引入一次全画幅重采样，与「全幅不裁切、不改几何」冲突。
+                candidate.transform = videoTransform
+
+                if writer.canAdd(candidate) {
+                    writer.add(candidate)
+                    accepted = candidate
+                    acceptedLevel = level
+                    break
+                }
+            }
+
+        }
         guard let vInput = accepted else {
-            throw RecorderError.videoInputRejected
+            throw RecorderError.videoInputRejected("四套参数全部被拒，\(width)×\(height) \(tier.displayName)")
         }
         videoInput = vInput
         settingsLevel = acceptedLevel
 
-        // ProRes RAW 的输入是未解码的 Bayer，必须显式声明格式：
-        // 不声明的话写入器按普通视频缓冲处理，一定拒收。
-        // 其余档位不指定——全幅走 BGRA、系统 ISP 降级走 10-bit YUV，
-        // 两条路都要能 append，让 adaptor 保持中立。
-        if tier.isRawBayer {
-            adaptor = AVAssetWriterInputPixelBufferAdaptor(
-                assetWriterInput: vInput,
-                sourcePixelBufferAttributes: [
-                    kCVPixelBufferPixelFormatTypeKey as String: BayerConverter.bayerFormat,
-                    kCVPixelBufferWidthKey as String: width,
-                    kCVPixelBufferHeightKey as String: height,
-                ]
-            )
-        } else {
-            adaptor = AVAssetWriterInputPixelBufferAdaptor(
-                assetWriterInput: vInput,
-                sourcePixelBufferAttributes: nil
-            )
-        }
+        // 所有档位都保持中立：不声明源格式。
+        //
+        // 早先 RAW 档在这里声明了 btp2 + 4224×3024，理由是"不声明会被当普通
+        // 视频缓冲拒收"——那是猜的。实际上声明非 nil 会让 adaptor 去建一个
+        // 该格式的 pixel buffer pool，而 `96VersatileBayerPacked12` 是相机
+        // 专用格式，CoreVideo 未必能自行创建；池建不出来，append 就一路失败。
+        //
+        // nil 的含义是"接受任何符合 writer input 要求的 buffer，不做转换"，
+        // 正是直通需要的。相机给的 buffer 本身就是 btp2，尺寸也对得上。
+        adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: vInput,
+            sourcePixelBufferAttributes: nil
+        )
 
         // ---- 音频输入 ----
         if withAudio {
@@ -198,7 +224,8 @@ final class MovieRecorder {
         }
 
         // ---- 元数据：必须在 startWriting 之前 ----
-        writer.metadata = metadata
+        // 顺序不能反：这一行会整体替换，先写 rawMovieMetadata 会被冲掉。
+        writer.metadata = rawMovieMetadata + metadata
 
         // ---- 启动 ----
         guard writer.startWriting() else {
@@ -302,8 +329,19 @@ final class MovieRecorder {
             if firstFailure {
                 // 只在第一次记，避免每条帧都拼字符串。
                 // 这条文本是"文件 0 字节"唯一的现场证据，必须留给界面看。
-                let reason = writer.error?.localizedDescription ?? "append 返回 false"
-                firstAppendFailure = reason
+                //
+                // 带上源 buffer 的实际格式：RAW 档失败最常见的原因就是
+                // adaptor 拿到的格式和 writer input 期望的不一致，
+                // 只写"append 返回 false"等于什么都没说。
+                let fmt = CVPixelBufferGetPixelFormatType(imageBuffer)
+                let code = String(bytes: [
+                    UInt8((fmt >> 24) & 0xFF), UInt8((fmt >> 16) & 0xFF),
+                    UInt8((fmt >> 8) & 0xFF), UInt8(fmt & 0xFF),
+                ], encoding: .ascii) ?? "????"
+                let size = "\(CVPixelBufferGetWidth(imageBuffer))×\(CVPixelBufferGetHeight(imageBuffer))"
+                let writerReason = writer.error?.localizedDescription
+                    ?? "writer 状态 \(writer.status.rawValue)"
+                firstAppendFailure = "帧被拒（源 \(code) \(size)）：\(writerReason)"
             }
             stateLock.unlock()
             return false

@@ -358,6 +358,81 @@ final class CaptureController: NSObject {
         }
     }
 
+    /// ProRes RAW 的开录前置条件。
+    ///
+    /// Apple 文档对这条路有三条硬性要求，任何一条不满足都会失败，
+    /// 而失败方式各不相同（抛异常 / canApply 拒绝 / append 静默失败），
+    /// 早先三样**一条都没做**，所以 RAW 档从来录不出来：
+    ///
+    /// 1. **白平衡必须先锁到具体增益**（`setWhiteBalanceModeLocked(with:)`）。
+    ///    只把 `whiteBalanceMode` 设成 `.locked` 不够——那只是停止更新，
+    ///    没有给出确定增益。文档原文：ProRes RAW 客户端在查询建议元数据前
+    ///    必须先锁定白平衡，否则抛 `NSInvalidArgumentException`。
+    /// 2. **编解码器必须出现在 `availableVideoCodecTypesForAssetWriter(writingTo:)`**，
+    ///    否则同样抛异常。这一步用来判断这台设备到底支不支持。
+    /// 3. **必须向系统要建议设置与电影级元数据**（`recommendedVideoSettings` /
+    ///    `recommendedMovieMetadata`）。RAW 的容器里要写相机标定、白平衡增益
+    ///    等一批元数据，解码器靠它还原色彩；自己手拼 settings 拼不出来。
+    ///
+    /// 返回 `reason` 非空即代表这条路走不通，界面直接把原因报给用户，
+    /// 不再出现"录了两秒才发现是 0 字节"。
+    struct RawPreparation {
+        var settings: [String: Any]?
+        var metadata: [AVMetadataItem]?
+        var reason: String?
+    }
+
+    func prepareProResRAW() -> RawPreparation {
+        guard let device = videoDevice else {
+            return RawPreparation(settings: nil, metadata: nil, reason: "没有可用的视频设备")
+        }
+
+        // ---- 第一条：锁定白平衡到当前增益 ----
+        do {
+            try device.lockForConfiguration()
+            if device.isWhiteBalanceModeSupported(.locked) {
+                device.setWhiteBalanceModeLocked(
+                    with: device.deviceWhiteBalanceGains,
+                    completionHandler: nil
+                )
+            } else {
+                device.unlockForConfiguration()
+                return RawPreparation(settings: nil, metadata: nil,
+                                      reason: "该格式不支持锁定白平衡，ProRes RAW 无法开录")
+            }
+            device.unlockForConfiguration()
+        } catch {
+            return RawPreparation(settings: nil, metadata: nil,
+                                  reason: "白平衡锁定失败：\(error.localizedDescription)")
+        }
+
+        // ---- 第二条：系统是否支持把 RAW 写进 .mov ----
+        let codec = AVVideoCodecType.proResRawCompat
+        let supported = videoOutput.availableVideoCodecTypesForAssetWriter(writingTo: .mov)
+        guard supported.contains(codec) else {
+            let names = supported.isEmpty
+                ? "空"
+                : supported.map(\.rawValue).joined(separator: ",")
+            return RawPreparation(settings: nil, metadata: nil,
+                                  reason: "系统不接受 \(codec.rawValue) 写入，可用：\(names)")
+        }
+
+        // ---- 第三条：向系统要设置与元数据 ----
+        let settings = videoOutput.recommendedVideoSettings(
+            forVideoCodecType: codec,
+            assetWriterOutputFileType: .mov
+        )
+        guard settings != nil else {
+            return RawPreparation(settings: nil, metadata: nil,
+                                  reason: "系统未给出 ProRes RAW 的建议编码设置")
+        }
+        let metadata = videoOutput.recommendedMovieMetadata(
+            forVideoCodecType: codec,
+            assetWriterOutputFileType: .mov
+        )
+        return RawPreparation(settings: settings, metadata: metadata, reason: nil)
+    }
+
     private func attachAudio(result: inout Configuration) -> Bool {
         guard let device = AVCaptureDevice.default(for: .audio) else {
             result.notes.append("找不到麦克风")
