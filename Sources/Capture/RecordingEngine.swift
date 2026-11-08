@@ -229,6 +229,8 @@ final class RecordingEngine: ObservableObject {
     private var relayPending: (raw: URL, final: URL, tier: QualityTier)?
     /// 中转用的元数据在开录时生成一次，转码时复用，避免丢失拍摄信息
     private var relayMetadata: [AVMetadataItem] = []
+    /// 自校准结果缓存。采集回调每帧都要用它，不能每帧读 UserDefaults。
+    nonisolated(unsafe) private static var bayerSolution = BayerSelfCalibration.saved
     private var recordingStart: Date?
     private var tickTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
@@ -459,6 +461,12 @@ final class RecordingEngine: ObservableObject {
         wb: (red: Float, blue: Float)? = nil
     ) -> BayerConverter.Parameters {
         var parameters = BayerConverter.Parameters()
+        // 自校准算出的位序锁死在这里：搜索出来的 mode 一直与官方解码对不上，
+        // 有了标准答案反推的结果就不该再让判据改回去。
+        if let solution = bayerSolution, solution.score > 0.90 {
+            parameters.lockMode = solution.mode
+            parameters.pattern = solution.pattern
+        }
 
         guard let attachments = CMCopyDictionaryOfAttachments(
             allocator: kCFAllocatorDefault,
@@ -719,6 +727,8 @@ final class RecordingEngine: ObservableObject {
         refreshWhiteBalanceGains()
 
         let selectedTier = tier
+        // 每次开录重读一次校准结果：上次录制可能刚把它算出来
+        Self.bayerSolution = BayerSelfCalibration.saved
         // 颜色链路：不再用自研 btp2 解包。
         //
         // 相机给的是 btp2 私有打包，自研解包与官方解码始终对不上
@@ -730,7 +740,12 @@ final class RecordingEngine: ObservableObject {
         // 重新编码成用户选的档位。
         //
         // 代价是临时空间与一次转码等待，换来的是颜色由 Apple 解码器保证。
-        let relay = !selectedTier.isRawBayer && captureConfiguration?.isBayer == true
+        // 自校准一旦成立，自研解包就有了可信位序，可以直接实时录，
+        // 不必再走 ProRes RAW 中转（省掉临时空间和转码等待）。
+        let needsRelay = !BayerSelfCalibration.hasSolution
+        let relay = needsRelay
+            && !selectedTier.isRawBayer
+            && captureConfiguration?.isBayer == true
         let recordingTier: QualityTier = relay ? .proResRAW : selectedTier
         let width = Int(captureConfiguration?.width ?? 4224)
         let height = Int(captureConfiguration?.height ?? 3024)
@@ -816,6 +831,9 @@ final class RecordingEngine: ObservableObject {
                     ? (raw: outputURL, final: finalURL, tier: selectedTier)
                     : nil
                 self.relayMetadata = metadata
+                // 中转的这一次顺便把 btp2 原始字节存下来，
+                // 转码时用官方解码结果反推位序，成功后就不必再中转
+                if relay { BayerDump.enable() }
             } catch {
                 self.state = .failed(error.localizedDescription)
                 return
@@ -861,6 +879,7 @@ final class RecordingEngine: ObservableObject {
                     }.value
                     // 转码成功才删临时文件；失败保留，素材不能丢
                     try? FileManager.default.removeItem(at: relay.raw)
+                    BayerDump.disable()
                     outcome = MovieRecorder.Outcome(
                         url: relay.final,
                         tier: relay.tier,

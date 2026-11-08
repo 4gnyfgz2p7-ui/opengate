@@ -237,7 +237,8 @@ final class BayerCalibration {
         white: Float,
         redGain: Float,
         blueGain: Float,
-        preferredPattern: Int32
+        preferredPattern: Int32,
+        forceMode: Int32? = nil
     ) -> Outcome {
 
         /// 相位/白平衡采样的步长。必须是**偶数**：quad 四个位置的
@@ -254,6 +255,11 @@ final class BayerCalibration {
         ///   step=27 → 0.415 0.417 … 0.018 0.017（只有 9/10 低）
         /// 奇数步长与 8、4、2 都互质，能把所有字节位置都扫到。
         let scanStep = 27
+
+        /// 自校准算出的位序一旦确定，就只评估这一种。
+        /// 未评估的槽位保持默认值（sameDiff 是 0、crossRms 是无穷），
+        /// 选择阶段只会落在真正评估过的 mode 上，不会误选空白项。
+        let modes: [Int] = forceMode.map { [Int($0)] } ?? Array(0..<candidateCount)
 
         let invRange = 1.0 / Double(max(white - black, 1))
         let blackValue = Double(black)
@@ -288,7 +294,7 @@ final class BayerCalibration {
         while sampleY + 2 < height {
             var sampleX = scanStep
             while sampleX + 2 < width {
-                for mode in 0..<candidateCount {
+                for mode in modes {
                     let center = value(mode, sampleX, sampleY)
                     let right = value(mode, sampleX + 1, sampleY)
                     let down = value(mode, sampleX, sampleY + 1)
@@ -309,7 +315,7 @@ final class BayerCalibration {
 
         // 每种排法的同色/异色比，只作为诊断留档
         var ratios = [Double](repeating: .greatestFiniteMagnitude, count: candidateCount)
-        for mode in 0..<candidateCount {
+        for mode in modes {
             guard crossDiff[mode] > 1e-9 * max(sampleCount, 1) else { continue }
             ratios[mode] = sameDiff[mode] / crossDiff[mode]
         }
@@ -330,7 +336,7 @@ final class BayerCalibration {
             var x = 0
             while x < width {
                 let slot = x & 7
-                for mode in 0..<candidateCount {
+                for mode in modes {
                     mod8Sums[mode][slot] += unpack(row, x, mode: mode)
                 }
                 x += 1
@@ -341,7 +347,7 @@ final class BayerCalibration {
 
         var periodicities = [Double](repeating: .greatestFiniteMagnitude, count: candidateCount)
         if mod8Rows > 0 {
-            for mode in 0..<candidateCount {
+            for mode in modes {
                 var means = [Double](repeating: 0, count: 8)
                 var overall = 0.0
                 for slot in 0..<8 {
@@ -402,7 +408,7 @@ final class BayerCalibration {
         // 且均方根对「大片零」免疫：零仍是零，高光区的跳变被放大。
         var crossMeans = [Double](repeating: .greatestFiniteMagnitude, count: candidateCount)
         var crossRms = [Double](repeating: .greatestFiniteMagnitude, count: candidateCount)
-        for mode in 0..<candidateCount {
+        for mode in modes {
             guard maxSample[mode] - minSample[mode] > 0.02 else { continue }
             let n = max(sampleCount * 2, 1)
             crossMeans[mode] = crossDiff[mode] / n

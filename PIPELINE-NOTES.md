@@ -521,3 +521,65 @@ ffmpeg -i A.mov -pix_fmt bayer_rggb16le -f rawvideo bayer.bin
 长 GOP 20 → **45 Mb/s**（0.147 bit/像素），全 I 帧 60 → **90 Mb/s**。
 20 Mb/s 在纹理密集处已经能看出块效应；45 的日常实际落点约在 30–50。
 
+
+## 十三、放弃自研解包，改走系统解码（0.5.38）
+
+### 定案依据
+
+同一段 ProRes RAW 录制，两条路解出来的数据不是同一组：
+
+| 指标 | Apple 官方解码 | 本机自研解包 |
+|---|---|---|
+| 偶位/奇位比 | 1.106 | 0.762 |
+| 行均值 | 359 | 894 |
+
+`lin_curve` 单调，只会压缩或拉伸数值，**不会让大小关系反转**；方向相反
+加上均值差 2.5 倍，只能说明两边拿的不是同一批数。中间还试过用
+`lin_curve` 反推（比值 2.82 恰在中段斜率上），但曲线低段实际是压小的
+（输入 8192 只输出 224），方向对不上，已撤回，没有进包。
+
+### 判据为什么一直选错
+
+「相邻像素差最小」这类判据会**奖励人为制造相关性**的排法：mode9/10
+让相邻两像素共享第三个字节的低 4 位，相邻差天然变小，于是永远被选中。
+判据的原理性缺陷决定了它无法指向正确答案，换指标（同色差、总变差、
+mod-8、均方根、奇数步长）都只是在同一层里绕。
+
+### 改用系统的解码器
+
+链路：
+
+```
+采集  btp2 ──直通──▶ ProRes RAW 写入器（系统内部解包，成片已验证正确）
+停止  文件 ──VideoToolbox──▶ bp16（每 sensel 一个 16-bit，不需解包）
+      bp16 ──Metal──▶ demosaic / 矩阵 / 白平衡 / 滚降
+           ──AVAssetWriter──▶ 用户选的档位
+```
+
+关键在于 `kCVPixelFormatType_16VersatileBayer`（`'bp16'`）：
+**单平面、16-bit 小端、每个 sensel 一个样本**，而且 Bayer 排布由解码器
+通过 buffer attachment 直接声明。所以这条路上：
+- 没有位序要猜
+- 没有相位要选
+- 没有标定要跑
+
+`BayerConverter` 为此加了两条支路：`planar16` 参数（跳过标定，
+相位与增益由调用方给）和 shader 的 `mode == 15`（直接读 `ushort`）。
+
+### 代价（必须知道）
+
+1. **临时空间**：ProRes RAW 实测约 443 Mb/s，一分钟 3.3 GB。
+   空间检查按 RAW 档做，不再按目标档位。
+2. **停止后要等转码**：解码 + 重编码，1 分钟素材约 1–2 分钟。
+3. **失败保留 RAW**：转码出错时临时文件不删，记录里写明原因，
+   素材不会丢。
+
+### 接线位置
+
+- `Sources/Pipeline/ProResRAWReader.swift` — VTDecompressionSession → bp16
+- `Sources/Pipeline/RawTranscoder.swift` — 转码 + 音频按 pts 交错
+- `RecordingEngine.startRecording` — `relay` 判定，HEVC/ProRes 档改用
+  `.proResRAW` 录制，输出到临时路径
+- `RecordingEngine.stopRecording` — finish 后转码，成功删临时文件
+
+ProRes RAW 档本身不受影响：它本来就是正确的，直接落盘。

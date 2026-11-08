@@ -181,6 +181,25 @@ final class RawTranscoder {
             throw TranscoderError.converterUnavailable
         }
 
+        // ---- 顺便做一次自校准 ----
+        //
+        // 这次录制已经把同一帧的 btp2 原始字节存下来了，而手头这个 RAW 文件
+        // 里是同一次曝光的官方解码结果。两者对照就能把真实位序算出来——
+        // 这是唯一绕开「判据永远选错」的路，因为判据奖励的是人为相关性，
+        // 而这里比的是标准答案。
+        //
+        // 成立后写进 UserDefaults，下次录制直接走自研解包，恢复实时。
+        var calibrationNote = ""
+        if BayerDump.loadSlices().count >= 2 {
+            if let solution = BayerSelfCalibration.calibrate(rawURL: rawURL) {
+                BayerSelfCalibration.saved = solution
+                calibrationNote = " 自校准 " + solution.summary
+            } else {
+                calibrationNote = " 自校准未成立"
+            }
+            BayerDump.clear()
+        }
+
         let asset = AVURLAsset(url: rawURL)
         let videoTrack = asset.tracks(withMediaType: .video).first
         let audioTrack = asset.tracks(withMediaType: .audio).first
@@ -270,7 +289,7 @@ final class RawTranscoder {
 
         outcome.frames = count
         outcome.elapsed = Date().timeIntervalSince(started)
-        outcome.probe = probe?.summary ?? "—"
+        outcome.probe = (probe?.summary ?? "—") + calibrationNote
         outcome.audioBuffers = feeder?.appended ?? 0
         outcome.outputURL = finishedClean ? outputURL : nil
         if !finishedClean {

@@ -36,6 +36,12 @@ final class BayerConverter {
         /// attachment 里声明。所以这条路上**不做设备端标定**，
         /// 相位与白平衡全部由调用方给定。
         var planar16: Bool = false
+        /// 自校准算出的解包位序。有值时只评估这一种，不再搜索。
+        ///
+        /// 搜索出来的位序一直不可靠：判据奖励「相邻像素共享低位字节」的排法，
+        /// mode9/10 永远胜出，而它们与官方解码对不上。自校准用官方解码结果
+        /// 做标准答案反推位序，一旦成立就该锁死，不能再让搜索改回去。
+        var lockMode: Int32? = nil
     }
 
     /// 一次转换的自检结果。直接读数，不猜。
@@ -264,7 +270,8 @@ final class BayerConverter {
                 white: parameters.whiteLevel,
                 redGain: parameters.redGain,
                 blueGain: parameters.blueGain,
-                preferredPattern: parameters.pattern
+                preferredPattern: parameters.pattern,
+                forceMode: parameters.lockMode
             )
         }
 
@@ -293,7 +300,8 @@ final class BayerConverter {
             redGain = calibrated.whiteBalanceRed
             greenGain = 1
             blueGain = calibrated.whiteBalanceBlue
-            activePattern = calibrated.pattern
+            // 锁了位序说明自校准给了完整答案，相位也以它为准
+            activePattern = parameters.lockMode != nil ? parameters.pattern : calibrated.pattern
             activeUnpack = calibrated.unpackMode
         }
         let floats = [parameters.blackLevel, parameters.whiteLevel,
