@@ -293,12 +293,19 @@ enum VideoSettingsBuilder {
     /// 公开的 `AVVideoColorPrimaries_AppleGamut` 常量。这里写 BT.2020 作为可被
     /// 主流 NLE 正确识别的近似标记，真实色彩空间另用自定义元数据键记录。
     ///
-    /// 这是已知偏差，验证方式是导入 DaVinci 后看 Color Space 识别结果。
+    /// 传输函数**不能写 HLG**。早先那一版写的是
+    /// `AVVideoTransferFunction_ITU_R_2100_HLG`，理由是"Log 曲线没有标准编码，
+    /// 挑一个宽色域的非线性函数凑上去"——这是错的：HLG 是显示参考曲线，
+    /// 播放器会按 HDR 通路做 OOTF 和 tone mapping，画面会被重新映射一遍，
+    /// 表现为高光变白、中间调偏色。Apple Log 2 的官方容器写法是
+    /// `colr = 9 / 2 / 9`（transfer 为 *unspecified*），AVFoundation 没有
+    /// unspecified 常量，退到 BT.709 最接近"不做变换"。
+    /// 真正的 Log 身份靠 `AVVideoLogTransferFunctionKey` 表达。
     static func colorProperties(appleLog2: Bool) -> [String: Any] {
         if appleLog2 {
             return [
                 AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
                 AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020,
             ]
         }

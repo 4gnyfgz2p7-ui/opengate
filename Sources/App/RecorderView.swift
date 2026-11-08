@@ -436,6 +436,14 @@ struct RecorderView: View {
                     .frame(maxWidth: .infinity)
             }
 
+            if let hint = engine.logCaptureHint {
+                Text(hint)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.white.opacity(0.5))
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+            }
+
             VStack(spacing: 8) {
                 ExposureStrip(exposure: engine.exposure, accent: accent, compact: landscape, embedded: true)
                 WhiteBalanceStrip(whiteBalance: engine.whiteBalance, accent: accent, embedded: true)

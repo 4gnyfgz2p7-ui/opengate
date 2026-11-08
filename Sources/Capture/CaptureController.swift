@@ -43,6 +43,8 @@ final class CaptureController: NSObject {
         var isBayer: Bool = false
         /// 全幅是否被迫让位给系统 ISP（Bayer 转换器不可用时）
         var degradedToSystemISP: Bool = false
+        /// 其实生效的采集色彩空间（SDR / Apple Log / Apple Log 2）
+        var colorSpace: String = "SDR"
         var notes: [String] = []
 
         var resolutionText: String { "\(width)×\(height)" }
@@ -56,8 +58,8 @@ final class CaptureController: NSObject {
         /// 一行说清画面是怎么来的，界面常驻显示，避免"以为在录全幅"
         var pipelineText: String {
             if isBayer { return "Bayer 直出 · 自建管线" }
-            if degradedToSystemISP { return "系统 ISP · 非全幅" }
-            return "系统 ISP"
+            if degradedToSystemISP { return "系统 ISP · 非全幅 · \(colorSpace)" }
+            return "系统 ISP · \(colorSpace)"
         }
     }
 
@@ -100,7 +102,8 @@ final class CaptureController: NSObject {
         path: Path,
         audioEnabled: Bool,
         lockWhiteBalance: Bool = false,
-        canProcessBayer: Bool = true
+        canProcessBayer: Bool = true,
+        requestLogColorSpace: Bool = true
     ) -> Configuration {
 
         var result = Configuration()
@@ -146,11 +149,17 @@ final class CaptureController: NSObject {
             return result
         }
 
-        // ---- 设备参数：格式、帧率、白平衡、对焦 ----
+        // ---- 设备参数：格式、帧率、白平衡、对焦、色彩空间 ----
+        //
+        // RAW 档也要设：ProRes RAW 存的是线性 Bayer，但**文件元数据**里的
+        // 色彩空间决定解码器按什么曲线输出。不标 Log 2，解码出来就是
+        // `linear`（实测源文件正是 unknown/unknown/linear），画面灰平，
+        // 之后不管怎么重编码都救不回来。Apple 相机录 RAW 时同样是 Log 2 组合。
         applyDeviceSettings(
             device: device,
             format: format,
             lockWhiteBalance: lockWhiteBalance,
+            requestLogColorSpace: requestLogColorSpace,
             result: &result
         )
 
@@ -179,7 +188,9 @@ final class CaptureController: NSObject {
 
         if let code = chosen, FourCC.isBayer(code), !canProcessBayer {
             result.notes.append("Bayer 转换器不可用，改用系统 ISP 格式")
-            if let adopted = adoptProcessedFormat(device: device, output: output, result: &result) {
+            if let adopted = adoptProcessedFormat(device: device, output: output,
+                                                  requestLogColorSpace: requestLogColorSpace,
+                                                  result: &result) {
                 chosen = adopted
                 result.degradedToSystemISP = true
             }
@@ -259,6 +270,7 @@ final class CaptureController: NSObject {
     private func adoptProcessedFormat(
         device: AVCaptureDevice,
         output: AVCaptureVideoDataOutput,
+        requestLogColorSpace: Bool,
         result: inout Configuration
     ) -> OSType? {
         let current = device.activeFormat
@@ -278,6 +290,7 @@ final class CaptureController: NSObject {
                 device: device,
                 format: candidate,
                 lockWhiteBalance: false,
+                requestLogColorSpace: requestLogColorSpace,
                 result: &scratch
             )
             session.commitConfiguration()
@@ -291,10 +304,69 @@ final class CaptureController: NSObject {
         return nil
     }
 
+    // MARK: - 色彩空间
+
+    /// `AVCaptureColorSpace` 的 Apple Log 取值。
+    ///
+    /// iOS 26 起才有 `appleLog2` 这个符号，CI 上的 SDK 不一定跟得上；
+    /// 用 rawValue 构造可以绕开符号缺失。取值来自 Apple 头文件：
+    /// 0 sRGB / 1 P3_D65 / 2 HLG_BT2020 / 3 AppleLog / 4 AppleLog2。
+    static let colorSpaceAppleLog2 = AVCaptureColorSpace(rawValue: 4)
+    static let colorSpaceAppleLog = AVCaptureColorSpace(rawValue: 3)
+
+    /// 请求 Log 色彩空间。
+    ///
+    /// 必须在 `activeFormat` 生效**之后**调用：`supportedColorSpaces` 是由格式
+    /// 决定的，先配色会被旧格式的能力表挡掉。
+    ///
+    /// 设成 Log 之后系统 ISP 直接按 Apple Log 2 曲线输出画面——这就是手机端
+    /// "颜色正确"的全部来源。不需要自己解 Bayer，也不该在它后面再叠一层曲线：
+    /// 系统给的已经是场景参考的 Log 编码。
+    private func applyLogColorSpace(
+        device: AVCaptureDevice,
+        format: AVCaptureDevice.Format,
+        result: inout Configuration
+    ) {
+        let supported = format.supportedColorSpaces
+        func offers(_ cs: AVCaptureColorSpace?) -> Bool {
+            guard let cs else { return false }
+            return supported.contains { $0.rawValue == cs.rawValue }
+        }
+
+        // Log 2 优先（Apple Wide Gamut）；退一步 Apple Log（BT.2020）；
+        // 都不支持就保持系统默认，并在界面上说明，不做静默降级。
+        let target: (space: AVCaptureColorSpace, name: String)
+        if offers(Self.colorSpaceAppleLog2), let cs = Self.colorSpaceAppleLog2 {
+            target = (cs, "Apple Log 2")
+        } else if offers(Self.colorSpaceAppleLog), let cs = Self.colorSpaceAppleLog {
+            target = (cs, "Apple Log")
+        } else {
+            result.colorSpace = "SDR"
+            result.notes.append("该格式不支持 Apple Log，色彩空间保持 SDR")
+            return
+        }
+
+        if device.activeColorSpace.rawValue != target.space.rawValue {
+            device.activeColorSpace = target.space
+        }
+
+        // 读回实际值。系统在少数情况下会拒绝（例如同一设备还挂着 PhotoOutput），
+        // 拒绝时不能假装成功，否则写进容器的标签又是假的。
+        switch device.activeColorSpace.rawValue {
+        case 4: result.colorSpace = "Apple Log 2"
+        case 3: result.colorSpace = "Apple Log"
+        default: result.colorSpace = "SDR"
+        }
+        if device.activeColorSpace.rawValue != target.space.rawValue {
+            result.notes.append("色彩空间请求 \(target.name) 未生效，实际 \(result.colorSpace)")
+        }
+    }
+
     private func applyDeviceSettings(
         device: AVCaptureDevice,
         format: AVCaptureDevice.Format,
         lockWhiteBalance: Bool,
+        requestLogColorSpace: Bool,
         result: inout Configuration
     ) {
         do {
@@ -302,6 +374,11 @@ final class CaptureController: NSObject {
 
             if device.activeFormat != format {
                 device.activeFormat = format
+            }
+
+            // 格式生效之后再配色：supportedColorSpaces 跟着 activeFormat 走
+            if requestLogColorSpace {
+                applyLogColorSpace(device: device, format: format, result: &result)
             }
 
             // 精确 24.000：分子分母都用整数，不取 1001/24000

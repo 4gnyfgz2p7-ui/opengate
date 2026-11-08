@@ -287,7 +287,10 @@ final class RawTranscoder {
                 height: height,
                 metadata: metadata,
                 withAudio: audioTrack != nil,
-                appleLog2: false,
+                // 源 RAW 的像素由系统解码器按 Apple Log 2 输出，转出来的
+                // HEVC 必须带上同样的标记，否则 NLE 会拿 SDR 曲线去解释
+                // 一段 Log 数据，画面直接发白。
+                appleLog2: true,
                 // 沿用源的显示矩阵：竖拍时录下来的是横置画面 + 旋转标记，
                 // 转码不带上它，成片方向就反了。
                 videoTransform: videoTrack?.preferredTransform ?? .identity,

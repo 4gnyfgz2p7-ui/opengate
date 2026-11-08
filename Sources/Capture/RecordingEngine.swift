@@ -805,19 +805,26 @@ final class RecordingEngine: ObservableObject {
                 ? MovieRecorder.makeOutputURL(tier: selectedTier, date: startedAt)
                 : outputURL
 
+            // 颜色链路标记：中转录制是系统转码出来的，不能再标成
+            // bayer12-demosaic-rec709——那是自研解包时代的产物。
+            // 直录时按**实际生效**的色彩空间写，而不是按请求写：
+            // 设备不支持 Log 时会掉回 SDR，标签必须跟着真实情况。
+            let colorPipelineName: String = {
+                if relay { return "system-raw-pipeline" }
+                if selectedTier.isRawBayer { return "proresraw-bayer-passthrough" }
+                switch self.captureConfiguration?.colorSpace {
+                case "Apple Log 2": return "apple-log2-system-isp"
+                case "Apple Log": return "apple-log-system-isp"
+                default: return "system-isp-sdr"
+                }
+            }()
+
             let context = MovieMetadata.RecordingContext(
                 tier: recordingTier,
                 width: width,
                 height: height,
                 frameRate: VideoSettingsBuilder.frameRate,
-                // 颜色链路标记：中转录制最终是系统转码出来的，
-                // 不能再标成 bayer12-demosaic-rec709——那是自研解包时代的产物，
-                // 日志和成片元数据会互相矛盾。
-                colorPipeline: relay
-                    ? "system-raw-pipeline"
-                    : (selectedTier.isRawBayer
-                        ? "proresraw-bayer-passthrough"
-                        : "system-isp-sdr"),
+                colorPipeline: colorPipelineName,
                 audioDescription: AudioSettings.description,
                 locationOutcome: locationOutcome,
                 startedAt: startedAt,
@@ -834,7 +841,10 @@ final class RecordingEngine: ObservableObject {
                     height: height,
                     metadata: metadata,
                     withAudio: self.captureConfiguration?.audioEnabled ?? false,
-                    appleLog2: false,
+                    // RAW 存的是未解码的 Bayer，没有色彩空间可标；
+                    // 其余档都由系统 ISP 按 Apple Log 2 输出，标记必须跟上，
+                    // 否则容器里写的是 SDR、像素是 Log。
+                    appleLog2: !recordingTier.isRawBayer,
                     videoTransform: CGAffineTransform(rotationAngle: degrees * .pi / 180),
                     rawSettings: rawSettings,
                     rawMetadata: rawMetadata
@@ -1140,7 +1150,16 @@ final class RecordingEngine: ObservableObject {
     /// 档位旁的一行小字：画面从哪来、多大
     var formatBadge: String {
         guard let config = captureConfiguration else { return "—" }
-        return "\(config.width)×\(config.height) · \(config.pixelFormat)"
+        // 色彩空间必须和分辨率写在同一行：录 Log 时取景框是灰的，
+        // 光看画面会以为曝光坏了，这里直接说明是哪种 Log。
+        let space = config.colorSpace == "SDR" ? "" : " · \(config.colorSpace)"
+        return "\(config.width)×\(config.height) · \(config.pixelFormat)\(space)"
+    }
+
+    /// 录 Log 时给出的一句解释，常驻待机面板
+    var logCaptureHint: String? {
+        guard let space = captureConfiguration?.colorSpace, space != "SDR" else { return nil }
+        return "\(space) 画面偏灰是正常的：曲线是场景参考的，调色时套 LUT 还原"
     }
 
     var audioSummary: String {

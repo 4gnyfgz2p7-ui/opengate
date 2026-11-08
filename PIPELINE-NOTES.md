@@ -737,3 +737,73 @@ Bayer/YUV 要少一个数量级的出错面。
 比研究它的字节布局更划算。
 
 `pf=` 这个字段早该打进日志——没有它，一直在假设"拿到的是 bp16"。
+
+---
+
+## 十七、Apple Log 2 的容器标记：官方是 9 / 2 / 9，不是 9 / 2 / 1（2026-11-08）
+
+本地转码链路（Bayer → Apple Wide Gamut → Log 曲线）在像素层早已自洽，
+闭环验证的两条路径差 ≤1.1 码。真正的漏洞在**容器标记**这一层——它不改变
+画面，但决定播放器 / NLE 怎么解释画面。
+
+### 查到的事实
+
+Apple 未公开 Log 的 nclc 编码，但 iPhone 相机原片的字节是可查的。
+LogForge 项目对 iPhone 15 Pro Max 原片做过逐 atom 比对，结论：
+
+| 字段 | 官方值 | 含义 |
+|---|---|---|
+| `colr` / `nclc` primaries | **9** | BT.2020（Apple Wide Gamut 无编码，取最接近的标准值） |
+| `colr` / `nclc` transfer | **2** | unspecified（Log 曲线没有标准传输函数编码） |
+| `colr` / `nclc` matrix | **9** | BT.2020 non-constant |
+| `logs` 子 atom | `com.apple.rec2020.apple-log` | 35 字节，Apple 私有 Log 标识 |
+| 量程 | **video (tv)** | 10-bit 名义 Y 64–940 |
+
+`logs` 是关键：DaVinci Resolve 20.3.2.9 的托管导入**只靠这一个 atom**
+就能自动识别 Apple Log，不需要手动设 CST。没有它，用户每次都要手点。
+
+### 之前这一版错在哪
+
+被推翻的旧版是 `colr = 9 / 2 / 1` + `full range`：
+
+- **matrix 写成 1（BT.709）**：而编码时 ffmpeg 用 `-colorspace bt709`，
+  数据与标记自洽、往返 MAE 只有 1.4 码——所以**本地验证查不出来**。
+  它错在"没有按 wide gamut 素材的惯例声明"，Resolve 会按 709 矩阵解
+  BT.2020 原色，色度坐标对不上。
+- **full range**：数据没错，但与 Apple 官方（video range）不一致。
+  老工具忽略 VUI 时会把 full range 当 video 解，画面被压对比。
+- **缺 `logs`**：Resolve 不认。
+
+### 修正后的实测
+
+| 项 | 值 |
+|---|---|
+| colr | `9 / 2 / 9` |
+| logs | `com.apple.rec2020.apple-log` |
+| 像素 | HEVC Main10 / hvc1 / yuv420p10le / **tv** / BT.2020 |
+| 成片解码 vs 算法 | MAE **1.02 码**，通道偏移 ≤0.04 码 |
+| 新旧两版互比 | MAE 1.40 码（纯编码量化） |
+| 18% 灰 | 0.488272 → video 码 492 |
+| 中位落点 | 0.4870 → 491（差 −1） |
+| 曲线可逆 | 2.4e-07 |
+| 裁切 | 0.00% |
+
+### ffmpeg 不写 colr，得自己补
+
+无论 `-movflags` 怎么配，ffmpeg 的 mov muxer 在纯编码路径里都不写
+`colr` atom（`-c copy` 才从源继承）。`logs` 更是私有格式。所以两项
+都由 `tools/movtag.py` 直接改容器字节：重建 stsd 里的视频 sample
+entry，追加 `colr` + `logs`，再逐级回填祖先 box 的 size；若 `mdat`
+在插入点之后，同步修正 `stco` / `co64` 的每个 chunk offset。
+
+### 工具
+
+```
+tools/opengate_log2.py     完整算法（probe / transcode / tag-only / 自检）
+tools/movtag.py            MOV 标记注入
+tools/转AppleLog2.bat      拖放即用
+```
+
+`probe` 会读 aprn 帧头（白点 65520、黑 256、BayerPattern、ColorMatrix、
+GainFactor、CCT 5555K），`transcode` 自动把 BayerPattern 3→0 再解，
+不必手工 patch。
