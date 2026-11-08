@@ -223,6 +223,12 @@ final class RecordingEngine: ObservableObject {
     }
 
     private let recorderBox = RecorderBox()
+
+    /// 中转任务：录制时落 ProRes RAW，停止后转成用户选的档位。
+    /// 记下临时文件与最终目标，成功后删临时文件，失败则保留素材。
+    private var relayPending: (raw: URL, final: URL, tier: QualityTier)?
+    /// 中转用的元数据在开录时生成一次，转码时复用，避免丢失拍摄信息
+    private var relayMetadata: [AVMetadataItem] = []
     private var recordingStart: Date?
     private var tickTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
@@ -713,6 +719,19 @@ final class RecordingEngine: ObservableObject {
         refreshWhiteBalanceGains()
 
         let selectedTier = tier
+        // 颜色链路：不再用自研 btp2 解包。
+        //
+        // 相机给的是 btp2 私有打包，自研解包与官方解码始终对不上
+        // （偶/奇位比实测 0.762 vs 官方 1.106，均值差 2.8 倍），
+        // 换十几版判据都没找到正确位序。这里改成先按 ProRes RAW 录：
+        // 写入器内部用的是 Apple 自己的解包，已在成片上验证正确；
+        // 停止后再用 VideoToolbox 解回 bp16（每 sensel 一个 16-bit 值，
+        // 不需解包，相位由 buffer attachment 声明），走已验证的色彩管线
+        // 重新编码成用户选的档位。
+        //
+        // 代价是临时空间与一次转码等待，换来的是颜色由 Apple 解码器保证。
+        let relay = !selectedTier.isRawBayer && captureConfiguration?.isBayer == true
+        let recordingTier: QualityTier = relay ? .proResRAW : selectedTier
         let width = Int(captureConfiguration?.width ?? 4224)
         let height = Int(captureConfiguration?.height ?? 3024)
         // 角度在按下的瞬间定格：录制中转向不应改变已写文件的显示矩阵
@@ -732,7 +751,7 @@ final class RecordingEngine: ObservableObject {
 
             // ---- 步骤 2：空间检查 ----
             self.state = .preparing("正在检查存储…")
-            if let spaceError = MovieRecorder.preflightSpaceCheck(tier: selectedTier) {
+            if let spaceError = MovieRecorder.preflightSpaceCheck(tier: recordingTier) {
                 self.state = .failed(spaceError.localizedDescription)
                 return
             }
@@ -745,7 +764,7 @@ final class RecordingEngine: ObservableObject {
             // 已启动的会话里取，而且失败原因能直接报给用户，不用等录完发现 0 字节。
             var rawSettings: [String: Any]?
             var rawMetadata: [AVMetadataItem]?
-            if selectedTier.isRawBayer {
+            if recordingTier.isRawBayer {
                 let prep = self.capture.prepareProResRAW()
                 if let reason = prep.reason {
                     self.state = .failed("ProRes RAW 无法开录：\(reason)")
@@ -756,10 +775,13 @@ final class RecordingEngine: ObservableObject {
             }
 
             let startedAt = Date()
-            let outputURL = MovieRecorder.makeOutputURL(tier: selectedTier, date: startedAt)
+            let outputURL = MovieRecorder.makeOutputURL(tier: recordingTier, date: startedAt)
+            let finalURL = relay
+                ? MovieRecorder.makeOutputURL(tier: selectedTier, date: startedAt)
+                : outputURL
 
             let context = MovieMetadata.RecordingContext(
-                tier: selectedTier,
+                tier: recordingTier,
                 width: width,
                 height: height,
                 frameRate: VideoSettingsBuilder.frameRate,
@@ -779,7 +801,7 @@ final class RecordingEngine: ObservableObject {
             do {
                 let recorder = try MovieRecorder(
                     outputURL: outputURL,
-                    tier: selectedTier,
+                    tier: recordingTier,
                     width: width,
                     height: height,
                     metadata: metadata,
@@ -790,6 +812,10 @@ final class RecordingEngine: ObservableObject {
                     rawMetadata: rawMetadata
                 )
                 self.recorderBox.set(recorder)
+                self.relayPending = relay
+                    ? (raw: outputURL, final: finalURL, tier: selectedTier)
+                    : nil
+                self.relayMetadata = metadata
             } catch {
                 self.state = .failed(error.localizedDescription)
                 return
@@ -817,7 +843,57 @@ final class RecordingEngine: ObservableObject {
                 return
             }
             self.recorderBox.set(nil)
-            let outcome = await recorder.finish()
+            var outcome = await recorder.finish()
+
+            // ---- 中转：把刚录的 ProRes RAW 转成用户选的档位 ----
+            if let relay = self.relayPending {
+                self.relayPending = nil
+                let metadata = self.relayMetadata
+                self.state = .finishing
+                do {
+                    let result = try await Task.detached(priority: .userInitiated) {
+                        try RawTranscoder.run(
+                            rawURL: relay.raw,
+                            outputURL: relay.final,
+                            tier: relay.tier,
+                            metadata: metadata
+                        )
+                    }.value
+                    // 转码成功才删临时文件；失败保留，素材不能丢
+                    try? FileManager.default.removeItem(at: relay.raw)
+                    outcome = MovieRecorder.Outcome(
+                        url: relay.final,
+                        tier: relay.tier,
+                        duration: outcome.duration,
+                        fileSize: MovieRecorder.fileSize(at: relay.final),
+                        writtenVideoFrames: Int64(result.frames),
+                        droppedVideoFrames: Int64(result.dropped),
+                        writtenAudioBuffers: Int64(result.audioBuffers),
+                        discardedAudioBuffers: 0,
+                        effectiveFrameRate: outcome.effectiveFrameRate,
+                        averageWriteRateMBps: Double(result.frames) / max(result.elapsed, 0.001),
+                        finishedCleanly: true,
+                        note: "官方解码中转 · \(result.probe) · \(result.gains)"
+                    )
+                } catch {
+                    // 失败时把 RAW 交回给用户，并把原因写进记录
+                    outcome = MovieRecorder.Outcome(
+                        url: relay.raw,
+                        tier: .proResRAW,
+                        duration: outcome.duration,
+                        fileSize: MovieRecorder.fileSize(at: relay.raw),
+                        writtenVideoFrames: outcome.writtenVideoFrames,
+                        droppedVideoFrames: outcome.droppedVideoFrames,
+                        writtenAudioBuffers: outcome.writtenAudioBuffers,
+                        discardedAudioBuffers: outcome.discardedAudioBuffers,
+                        effectiveFrameRate: outcome.effectiveFrameRate,
+                        averageWriteRateMBps: outcome.averageWriteRateMBps,
+                        finishedCleanly: outcome.finishedCleanly,
+                        note: "转码失败，已保留 ProRes RAW：\(error.localizedDescription)"
+                    )
+                }
+            }
+
             self.history.insert(outcome, at: 0)
             self.state = .finished
             self.refreshWrittenBytes()

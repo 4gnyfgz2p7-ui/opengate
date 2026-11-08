@@ -130,6 +130,11 @@ final class BayerCalibration {
     ) -> Double {
         switch mode {
 
+        case 15:    // bp16：系统解码输出，每个 sensel 一个 16-bit 小端值
+            // 逐字节取，避开未对齐指针问题。高 12 位有效。
+            let p = row + x * 2
+            return Double((UInt16(p[0]) | (UInt16(p[1]) << 8)) >> 4)
+
         case 0:     // 8px/12B，偶像素取低半字节的高位
             let g = x >> 3
             let k = x & 7

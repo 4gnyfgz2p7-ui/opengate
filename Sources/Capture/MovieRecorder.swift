@@ -110,7 +110,8 @@ final class MovieRecorder {
         appleLog2: Bool,
         videoTransform: CGAffineTransform = .identity,
         rawSettings: [String: Any]? = nil,
-        rawMetadata: [AVMetadataItem]? = nil
+        rawMetadata: [AVMetadataItem]? = nil,
+        realTime: Bool = true
     ) throws {
 
         self.outputURL = outputURL
@@ -148,7 +149,7 @@ final class MovieRecorder {
                 throw RecorderError.videoInputRejected("canApply 拒绝系统给出的 RAW 设置")
             }
             let candidate = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-            candidate.expectsMediaDataInRealTime = true
+            candidate.expectsMediaDataInRealTime = realTime
             candidate.transform = videoTransform
             guard writer.canAdd(candidate) else {
                 throw RecorderError.videoInputRejected("canAdd 拒绝 RAW 视频轨，输出文件类型 \(tier.fileType.rawValue)")
@@ -175,7 +176,7 @@ final class MovieRecorder {
                 guard writer.canApply(outputSettings: settings, forMediaType: .video) else { continue }
 
                 let candidate = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-                candidate.expectsMediaDataInRealTime = true
+                candidate.expectsMediaDataInRealTime = realTime
                 // 拍摄方向只作为显示矩阵写入容器，**不旋转像素**。
                 // 4224×3024 是传感器原生画幅，旋转像素要么改变实际存储尺寸，
                 // 要么引入一次全画幅重采样，与「全幅不裁切、不改几何」冲突。
@@ -215,7 +216,7 @@ final class MovieRecorder {
             let aSettings = AudioSettings.writerSettings
             if writer.canApply(outputSettings: aSettings, forMediaType: .audio) {
                 let aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: aSettings)
-                aInput.expectsMediaDataInRealTime = true
+                aInput.expectsMediaDataInRealTime = realTime
                 if writer.canAdd(aInput) {
                     writer.add(aInput)
                     audioInput = aInput

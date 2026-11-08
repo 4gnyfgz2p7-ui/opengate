@@ -1,0 +1,256 @@
+import Foundation
+import AVFoundation
+import VideoToolbox
+import CoreVideo
+
+/// 用系统的 ProRes RAW 解码器把 .mov 解成 16-bit Bayer。
+///
+/// ## 为什么改走这条路
+///
+/// 采集时相机给的是 `btp2`——2 像素 3 字节的私有打包，Apple 没有公开文档。
+/// 自己解包反复对不上：同一场景下自研解包算出的偶/奇位比是 0.762，
+/// 官方解码是 1.106，均值差 2.8 倍。换了十几版判据都没找到正确位序，
+/// 因为判据奖励「人为制造相关性」的排法，原理性缺陷注定选错。
+///
+/// 但系统自己有一条完全正确的路。ProRes RAW 写入器接受 btp2 并产出合规
+/// 文件（Apple 官方解码器已验证：宽高、黑电平、色彩矩阵、CCT 全部合规），
+/// 再用 VideoToolbox 把它解回来，输出就是
+/// `kCVPixelFormatType_16VersatileBayer`（'bp16'）——
+/// **每个 sensel 一个 16-bit 值，不需要解包**，排布信息还通过
+/// buffer attachment 一并给出。
+///
+/// 代价是离线：必须先有 ProRes RAW 文件，不能边录边出。
+final class ProResRAWReader {
+
+    enum ReaderError: LocalizedError {
+        case noVideoTrack
+        case readerRejected(String)
+        case cannotStart(String)
+        case sessionCreate(OSStatus)
+        case decode(OSStatus)
+        case unexpectedFormat(String)
+        case timeout
+
+        var errorDescription: String? {
+            switch self {
+            case .noVideoTrack:
+                return "文件里没有视频轨"
+            case .readerRejected(let detail):
+                return "读取器拒绝该轨道：\(detail)"
+            case .cannotStart(let detail):
+                return "读取器无法启动：\(detail)"
+            case .sessionCreate(let status):
+                return "解码会话创建失败（OSStatus \(status)）"
+            case .decode(let status):
+                return "解码失败（OSStatus \(status)）"
+            case .unexpectedFormat(let detail):
+                return "解码输出格式不符：\(detail)"
+            case .timeout:
+                return "解码超时"
+            }
+        }
+    }
+
+    /// 首帧的自检信息。写进诊断，用来确认系统到底给了什么。
+    struct Probe {
+        var width = 0
+        var height = 0
+        var rowBytes = 0
+        var pixelFormat = "—"
+        /// buffer attachment 里声明的排布，0=RGGB 1=BGGR 2=GRBG 3=GBRG
+        var bayerPattern: Int?
+        /// 原始样本的最小/最大/均值（16-bit 域）
+        var minValue = 0
+        var maxValue = 0
+        var meanValue = 0
+        /// 首行前 12 个值，方便和 PC 端解码结果逐点对账
+        var firstValues: [Int] = []
+        var note = ""
+
+        var summary: String {
+            var text = "\(width)×\(height) rb=\(rowBytes) pf=\(pixelFormat)"
+            text += " pat=\(bayerPattern.map(String.init) ?? "—")"
+            text += " v=\(minValue)…\(maxValue)/\(meanValue)"
+            if !firstValues.isEmpty {
+                text += " head=\(firstValues.prefix(8).map(String.init).joined(separator: ","))"
+            }
+            if !note.isEmpty { text += " note=\(note)" }
+            return text
+        }
+    }
+
+    /// 解码一整个文件（或前 `limit` 帧）。
+    ///
+    /// `onFrame` 返回 false 表示调用方要求提前停止。抛错即中断。
+    /// 返回实际解码帧数与首帧自检信息。
+    @discardableResult
+    static func decode(
+        url: URL,
+        limit: Int = .max,
+        probeFrames: Int = 0,
+        onFrame: (CVPixelBuffer, CMTime, Int) throws -> Bool
+    ) throws -> (count: Int, probe: Probe?) {
+
+        let asset = AVURLAsset(url: url)
+        let tracks = asset.tracks(withMediaType: .video)
+        guard let track = tracks.first else { throw ReaderError.noVideoTrack }
+
+        let reader: AVAssetReader
+        do {
+            reader = try AVAssetReader(asset: asset)
+        } catch {
+            throw ReaderError.cannotStart(error.localizedDescription)
+        }
+
+        // outputSettings 传 nil = 只要压缩样本，不做解码。
+        // 让 AVAssetReader 直接给 bp16 是行不通的：它不接受这个像素格式，
+        // 必须自己接 VTDecompressionSession。
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else {
+            throw ReaderError.readerRejected("canAdd 为 false")
+        }
+        reader.add(output)
+        guard reader.startReading() else {
+            throw ReaderError.cannotStart(reader.error?.localizedDescription ?? "未知原因")
+        }
+
+        var session: VTDecompressionSession?
+        defer {
+            if let session { VTDecompressionSessionInvalidate(session) }
+            reader.cancelReading()
+        }
+
+        var count = 0
+        var probe: Probe?
+
+        while let sample = output.copyNextSampleBuffer() {
+            guard let format = CMSampleBufferGetFormatDescription(sample) else { continue }
+
+            if session == nil {
+                // 只要 bp16。这是 ProRes RAW 的「全尺寸解码」输出：
+                // 单平面、16-bit little-endian、每个 sensel 一个样本。
+                let attributes: [CFString: Any] = [
+                    kCVPixelBufferPixelFormatTypeKey: BayerConverter.planar16Format,
+                ]
+                var created: VTDecompressionSession?
+                let status = VTDecompressionSessionCreate(
+                    allocator: kCFAllocatorDefault,
+                    formatDescription: format,
+                    decoderSpecification: nil,
+                    imageBufferAttributes: attributes as CFDictionary,
+                    outputCallback: nil,
+                    decompressionSessionOut: &created
+                )
+                guard status == noErr, let created else {
+                    throw ReaderError.sessionCreate(status)
+                }
+                session = created
+            }
+            guard let session else { break }
+
+            var decoded: CVPixelBuffer?
+            var decodeStatus: OSStatus = noErr
+            let semaphore = DispatchSemaphore(value: 0)
+
+            let submit = VTDecompressionSessionDecodeFrame(
+                session,
+                sampleBuffer: sample,
+                flags: [],
+                infoFlagsOut: nil
+            ) { status, _, imageBuffer, _, _ in
+                decodeStatus = status
+                decoded = imageBuffer
+                semaphore.signal()
+            }
+            guard submit == noErr else { throw ReaderError.decode(submit) }
+            guard semaphore.wait(timeout: .now() + 20) == .success else {
+                throw ReaderError.timeout
+            }
+            guard decodeStatus == noErr else { throw ReaderError.decode(decodeStatus) }
+            guard let buffer = decoded else { continue }
+
+            if probe == nil {
+                probe = inspect(buffer)
+            }
+
+            count += 1
+            let keepGoing = try onFrame(buffer, CMSampleBufferGetPresentationTimeStamp(sample), count)
+            if !keepGoing { break }
+            if count >= limit { break }
+        }
+
+        if probe == nil, reader.status == .failed {
+            throw ReaderError.cannotStart(reader.error?.localizedDescription ?? "读取中断")
+        }
+        return (count, probe)
+    }
+
+    /// 系统在 buffer attachment 里声明的 Bayer 排布。
+    /// 这是 bp16 相比 btp2 最省事的一点：相位不用猜，解码器直接告诉。
+    static func declaredPattern(of buffer: CVPixelBuffer) -> Int32? {
+        guard let attachments = CVBufferCopyAttachments(buffer, .shouldPropagate) as? [String: Any] else {
+            return nil
+        }
+        for key in ["ProResRAW_BayerPattern", "BayerPattern", "kCVImageBufferBayerPatternKey"] {
+            if let value = attachments[key] as? Int { return Int32(value) }
+            if let value = attachments[key] as? NSNumber { return Int32(value.intValue) }
+        }
+        return nil
+    }
+
+    /// 读首帧的实际形态：尺寸、行字节、排布声明、值域。
+    private static func inspect(_ buffer: CVPixelBuffer) -> Probe {
+        var probe = Probe()
+        probe.width = CVPixelBufferGetWidth(buffer)
+        probe.height = CVPixelBufferGetHeight(buffer)
+        probe.rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+        probe.pixelFormat = fourCC(CVPixelBufferGetPixelFormatType(buffer))
+        probe.bayerPattern = declaredPattern(of: buffer).map(Int.init)
+
+        if probe.bayerPattern == nil,
+           let attachments = CVBufferCopyAttachments(buffer, .shouldPropagate) as? [String: Any] {
+            probe.note = "attachments=" + attachments.keys.sorted().prefix(4).joined(separator: ",")
+        }
+
+        if CVPixelBufferGetPixelFormatType(buffer) == BayerConverter.planar16Format {
+            CVPixelBufferLockBaseAddress(buffer, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+            if let base = CVPixelBufferGetBaseAddress(buffer) {
+                let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+                let row = base.assumingMemoryBound(to: UInt16.self)
+                let rowStride = rowBytes / 2
+                var low = Int(UInt16.max)
+                var high = 0
+                var total: Int64 = 0
+                var samples = 0
+                for y in stride(from: 0, to: probe.height, by: 7) {
+                    let line = row.advanced(by: y * rowStride)
+                    for x in stride(from: 0, to: probe.width, by: 5) {
+                        let value = Int(line[x])
+                        if value < low { low = value }
+                        if value > high { high = value }
+                        total += Int64(value)
+                        samples += 1
+                    }
+                }
+                probe.minValue = low
+                probe.maxValue = high
+                probe.meanValue = samples > 0 ? Int(total / Int64(samples)) : 0
+                probe.firstValues = (0..<min(12, probe.width)).map { Int(row[$0]) }
+            }
+        } else {
+            probe.note = "非 bp16，系统没有按请求给格式"
+        }
+        return probe
+    }
+
+    private static func fourCC(_ code: OSType) -> String {
+        let bytes = [
+            UInt8((code >> 24) & 0xFF), UInt8((code >> 16) & 0xFF),
+            UInt8((code >> 8) & 0xFF), UInt8(code & 0xFF),
+        ]
+        let text = String(bytes: bytes, encoding: .ascii) ?? ""
+        return text.allSatisfy { $0.isLetter || $0.isNumber } ? text : String(code)
+    }
+}

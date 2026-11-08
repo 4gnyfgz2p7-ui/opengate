@@ -29,6 +29,13 @@ final class BayerConverter {
         var blueGain: Float = 1
         /// 0=RGGB 1=BGGR 2=GRBG 3=GBRG
         var pattern: Int32 = 0
+        /// 源是 `bp16`（系统 ProRes RAW 解码输出）而不是 `btp2`。
+        ///
+        /// 两者差别是根本性的：`btp2` 需要自己解包、自己猜位序和相位，
+        /// 而 `bp16` 每个 sensel 一个 16-bit 值，相位由系统在 buffer
+        /// attachment 里声明。所以这条路上**不做设备端标定**，
+        /// 相位与白平衡全部由调用方给定。
+        var planar16: Bool = false
     }
 
     /// 一次转换的自检结果。直接读数，不猜。
@@ -86,9 +93,17 @@ final class BayerConverter {
     }
 
     static let bayerFormat: OSType = FourCC.code("btp2")
+    /// 系统 ProRes RAW 解码器的输出（'bp16'）。
+    /// 用 FourCC 构造而不引用 `kCVPixelFormatType_16VersatileBayer` 常量：
+    /// 后者在部分 SDK 版本里没有 Swift 符号，直接用字符串更稳。
+    static let planar16Format: OSType = FourCC.code("bp16")
     static let outputFormat: OSType = kCVPixelFormatType_32BGRA
     /// 供外部（写入端）判断该走哪条追加路径
     static func isBayer(_ format: OSType) -> Bool { format == bayerFormat }
+    /// bp16 是否可被本转换器直接消费
+    static func accepts(_ format: OSType) -> Bool {
+        format == bayerFormat || format == planar16Format
+    }
 
     private let device: MTLDevice
     private let queue: MTLCommandQueue
@@ -155,8 +170,9 @@ final class BayerConverter {
     ) -> CVPixelBuffer? {
         lastFailureStage = nil
 
-        guard CVPixelBufferGetPixelFormatType(source) == Self.bayerFormat else {
-            lastFailureStage = "源不是 btp2"
+        let sourceFormat = CVPixelBufferGetPixelFormatType(source)
+        guard sourceFormat == Self.bayerFormat || sourceFormat == Self.planar16Format else {
+            lastFailureStage = "源既不是 btp2 也不是 bp16"
             return nil
         }
 
@@ -235,7 +251,10 @@ final class BayerConverter {
 
         // 第一帧把解包方式与 Bayer 相位定下来：取错排法不会报错，
         // 只会得到一张浮雕状的图，靠肉眼看是猜不出来的。
-        if calibration == nil {
+        // bp16 跳过标定：数据已经是每个 sensel 一个值，既没有位序要猜，
+        // 相位也由系统在 buffer attachment 里声明。再跑一遍排法搜索只会
+        // 把系统给的正确答案覆盖掉——这正是 btp2 时代反复出错的地方。
+        if !parameters.planar16, calibration == nil {
             calibration = BayerCalibration.run(
                 base: sourceBase,
                 rowBytes: sourceRowBytes,
@@ -253,7 +272,7 @@ final class BayerConverter {
 
         // 用标定选中的排法读第一行前 16 个像素：这串数字直接反映解包对不对
         //（正确排法下相邻值应在同一量级；错了会看到 10 倍以上的交替）
-        let activeMode = Int(calibration?.unpackMode ?? 0)
+        let activeMode = parameters.planar16 ? 15 : Int(calibration?.unpackMode ?? 0)
         let headRow = headPointer
         for x in 0..<min(16, width) {
             let sample = BayerCalibration.unpack(headRow, x, mode: activeMode)
@@ -266,10 +285,16 @@ final class BayerConverter {
         var redGain = parameters.redGain
         var greenGain = parameters.greenGain
         var blueGain = parameters.blueGain
-        if let calibrated = calibration {
+        var activePattern = parameters.pattern
+        var activeUnpack: Int32 = parameters.planar16 ? 15 : 0
+        if parameters.planar16 {
+            // bp16：调用方给的相位与增益直接生效，不被标定覆盖
+        } else if let calibrated = calibration {
             redGain = calibrated.whiteBalanceRed
             greenGain = 1
             blueGain = calibrated.whiteBalanceBlue
+            activePattern = calibrated.pattern
+            activeUnpack = calibrated.unpackMode
         }
         let floats = [parameters.blackLevel, parameters.whiteLevel,
                       redGain, greenGain, blueGain]
@@ -281,8 +306,8 @@ final class BayerConverter {
         for (index, value) in floats.enumerated() {
             slots[4 + index] = value.bitPattern
         }
-        slots[9] = UInt32(bitPattern: calibration?.pattern ?? parameters.pattern)
-        slots[10] = UInt32(bitPattern: calibration?.unpackMode ?? 0)
+        slots[9] = UInt32(bitPattern: activePattern)
+        slots[10] = UInt32(bitPattern: activeUnpack)
         slots.withUnsafeBytes { memcpy(paramsBuffer.contents(), $0.baseAddress, 44) }
         memset(probeBuffer.contents(), 0, 32)
 
@@ -457,6 +482,16 @@ final class BayerConverter {
     // 排法由 CPU 侧标定后通过 p[10] 传进来（见 BayerCalibration.unpack），
     // 这里逐分支复刻同样的规则，保证两边算出同一个数。
     inline ushort ac_raw12(const device uchar* base, uint rowBytes, int x, int y, int mode) {
+        if (mode == 15) {
+            // bp16：系统 ProRes RAW 解码器的输出。
+            //
+            // 单平面、16-bit little-endian、**每个 sensel 一个样本**，
+            // 也就是说根本不需要解包——这正是绕开 btp2 私有打包的意义。
+            // 高 12 位是有效值，与 ffmpeg 的 bayer_rggb16le 同构，
+            // 所以后面的扣黑、白平衡、矩阵全部可以照用。
+            const device ushort* line = (const device ushort*)(base + uint(y) * rowBytes);
+            return ushort(line[x] >> 4);
+        }
         const device uchar* row = base + uint(y) * rowBytes;
 
         if (mode == 0) {
