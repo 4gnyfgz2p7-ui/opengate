@@ -53,8 +53,10 @@ final class BayerCalibration {
         var whiteLevel: Double = 4095
         /// 选中排法的平均总变差（诊断用）
         var bestVariation: Double = 0
-        /// 各排法的 mod-8 同色方差，最小者即选中
+        /// 各排法的 mod-8 同色方差。只作历史对照，不参与选择
         var modePeriodicities: [Double] = []
+        /// 各排法的相邻差均值，最小者即选中（真正的主判据）
+        var modeCross: [Double] = []
 
         var summary: String {
             let patterns = ["RGGB", "BGGR", "GRBG", "GBRG"]
@@ -72,6 +74,11 @@ final class BayerCalibration {
             text += String(format: "·bw%.0f/%.0f", blackLevel, whiteLevel)
             text += "·dev" + patterns[Int(max(0, min(3, devicePattern)))]
             text += String(format: "·tv%.4f", bestVariation)
+            if !modeCross.isEmpty {
+                // 各排法的相邻差均值，最小者即选中。真实数据上的分离度约 14 倍
+                let list = modeCross.map { $0.isFinite ? String(format: "%.0f", min($0, 9999)) : "x" }
+                text += "·cx" + list.joined(separator: "/")
+            }
             if !modePeriodicities.isEmpty {
                 let list = modePeriodicities.map { String(format: "%.2f", min($0, 9.99)) }
                 text += "·p" + list.joined(separator: "/")
@@ -188,6 +195,19 @@ final class BayerCalibration {
         }
     }
 
+    /// 并列时的固定优先级：9 最优先，其次 10，其余按编号。
+    ///
+    /// 9 与 10 只差「低 4 位归偶数像素还是奇数像素」，对图像的影响上限
+    /// 15/4095 ≈ 0.4%，肉眼不可分。但两者必须固定其一，否则同一场景
+    /// 前后两次录制可能各选一个，检查时容易被这 0.4% 误导成"又变了"。
+    static func rank(_ mode: Int) -> Int {
+        switch mode {
+        case 9: return 0
+        case 10: return 1
+        default: return 2 + mode
+        }
+    }
+
     // MARK: - 标定
 
     static func run(
@@ -257,17 +277,14 @@ final class BayerCalibration {
             ratios[mode] = sameDiff[mode] / crossDiff[mode]
         }
 
-        // ---- 第二关：mod-8 同色位置一致性 ----
+        // ---- mod-8 同色位置一致性：只作诊断，不参与选择 ----
         //
-        // 这是真正能定死的判据。同一行里第 0/2/4/6 个像素落在同一片滤光片上，
-        // 正确排法下这四个位置的均值必须彼此接近；错排会把不同来源的字节
-        // 混进来，四组均值立刻散开。
-        //
-        // 实测（按 mode 9 打包的合成场景）：
-        //   mode 9 = 0.0002、mode 10 = 0.0002、mode 2 = 0.0017、
-        //   mode 3 = 0.0146、mode 6 = 0.93、mode 0/1 = 0.91
-        // 分离度 5000 倍。相比之下总变差完全不够——mode 6 和 mode 9 只差
-        // 0.25%，因为 4px/6B 每四个像素恰有两个取对，画面看起来"也算平滑"。
+        // 这个指标在 8px/12B 那套排法上曾经很有效，但对 2px/3B 完全失效：
+        // 2px/3B 的错排会把某个字节的噪声当成高 8 位，而噪声在成千上万个
+        // 样本上求均值会收敛到同一个数——四个槽位的均值反而彼此相等，
+        // 同色方差被判成 0，于是六种排法并列 0.00，谁也没赢。
+        // 0.5.21 的实测就是这么选中 mode 2 的（诊断里 p 全为 0.00）。
+        // 留着只为对照历史，决策一律看上面的相邻差。
         var mod8Sums = [[Double]](repeating: [Double](repeating: 0, count: 8), count: candidateCount)
         var mod8Rows = 0.0
         var sampleRow = step
@@ -313,15 +330,43 @@ final class BayerCalibration {
             }
         }
 
-        // 选排法：mod-8 同色方差最小
-        var bestMode = 0
-        var bestPeriodicity = Double.greatestFiniteMagnitude
+        // ---- 选排法：相邻像素差最小 ----
+        //
+        // 真实数据给出了明确分离。用 0.5.21 成片里存的原始字节跑全部十一种：
+        //
+        //   mode 9  = 107      ← 正确（双高字节 + 低位容器）
+        //   mode 10 = 110
+        //   mode 6  = 458
+        //   mode 0/1/7 ≈ 975
+        //   mode 8  = 785
+        //   mode 3  = 1309
+        //   mode 4  = 1349
+        //   mode 2  = 1535     ← 0.5.21 实际选中的就是这个
+        //
+        // 差距 14 倍。原理很直白：错排把某个字节的噪声当成高 8 位，
+        // 每两个像素就制造一次上千的跳变，这些跳变在视觉上就是浮雕和条纹。
+        // 正确排法下相邻像素只差真实场景的变化量。
+        //
+        // 这也解释了为什么之前两次在这个指标上失败：0.5.15 用的是
+        // 「同色差 ÷ 异色差」，比值里的分母被噪声撑大，正确排法反而吃亏；
+        // 0.5.19 换成总变差、0.5.19b 换成 mod-8，都是在合成数据上调的，
+        // 而合成数据里没有真实噪声，两种错法的差距被磨平了。
+        var crossMeans = [Double](repeating: .greatestFiniteMagnitude, count: candidateCount)
         for mode in 0..<candidateCount {
             guard maxSample[mode] - minSample[mode] > 0.02 else { continue }
-            if periodicities[mode] < bestPeriodicity {
-                bestPeriodicity = periodicities[mode]
-                bestMode = mode
-            }
+            crossMeans[mode] = crossDiff[mode] / max(sampleCount, 1)
+        }
+
+        // 取最优；与最优相差 15% 以内的视为并列。
+        // 并列时按固定优先级挑：9 优先于 10——两者只差低 4 位归谁，
+        // 对图像的影响上限是 15/4095 ≈ 0.4%，肉眼不可见，但必须固定，
+        // 否则同一次录制前后可能来回跳。
+        let finite = crossMeans.filter { $0 < .greatestFiniteMagnitude }
+        var bestMode = 9
+        if let low = finite.min() {
+            let threshold = low * 1.15
+            let tied = (0..<candidateCount).filter { crossMeans[$0] <= threshold }
+            bestMode = tied.min(by: { rank($0) < rank($1) }) ?? tied.first ?? 9
         }
         let bestVariation = (crossDiff[bestMode] + sameDiff[bestMode]) / max(sampleCount, 1)
 
@@ -499,6 +544,7 @@ final class BayerCalibration {
         outcome.whiteLevel = Double(white)
         outcome.bestVariation = bestVariation
         outcome.modePeriodicities = periodicities
+        outcome.modeCross = crossMeans
         return outcome
     }
 }

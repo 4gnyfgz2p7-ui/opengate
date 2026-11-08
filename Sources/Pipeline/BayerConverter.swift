@@ -198,11 +198,15 @@ final class BayerConverter {
         let sourceRowBytes = CVPixelBufferGetBytesPerRow(source)
         let sourceLength = sourceRowBytes * height
 
-        // 前 24 字节的十六进制：万一打包方式与假设不符，这 8 组三字节
-        // 足够在 PC 上把两种排法各算一遍，一次定死。
+        // 前 512 字节的十六进制，供离线核验排法。
+        //
+        // 早先只存 24 字节（8 组三字节），够看出"每组的字节关系"，但不够
+        // 做统计——判据在设备上选错时，靠这 24 字节只能人工推、无法回放验证。
+        // 512 字节 = 170 组 ≈ 341 个像素，足以在 PC 上把每种排法各跑一遍
+        // 相邻差，直接看出设备选的和真实排法差多少。
         var headText = ""
         let headPointer = sourceBase.assumingMemoryBound(to: UInt8.self)
-        for index in 0..<min(24, sourceLength) {
+        for index in 0..<min(512, sourceLength) {
             headText += String(format: "%02x", headPointer[index])
         }
 
