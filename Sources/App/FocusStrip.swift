@@ -16,7 +16,9 @@ struct FocusStrip: View {
     @State private var draft: Double?
 
     var body: some View {
-        VStack(spacing: 6) {
+        // 两行之间的间距从 6 压到 2：滑块压矮之后，6pt 的缝隙在视觉上
+        // 反而成了「滑块和按键离得很远」，用户直接指出了这一点。
+        VStack(spacing: 2) {
             HStack(spacing: 6) {
                 Text("对焦")
                     .font(.system(size: 10))
@@ -43,7 +45,7 @@ struct FocusStrip: View {
             // 全幅格式下系统可能返回 false，滑块于是整个不出现，
             // 看起来就是"根本没法手动对焦"。先给出来，能力值已写进诊断。
             if focus.mode == .manual {
-                HStack(spacing: 8) {
+                HStack(spacing: 5) {
                     Text("近")
                         .font(.system(size: 10))
                         .foregroundStyle(.white.opacity(0.42))

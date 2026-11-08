@@ -455,13 +455,18 @@ struct RecorderView: View {
     /// 录制中只保留：监看画面、时间码、曝光、停止键。
     private func recordingControls(landscape: Bool) -> some View {
         VStack(spacing: 8) {
-            ExposureStrip(exposure: engine.exposure, accent: accent, compact: true, embedded: true)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-                .background(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(Color.black.opacity(0.55))
-                )
+            VStack(spacing: 6) {
+                ExposureStrip(exposure: engine.exposure, accent: accent, compact: true, embedded: true)
+                // 录制中也要能调对焦：跟焦是拍摄过程中的常规操作，
+                // 只在待机时可用等于这一档用不了。
+                FocusStrip(focus: engine.focus, accent: accent)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Color.black.opacity(0.55))
+            )
 
             stopBar
         }
