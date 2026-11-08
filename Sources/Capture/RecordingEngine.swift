@@ -910,7 +910,11 @@ final class RecordingEngine: ObservableObject {
     private func applyFallbackAutoExposure(mean: Double) {
         guard exposure.mode == .autoBoth else { return }
         guard let device = capture.videoDevice else { return }
-        guard !device.activeFormat.isAutoExposureSupported else { return }
+        // 判断「系统 AE 到底有没有真的在跑」，只能看实测状态：
+        // 已经在 continuousAutoExposure 就交给它，不抢；
+        // 我们请求过却仍不在这条模式上，说明这条格式下它被静默忽略了，
+        // 这时才接管。一旦接管（写 custom），这个条件会一直成立，控制权稳定。
+        guard device.exposureMode != .continuousAutoExposure else { return }
         let error = 0.42 - mean
         guard abs(error) > 0.04 else { return }
         let factor = min(max(1 + error * 1.3, 0.65), 1.5)
@@ -934,14 +938,15 @@ final class RecordingEngine: ObservableObject {
             //
             // 「默认 0EV 偏暗」到底是系统 AE 没在跑、还是 AE 跑了但亮度曲线不同，
             // 靠猜没有意义，把这四个数写进容器一次就能定：
-            //   ae  = activeFormat.isAutoExposureSupported。0 表示这条格式
-            //         根本不支持自动曝光，`exposureMode = .continuousAutoExposure`
-            //         会被静默忽略，画面就停在默认曝光上（正是"偏暗"的样子）
+            //   ae  = isExposureModeSupported(.continuousAutoExposure)。
+            //         系统"声称"支持；但如果同时 em≠2，说明写了没生效——
+            //         这两项组合起来看，才是"AE 有没有在跑"的可靠判断。
+            //         0 或 (1 且 em≠2) 都会让画面停在默认曝光上（"偏暗"）
             //   em  = 实际 exposureMode（0 锁定 / 1 自动 / 2 连续自动 / 3 自定义）
             //   iso / dur = 当前 ISO 与快门（dur 写成 1/x）
             //   ofs = exposureTargetOffset，AE 在跑时应当接近 0
             //   fm / lp   = 对焦模式与镜头实际位置，验证滑块写入有没有落地
-            text += "·ae\(device.activeFormat.isAutoExposureSupported ? 1 : 0)"
+            text += "·ae\(device.isExposureModeSupported(.continuousAutoExposure) ? 1 : 0)"
             text += "·em\(device.exposureMode.rawValue)"
             text += "·iso\(Int(device.iso.rounded()))"
             let seconds = CMTimeGetSeconds(device.exposureDuration)
