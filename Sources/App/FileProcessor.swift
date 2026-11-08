@@ -20,6 +20,26 @@ final class FileProcessor: ObservableObject {
     /// 转码日志（最近若干行）。转码每一步都写进 transcode.log，
     /// 这里直接读出来显示，不必再去「文件」App 里拷。
     @Published private(set) var logLines: [String] = []
+    /// 上次异常终止的现场。选完文件就闪退时，重开 App 进设置直接能看到
+    /// 异常名与原因，不必去翻「设置 → 隐私与安全性 → 分析数据」。
+    @Published private(set) var lastCrash: String?
+
+    init() {
+        lastCrash = Self.shortCrash()
+    }
+
+    private static func shortCrash() -> String? {
+        guard let raw = Diagnostics.readCrash() else { return nil }
+        let lines = raw.split(separator: "\n", omittingEmptySubsequences: false)
+        // 名称、原因两行足够定位；完整调用栈留在 last-crash.txt 里
+        let head = lines.prefix(4).joined(separator: "\n")
+        return head.count > 400 ? String(head.prefix(400)) + "…" : head
+    }
+
+    func dismissCrash() {
+        lastCrash = nil
+        try? FileManager.default.removeItem(at: Diagnostics.crashURL)
+    }
 
     /// 输出固定用 HEVC 长 GOP：文件小、编码快，便于快速比对。
     private let tier: QualityTier = .hevcLongGOP
@@ -64,6 +84,9 @@ final class FileProcessor: ObservableObject {
         busy = true
         output = nil
         status = "正在处理 \(url.lastPathComponent)…"
+        TranscodeLog.reset()
+        TranscodeLog.write("=== 开始处理 \(url.lastPathComponent) ===")
+        Diagnostics.beginProgress("离线转码 \(url.lastPathComponent)")
         startLogPolling()
 
         let tier = self.tier
@@ -74,17 +97,27 @@ final class FileProcessor: ObservableObject {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
 
-            let target = MovieRecorder.makeOutputURL(tier: tier)
+            // 输出放到录制目录，名字沿用源命名规则并加 _Log2 后缀，
+            // 与 PC 端工具的产物命名保持一致，一眼能对上。
+            let base = MovieRecorder.makeOutputURL(tier: tier)
+            let target = base.deletingPathExtension()
+                .deletingLastPathComponent()
+                .appendingPathComponent(base.deletingPathExtension().lastPathComponent + "_Log2")
+                .appendingPathExtension("mov")
+
             do {
-                // 走与 PC 端 tools/opengate_log2.py 同一条思路：
-                // 解出画面 → 套 Apple Log 2 曲线 → HEVC → 注入 colr(9/2/9) + logs。
-                let result = try await Log2Transcoder.run(
+                // 同步阻塞：解码、套曲线、编码、写标记全在这一个线程里完成。
+                // 早先用回调并行驱动，音视频两个队列抢同一个计数器，
+                // 会踩 Swift 独占访问检查而闪退。
+                let result = try Log2Transcoder.run(
                     rawURL: url,
                     outputURL: target,
                     applyCurve: true,
                     bitRate: 45_000_000
                 ) { line in
                     TranscodeLog.write(line)
+                    // 崩溃时日志文件不一定来得及落盘，这里同步 fsync 一份
+                    Diagnostics.mark(line)
                 }
                 let size = MovieRecorder.fileSize(at: target)
                 await MainActor.run {
@@ -97,12 +130,15 @@ final class FileProcessor: ObservableObject {
                         Double(size) / 1_000_000, result.summary
                     )
                     self.stopLogPolling()
+                    self.lastCrash = nil
+                    try? FileManager.default.removeItem(at: Diagnostics.crashURL)
                 }
             } catch {
                 await MainActor.run {
                     guard let self else { return }
                     self.busy = false
                     self.status = "失败：\(error.localizedDescription)"
+                    TranscodeLog.write("失败：\(error.localizedDescription)")
                     self.stopLogPolling()
                 }
             }

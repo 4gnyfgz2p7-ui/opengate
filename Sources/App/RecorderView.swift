@@ -1251,6 +1251,29 @@ struct SettingsSheet: View {
                     .foregroundStyle(processor.status.hasPrefix("失败") ? Color.red : Color.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
+                // 上次异常终止的现场。闪退之后重开 App 就能在这里读到
+                // 异常名与原因，不用去系统设置里翻 .ips。
+                if let crash = processor.lastCrash {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("上次异常退出")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(Color.orange)
+                            Spacer(minLength: 0)
+                            Button("清除") { processor.dismissCrash() }
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(crash)
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
+                }
+
                 // 转码日志。每一步都写进 transcode.log，这里直接显示，
                 // 不必再跑一次「文件」App 去拷贝。出问题时第一现场就在这里。
                 if !processor.logLines.isEmpty {

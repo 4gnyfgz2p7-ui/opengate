@@ -44,7 +44,7 @@ enum MovTag {
               let kids = boxes(bytes, entry.offset + entry.header + 78, entry.offset + entry.size) else {
             return out
         }
-        for kid in kids {
+        for kid in kids where kid.size >= kid.header && kid.offset + kid.size <= bytes.count {
             let body = bytes[(kid.offset + kid.header)..<(kid.offset + kid.size)]
             if kid.type == "colr", body.count >= 10, Array(body.prefix(4)) == Array("nclc".utf8) {
                 out["primaries"] = Int(body[4]) << 8 | Int(body[5])
@@ -72,6 +72,12 @@ enum MovTag {
         guard let entry = pickVideoEntry(bytes) else { throw TagError.noVideoEntry }
 
         let stsd = entry.stsd
+        // sample entry 的固定头是 78 字节（8 header + 70 保留区）。
+        // 结构异常时宁可放弃标记，也不能越界读——那会直接把 App 带走。
+        guard entry.size >= entry.header + 78,
+              entry.offset + entry.header + 78 <= bytes.count else {
+            throw TagError.noVideoEntry
+        }
         let fixedHeader = bytes[(entry.offset + entry.header)..<(entry.offset + entry.header + 78)]
 
         // 保留原有子 box（丢掉旧 colr/logs），末尾追加新的
@@ -158,6 +164,7 @@ enum MovTag {
         var i = start
         while i + 8 <= end {
             let size32 = Int(be32(bytes, i))
+            guard i + 8 <= bytes.count else { break }
             let type = String(decoding: bytes[(i + 4)..<(i + 8)], as: UTF8.self)
             var size = size32
             var header = 8
@@ -195,6 +202,8 @@ enum MovTag {
             }
             guard found else { continue }
             let stsd = cursor
+            guard stsd.size >= stsd.header + 8,
+                  stsd.offset + stsd.header + 8 <= bytes.count else { continue }
             guard let entries = boxes(bytes, stsd.offset + stsd.header + 8, stsd.offset + stsd.size) else {
                 continue
             }
@@ -225,10 +234,15 @@ enum MovTag {
                   let kids = boxes(bytes, cursor.offset + cursor.header, cursor.offset + cursor.size) else { continue }
             for kid in kids where kid.type == "stco" || kid.type == "co64" {
                 let base = kid.offset + kid.header + 4
+                guard base + 4 <= bytes.count else { continue }
                 let n = Int(be32(bytes, base - 4))
                 let width = kid.type == "stco" ? 4 : 8
+                // 条目数必须能塞进这个 box，且不能超出文件末尾。
+                // 表被写坏时（例如半截文件）这里会算出天文数字。
+                guard n >= 0, base + width * n <= min(kid.offset + kid.size, bytes.count) else { continue }
                 for k in 0..<n {
                     let p = base + width * k
+                    guard p + width <= bytes.count else { break }
                     let value = width == 4 ? Int(be32(bytes, p)) : Int(be64(bytes, p))
                     guard value >= threshold else { continue }
                     if width == 4 {
@@ -269,11 +283,13 @@ enum MovTag {
     // MARK: - 字节序
 
     private static func be32(_ bytes: [UInt8], _ at: Int) -> UInt32 {
-        (UInt32(bytes[at]) << 24) | (UInt32(bytes[at + 1]) << 16)
+        guard at >= 0, at + 4 <= bytes.count else { return 0 }
+        return (UInt32(bytes[at]) << 24) | (UInt32(bytes[at + 1]) << 16)
             | (UInt32(bytes[at + 2]) << 8) | UInt32(bytes[at + 3])
     }
 
     private static func be64(_ bytes: [UInt8], _ at: Int) -> UInt64 {
+        guard at >= 0, at + 8 <= bytes.count else { return 0 }
         var v: UInt64 = 0
         for i in 0..<8 { v = (v << 8) | UInt64(bytes[at + i]) }
         return v

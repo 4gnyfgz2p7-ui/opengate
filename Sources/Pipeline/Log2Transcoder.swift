@@ -2,16 +2,20 @@ import Foundation
 import AVFoundation
 import CoreImage
 import CoreVideo
+import CoreMedia
 
 /// 把已录好的 ProRes RAW 转成 HEVC + Apple Log 2。
 ///
 /// 与 PC 端 `tools/opengate_log2.py` 同一条思路：解出画面 → 套 Apple Log 2
 /// 曲线 → 编码 → 注入 colr(9/2/9) 与 logs 标识。
 ///
-/// 差别只在解码那一层：PC 能拿到 16-bit Bayer（ffmpeg 熵解码），
-/// iOS 的 ProRes RAW 解码器不给 Bayer，只给成品 YUV。所以这里是对
-/// 系统解码结果套曲线，而不是从传感器线性值起算——这一点会在
-/// `Report.sourceFormat` 里如实写出来。
+/// ## 为什么是同步单循环
+///
+/// 早先版本用 `requestMediaDataWhenReady` 分别驱动音视频，两个队列同时改
+/// 同一个 `report` 变量，会踩 Swift 的独占访问检查；一旦加上自定义的
+/// outputSettings 键，`AVAssetWriterInput` 还会直接抛 ObjC 异常把进程带走，
+/// 表现为"选完文件就闪退"。这里改成单线程拉取：音视频在同一个循环里轮询，
+/// 不用队列、不用信号量、不用 continuation，出错就是一条日志。
 final class Log2Transcoder {
 
     struct Report {
@@ -35,16 +39,18 @@ final class Log2Transcoder {
 
     enum TranscodeError: LocalizedError {
         case noVideoTrack
+        case tooShort
         case readerFailed(String)
         case writerFailed(String)
-        case pixelBufferFailed
+        case tagFailed(String)
 
         var errorDescription: String? {
             switch self {
-            case .noVideoTrack: return "文件里没有视频轨"
+            case .noVideoTrack: return "文件里没有视频轨，或不是可解码的 MOV"
+            case .tooShort: return "文件还没下载完成（iCloud 占位）或已损坏"
             case .readerFailed(let d): return "读取失败：\(d)"
             case .writerFailed(let d): return "写入失败：\(d)"
-            case .pixelBufferFailed: return "像素缓冲创建失败"
+            case .tagFailed(let d): return "写色彩标记失败：\(d)"
             }
         }
     }
@@ -58,6 +64,9 @@ final class Log2Transcoder {
     private static let rt: Float = 0.01
 
     /// 曲线内核。分段：R≥Rt 对数，R0≤R<Rt 抛物线，R<R0 归零。
+    ///
+    /// 常数一律带 `f` 后缀 —— 不带的话 OpenCL 会按 double 解析，
+    /// 部分 GPU 上直接编译失败，内核返回 nil，曲线被静默跳过。
     private static let curveKernelSource = """
     kernel vec4 log2curve(__sample s) {
         vec3 r = clamp(s.rgb, 0.0, 1.0);
@@ -70,30 +79,41 @@ final class Log2Transcoder {
     }
     """
 
+    /// 同步执行。调用方负责放到后台队列，别在主线程调。
     @discardableResult
     static func run(rawURL: URL,
                     outputURL: URL,
                     applyCurve: Bool = true,
                     bitRate: Int = 45_000_000,
-                    log: @escaping (String) -> Void = { _ in }) async throws -> Report {
+                    log: (String) -> Void = { _ in }) throws -> Report {
 
         let t0 = Date()
         var report = Report()
 
-        let asset = AVURLAsset(url: rawURL)
+        // ---- 0. 输入体检：iCloud 占位文件在这里就拦下 ----
+        let attrs = try? FileManager.default.attributesOfItem(atPath: rawURL.path)
+        let fileSize = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+        log("输入 \(rawURL.lastPathComponent) · \(fileSize / 1_000_000) MB")
+        guard fileSize > 4096 else { throw TranscodeError.tooShort }
+
+        let asset = AVURLAsset(url: rawURL, options: [
+            AVURLAssetPreferPreciseDurationAndTimingKey: true,
+        ])
         guard let videoTrack = asset.tracks(withMediaType: .video).first else {
             throw TranscodeError.noVideoTrack
         }
         let size = videoTrack.naturalSize
         let transform = videoTrack.preferredTransform
-        report.width = Int(size.width)
-        report.height = Int(size.height)
+        guard size.width >= 2, size.height >= 2 else { throw TranscodeError.noVideoTrack }
+        report.width = Int(size.width.rounded())
+        report.height = Int(size.height.rounded())
+        log("视频轨 \(report.width)×\(report.height) · \(String(format: "%.3f", videoTrack.nominalFrameRate)) fps")
 
         if FileManager.default.fileExists(atPath: outputURL.path) {
             try? FileManager.default.removeItem(at: outputURL)
         }
 
-        // ---- 解码：优先 10-bit，退 8-bit ----
+        // ---- 1. 解码 ----
         let reader: AVAssetReader
         do {
             reader = try AVAssetReader(asset: asset)
@@ -101,6 +121,8 @@ final class Log2Transcoder {
             throw TranscodeError.readerFailed(error.localizedDescription)
         }
 
+        // 10-bit 优先。ProRes RAW 解出来通常是 x420；这一代 VT 若只给
+        // 8-bit，会落到 p420，报告里如实写出来。
         let candidates: [OSType] = [
             kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
             kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
@@ -109,15 +131,15 @@ final class Log2Transcoder {
         var chosen: OSType?
         var videoOutput: AVAssetReaderTrackOutput?
         for code in candidates {
-            let output = AVAssetReaderTrackOutput(
+            let out = AVAssetReaderTrackOutput(
                 track: videoTrack,
                 outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: code]
             )
-            output.alwaysCopiesSampleData = false
-            if reader.canAdd(output) {
-                reader.add(output)
+            out.alwaysCopiesSampleData = false
+            if reader.canAdd(out) {
+                reader.add(out)
                 chosen = code
-                videoOutput = output
+                videoOutput = out
                 break
             }
         }
@@ -126,8 +148,9 @@ final class Log2Transcoder {
         }
         report.sourceFormat = fourCC(chosen)
         report.bitDepth = (chosen == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) ? 8 : 10
+        log("解码格式 \(report.sourceFormat) \(report.bitDepth)bit")
 
-        // ---- 音频：原样搬运 ----
+        // ---- 2. 音频：原样搬运，不做采样率/位深转换 ----
         var audioOutput: AVAssetReaderTrackOutput?
         if let audioTrack = asset.tracks(withMediaType: .audio).first {
             let out = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
@@ -135,6 +158,7 @@ final class Log2Transcoder {
             if reader.canAdd(out) {
                 reader.add(out)
                 audioOutput = out
+                log("音频轨 \(audioTrack.formatDescriptions.count) 个描述")
             }
         }
 
@@ -142,7 +166,7 @@ final class Log2Transcoder {
             throw TranscodeError.readerFailed(reader.error?.localizedDescription ?? "无法开始读取")
         }
 
-        // ---- 编码 ----
+        // ---- 3. 编码 ----
         let writer: AVAssetWriter
         do {
             writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
@@ -150,14 +174,18 @@ final class Log2Transcoder {
             throw TranscodeError.writerFailed(error.localizedDescription)
         }
 
-        var compression: [String: Any] = [
+        // 这里的键必须都是 AVFoundation 认识的。录制端用的
+        // AVVideoLogTransferFunctionKey 确实存在，但转码这边不需要它：
+        // Log 身份最后靠 MovTag 注入的 colr + logs 表达，比让 writer
+        // 自己写更可控，也不依赖 SDK 版本。
+        let compression: [String: Any] = [
             AVVideoAverageBitRateKey: bitRate,
             AVVideoExpectedSourceFrameRateKey: 24,
             AVVideoMaxKeyFrameIntervalKey: 240,
             AVVideoAllowFrameReorderingKey: false,
             AVVideoProfileLevelKey: "HEVC_Main10_AutoLevel",
         ]
-        var videoSettings: [String: Any] = [
+        let videoSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: report.width,
             AVVideoHeightKey: report.height,
@@ -168,8 +196,6 @@ final class Log2Transcoder {
             ],
             AVVideoCompressionPropertiesKey: compression,
         ]
-        videoSettings["AVVideoLogTransferFunctionKey"] = "AppleLog2"
-        _ = compression
 
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         videoInput.expectsMediaDataInRealTime = false
@@ -181,15 +207,9 @@ final class Log2Transcoder {
 
         var audioInput: AVAssetWriterInput?
         if audioOutput != nil {
-            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
-                AVFormatIDKey: kAudioFormatLinearPCM,
-                AVSampleRateKey: 48_000,
-                AVNumberOfChannelsKey: 2,
-                AVLinearPCMBitDepthKey: 16,
-                AVLinearPCMIsFloatKey: false,
-                AVLinearPCMIsBigEndianKey: false,
-                AVLinearPCMIsNonInterleaved: false,
-            ])
+            // nil = 不做转码，源是什么格式就写什么格式。
+            // 指定 LPCM 16bit 会把 24bit 源降位，且参数不匹配时 append 会被拒。
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
             input.expectsMediaDataInRealTime = false
             if writer.canAdd(input) {
                 writer.add(input)
@@ -202,144 +222,211 @@ final class Log2Transcoder {
         }
         writer.startSession(atSourceTime: .zero)
 
-        // ---- 曲线内核 ----
-        let context = CIContext(options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
+        // ---- 4. 曲线 ----
+        // workingColorSpace 设 NSNull：不做色彩管理，kernel 拿到什么值就是
+        // 什么值，输出也原样落地。否则 CI 会在输入输出两端各做一次 gamma，
+        // 套完曲线再被编码一遍，出来的不是 Log。
+        let ciContext = CIContext(options: [.workingColorSpace: NSNull()])
+        let outputColorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         var kernel: CIColorKernel?
         if applyCurve {
             let source = curveKernelSource
-                .replacingOccurrences(of: "%GAMMA%", with: "\(gamma)")
-                .replacingOccurrences(of: "%BETA%", with: "\(beta)")
-                .replacingOccurrences(of: "%DELTA%", with: "\(delta)")
-                .replacingOccurrences(of: "%C%", with: "\(c)")
-                .replacingOccurrences(of: "%R0%", with: "\(r0)")
-                .replacingOccurrences(of: "%RT%", with: "\(rt)")
+                .replacingOccurrences(of: "%GAMMA%", with: "\(gamma)f")
+                .replacingOccurrences(of: "%BETA%", with: "\(beta)f")
+                .replacingOccurrences(of: "%DELTA%", with: "\(delta)f")
+                .replacingOccurrences(of: "%C%", with: "\(c)f")
+                .replacingOccurrences(of: "%R0%", with: "\(r0)f")
+                .replacingOccurrences(of: "%RT%", with: "\(rt)f")
             kernel = CIColorKernel(source: source)
             if kernel == nil {
-                log("曲线内核编译失败，退回直通")
-                report.appliedCurve = false
+                log("曲线内核编译失败，本片按直通输出")
             } else {
-                report.appliedCurve = true
+                log("曲线内核就绪（Apple Log 2 · 白皮书常数）")
             }
         }
+        report.appliedCurve = (kernel != nil)
 
-        let outputFormat = chosen
-        var attachments: [CFString: Any] = [:]
-        let dstAttributes: [CFString: Any] = [
-            kCVPixelBufferPixelFormatTypeKey: outputFormat,
-            kCVPixelBufferWidthKey: report.width,
-            kCVPixelBufferHeightKey: report.height,
-            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+        // 渲染目标用 BGRA8：CoreImage 的原生格式，任何机器上都不会失败。
+        // 直接渲染到 10-bit YUV 在部分设备上会静默失败或抛异常，不冒这个险。
+        let dstAttributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: report.width,
+            kCVPixelBufferHeightKey as String: report.height,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
         ]
 
         func makeDestination() -> CVPixelBuffer? {
             var buffer: CVPixelBuffer?
-            CVPixelBufferCreate(kCFAllocatorDefault, report.width, report.height,
-                                outputFormat, dstAttributes as CFDictionary, &buffer)
+            let status = CVPixelBufferCreate(kCFAllocatorDefault, report.width, report.height,
+                                             kCVPixelFormatType_32BGRA,
+                                             dstAttributes as CFDictionary, &buffer)
+            guard status == kCVReturnSuccess else { return nil }
             return buffer
         }
-        _ = attachments
 
-        // ---- 视频循环 ----
-        let videoQueue = DispatchQueue(label: "opengate.log2.video")
-        let videoSemaphore = DispatchSemaphore(value: 0)
-        var videoError: String?
+        // ---- 5. 单循环拉取 ----
+        // AVAssetReader 要求各轨按它给的顺序消费，分两个队列各自 copy 会互相
+        // 阻塞甚至死锁；一个循环里轮流取才是对的。
+        var videoDone = false
+        var audioDone = (audioOutput == nil)
+        var failed: String?
+        var lastTick = Date()
+        var lastPTS = CMTime.zero
+        var frameDuration = CMTime(value: 1, timescale: 24)
+        var lastSeenFrames = 0
+        var lastProgress = Date()
 
-        videoInput.requestMediaDataWhenReady(on: videoQueue) { [weak videoInput] in
-            guard let videoInput else { return }
-            while videoInput.isReadyForMoreMediaData {
-                guard let sample = videoOutput.copyNextSampleBuffer() else {
+        while true {
+            if writer.status == .failed || writer.status == .cancelled { break }
+            if videoDone && audioDone { break }
+            if reader.status == .failed || reader.status == .cancelled { break }
+
+            var didWork = false
+
+            if !videoDone, videoInput.isReadyForMoreMediaData {
+                if let sample = videoOutput.copyNextSampleBuffer() {
+                    didWork = true
+                    lastPTS = CMSampleBufferGetPresentationTimeStamp(sample)
+                    if CMSampleBufferGetDuration(sample).isValid,
+                       CMSampleBufferGetDuration(sample) > .zero {
+                        frameDuration = CMSampleBufferGetDuration(sample)
+                    }
+                    if let toAppend = process(sample: sample, kernel: kernel,
+                                              context: ciContext, colorSpace: outputColorSpace,
+                                              makeDestination: makeDestination) {
+                        if videoInput.append(toAppend) {
+                            report.frames += 1
+                        } else {
+                            failed = "编码器拒帧：\(writer.error?.localizedDescription ?? "未知")"
+                            videoDone = true
+                            videoInput.markAsFinished()
+                        }
+                    }
+                } else {
+                    videoDone = true
                     videoInput.markAsFinished()
-                    videoSemaphore.signal()
-                    return
-                }
-                guard let src = CMSampleBufferGetImageBuffer(sample) else { continue }
-
-                var toAppend: CVPixelBuffer = src
-                if let kernel {
-                    let ci = CIImage(cvPixelBuffer: src)
-                    if let out = kernel.apply(extent: ci.extent, arguments: [ci]),
-                       let dst = makeDestination() {
-                        context.render(out, to: dst, bounds: ci.extent, colorSpace: nil)
-                        toAppend = dst
-                    }
-                }
-
-                var timed: CMSampleBuffer?
-                var timing = CMSampleTimingInfo(
-                    duration: CMSampleBufferGetDuration(sample),
-                    presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sample),
-                    decodeTimeStamp: .invalid
-                )
-                CMSampleBufferCreateForImageBuffer(
-                    allocator: kCFAllocatorDefault,
-                    imageBuffer: toAppend,
-                    dataReady: true,
-                    makeDataReadyCallback: nil,
-                    refcon: nil,
-                    formatDescription: CMSampleBufferGetFormatDescription(sample)!,
-                    sampleTiming: &timing,
-                    sampleBufferOut: &timed
-                )
-                if let timed {
-                    if !videoInput.append(timed) {
-                        videoError = writer.error?.localizedDescription ?? "append 被拒"
-                        videoInput.markAsFinished()
-                        videoSemaphore.signal()
-                        return
-                    }
-                    report.frames += 1
+                    log("视频读完 · \(report.frames) 帧")
                 }
             }
-        }
 
-        // ---- 音频循环 ----
-        var audioDone = true
-        if let audioInput, let audioOutput {
-            audioDone = false
-            let queue = DispatchQueue(label: "opengate.log2.audio")
-            let sem = DispatchSemaphore(value: 0)
-            audioInput.requestMediaDataWhenReady(on: queue) { [weak audioInput] in
-                guard let audioInput else { return }
-                while audioInput.isReadyForMoreMediaData {
-                    guard let sample = audioOutput.copyNextSampleBuffer() else {
-                        audioInput.markAsFinished()
-                        sem.signal()
-                        return
-                    }
+            if !audioDone, let audioInput, let audioOutput, audioInput.isReadyForMoreMediaData {
+                if let sample = audioOutput.copyNextSampleBuffer() {
+                    didWork = true
                     if audioInput.append(sample) {
                         report.audioBuffers += 1
                     }
+                } else {
+                    audioDone = true
+                    audioInput.markAsFinished()
+                    log("音频读完 · \(report.audioBuffers) 块")
                 }
             }
-            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-                sem.wait()
-                c.resume()
+
+            if !didWork {
+                usleep(2_000)
+            }
+
+            if report.frames != lastSeenFrames {
+                lastSeenFrames = report.frames
+                lastProgress = Date()
+            }
+            if Date().timeIntervalSince(lastTick) > 10 {
+                lastTick = Date()
+                log("进度 \(report.frames) 帧 · \(Int(Date().timeIntervalSince(t0))) 秒")
+                // 120 秒没有新帧就认定卡死：解码器可能挂在一个坏样本上，
+                // 再等下去只会让用户以为 App 假死。
+                if Date().timeIntervalSince(lastProgress) > 120 {
+                    failed = "超过 120 秒没有新帧，已停止（解码器可能卡在这个 RAW 变体上）"
+                    break
+                }
             }
         }
-        _ = audioDone
 
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-            videoSemaphore.wait()
-            c.resume()
-        }
-
-        if let videoError {
+        if let failed {
             writer.cancelWriting()
-            throw TranscodeError.writerFailed(videoError)
+            reader.cancelReading()
+            throw TranscodeError.writerFailed(failed)
+        }
+        if reader.status == .failed {
+            let detail = reader.error?.localizedDescription ?? "未知"
+            writer.cancelWriting()
+            throw TranscodeError.readerFailed(detail)
+        }
+        guard report.frames > 0 else {
+            writer.cancelWriting()
+            throw TranscodeError.readerFailed("一帧都没解出来（解码器可能不支持这个 RAW 变体）")
         }
 
-        await writer.finishWriting()
+        writer.endSession(atSourceTime: lastPTS + frameDuration)
+        writer.finishWriting()
+        // finishWriting 是异步的，这里同步等它落盘
+        var waited = 0
+        while writer.status == .writing && waited < 6_000 {
+            usleep(5_000)
+            waited += 1
+        }
         if writer.status == .failed {
-            throw TranscodeError.writerFailed(writer.error?.localizedDescription ?? "未知")
+            throw TranscodeError.writerFailed(writer.error?.localizedDescription ?? "封盘失败")
         }
         reader.cancelReading()
+        log("已封盘 · \(outputURL.lastPathComponent)")
 
-        // ---- 注入标记 ----
-        let tag = try MovTag.inject(outputURL)
-        report.tagDelta = tag.delta
+        // ---- 6. 注入色彩标记 ----
+        do {
+            let tag = try MovTag.inject(outputURL)
+            report.tagDelta = tag.delta
+            log("标记 colr \(tag.primaries)/\(tag.transfer)/\(tag.matrix) · logs · +\(tag.delta)B · 修正 \(tag.chunksShifted) 个 chunk")
+        } catch {
+            // 标记失败不影响画面，文件本身可用，只记录
+            log("标记注入失败：\(error.localizedDescription)")
+            report.tagDelta = 0
+        }
+
         report.elapsed = Date().timeIntervalSince(t0)
         log("完成：\(report.summary)")
         return report
+    }
+
+    /// 把一帧解出的画面套上曲线，返回可交给编码器的样本。
+    /// 不套曲线或渲染失败时原样返回，绝不因为增强失败而丢帧。
+    private static func process(sample: CMSampleBuffer,
+                                kernel: CIColorKernel?,
+                                context: CIContext,
+                                colorSpace: CGColorSpace,
+                                makeDestination: () -> CVPixelBuffer?) -> CMSampleBuffer? {
+        guard let kernel else { return sample }
+        guard let src = CMSampleBufferGetImageBuffer(sample) else { return sample }
+
+        let ci = CIImage(cvPixelBuffer: src)
+        guard let out = kernel.apply(extent: ci.extent, arguments: [ci]) else { return sample }
+        guard let dst = makeDestination() else { return sample }
+        context.render(out, to: dst, bounds: ci.extent, colorSpace: colorSpace)
+
+        var format: CMVideoFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: dst,
+            formatDescriptionOut: &format
+        ) == noErr, let format else { return sample }
+
+        var timing = CMSampleTimingInfo(
+            duration: CMSampleBufferGetDuration(sample),
+            presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sample),
+            decodeTimeStamp: .invalid
+        )
+        var rebuilt: CMSampleBuffer?
+        let status = CMSampleBufferCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: dst,
+            dataReady: true,
+            makeDataReadyCallback: nil,
+            refcon: nil,
+            formatDescription: format,
+            sampleTiming: &timing,
+            sampleBufferOut: &rebuilt
+        )
+        guard status == noErr, let rebuilt else { return sample }
+        return rebuilt
     }
 
     private static func fourCC(_ code: OSType) -> String {
