@@ -49,22 +49,24 @@ struct FocusStrip: View {
                         .foregroundStyle(.white.opacity(0.42))
                         .frame(width: 30, alignment: .leading)
 
-                    Slider(
+                    // 系统 Slider 自带 ~30pt 的高度，在参数面板里太占地方。
+                    // 换自绘的细轨道版本：高度 14pt，宽度撑满（与原来一致），
+                    // 拖动逻辑与原来完全相同——拖动中写设备，松手清 draft。
+                    CompactSlider(
                         value: Binding(
                             get: { draft ?? focus.sliderPosition },
                             // 拖动过程中就写进设备。对焦是「看着画面找焦点」，
-                            // 松手才生效等于盲拖——曝光条那样延后提交在这一档行不通。
+                            // 松手才生效等于盲拖。
                             set: { value in
                                 draft = value
                                 focus.sliderPosition = value
                             }
                         ),
-                        in: 0...1,
+                        accent: accent,
                         onEditingChanged: { editing in
                             if !editing { draft = nil }
                         }
                     )
-                    .tint(accent)
 
                     Text("∞")
                         .font(.system(size: 10))
@@ -108,5 +110,75 @@ struct FocusStrip: View {
                 )
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - 细轨道滑块
+
+/// 高度只有 14pt 的滑块，替换系统 `Slider`（后者自带约 30pt）。
+///
+/// 参数面板在 `ScrollView` 里、高度由布局分区给定，滑块厚一点就多吃一行，
+/// 用户直接反馈「滑块占的高度太大」。这里只压高度，**长度沿用原来的撑满**，
+/// 拖动阈值、跟手程度与系统版本一致。
+///
+/// 不用 `.scaleEffect` 压系统控件：那会把文字和拇指一起缩放、
+/// 且点击热区仍按原尺寸算，手感会变差。
+struct CompactSlider: View {
+
+    @Binding var value: Double
+    let accent: Color
+    var onEditingChanged: ((Bool) -> Void)?
+
+    /// 轨道粗细与拇指直径。整体高度 = knobSize，比系统少一半以上。
+    private let trackHeight: CGFloat = 3
+    private let knobSize: CGFloat = 12
+
+    @State private var dragging = false
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = geo.size.width
+            let travel = max(width - knobSize, 1)
+            let clamped = min(max(value, 0), 1)
+            let knobX = CGFloat(clamped) * travel
+
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(0.16))
+                    .frame(height: trackHeight)
+                    .padding(.horizontal, knobSize / 2)
+
+                Capsule()
+                    .fill(accent)
+                    .frame(width: knobX + knobSize / 2, height: trackHeight)
+                    .offset(x: 0)
+
+                Circle()
+                    .fill(accent)
+                    .frame(width: knobSize, height: knobSize)
+                    .offset(x: knobX)
+            }
+            .frame(width: width, height: knobSize, alignment: .leading)
+            .contentShape(Rectangle())
+            .gesture(
+                // minimumDistance 0：按下即开始调，和系统滑块一致，
+                // 否则对焦要拖出一点点距离才响应，手感发涩
+                DragGesture(minimumDistance: 0)
+                    .onChanged { gesture in
+                        if !dragging {
+                            dragging = true
+                            onEditingChanged?(true)
+                        }
+                        let position = (gesture.location.x - knobSize / 2) / travel
+                        value = min(max(Double(position), 0), 1)
+                    }
+                    .onEnded { _ in
+                        dragging = false
+                        onEditingChanged?(false)
+                    }
+            )
+        }
+        // 整条高度：拇指直径 + 一点上下余量，便于手指按住
+        .frame(height: knobSize + 2)
     }
 }
