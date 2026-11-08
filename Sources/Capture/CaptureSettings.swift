@@ -115,11 +115,11 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
     ///
     /// 数值按**每像素多少 bit** 折算，不按「感觉画质高」拍脑袋定。
     /// 4224×3024 @24fps = 306 M像素/秒，于是：
-    ///   70 Mb/s  ÷ 306 M = 0.23 bit/像素（长 GOP，与 iPhone 自家 4K60 HEVC 同级）
-    ///   210 Mb/s ÷ 306 M = 0.69 bit/像素（全 I 帧，约为长 GOP 的 3 倍，
+    ///   50 Mb/s  ÷ 306 M = 0.16 bit/像素（长 GOP，接近手机出厂的日常档）
+    ///  130 Mb/s ÷ 306 M = 0.42 bit/像素（全 I 帧，约为长 GOP 的 2.6 倍，
     ///                       帧内编码缺少时域预测，同画质本就该是这个倍数）
     ///
-    /// 早先写的是 200 / 500 Mb/s（0.65 / 1.63 bit/像素），两个数都错了：
+    /// 更早还写过 200 / 500 Mb/s（0.65 / 1.63 bit/像素），两个数都离谱：
     /// - 长 GOP 1.48 GB/分钟，比 iPhone 大 3 倍，「最小文件档」名不副实；
     /// - 全 I 帧 500 Mb/s 与 ProRes 422 LT 换算后的 503 Mb/s 几乎相等，
     ///   两档文件一样大，而 LT 是调色中间格式、画质更好——
@@ -127,8 +127,8 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
     var averageBitRate: Int? {
         switch self {
         case .proResHQ, .proResLT, .proResRAW: return nil
-        case .hevcLongGOP: return 70_000_000
-        case .hevcAllIntra: return 210_000_000
+        case .hevcLongGOP: return 50_000_000
+        case .hevcAllIntra: return 130_000_000
         }
     }
 

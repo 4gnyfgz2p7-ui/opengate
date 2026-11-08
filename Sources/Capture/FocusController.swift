@@ -65,6 +65,8 @@ final class FocusController: ObservableObject {
     @Published private(set) var liveLensPosition: Float = 1
     /// 设备是否支持按位置锁定焦距。不支持时手动档给不出效果。
     @Published private(set) var supportsManualFocus = false
+    /// 最近一次写入失败的原因。界面与诊断都读它，不再静默失败。
+    @Published private(set) var lastError: String?
 
     // MARK: - 内部
 
@@ -134,7 +136,16 @@ final class FocusController: ObservableObject {
         guard let device = device else { return }
 
         let target = min(max(lensPosition, 0), 1)
-        try? device.lockForConfiguration()
+
+        // 这里原来写的是 `try? device.lockForConfiguration()`：锁不住时错误被
+        // 吞掉，函数照常往下走、读数照常更新，于是表现为「滑块在动、镜头不动」。
+        // 必须把失败显式记下来。
+        do {
+            try device.lockForConfiguration()
+        } catch {
+            lastError = "对焦锁定失败：" + error.localizedDescription
+            return
+        }
 
         if device.isLockingFocusWithCustomLensPositionSupported {
             // 只有这个方法会真正把镜头移过去。attach 里已经确认过支持，
@@ -142,13 +153,16 @@ final class FocusController: ObservableObject {
             device.setFocusModeLocked(lensPosition: target, completionHandler: nil)
             supportsManualFocus = true
         } else if device.isFocusModeSupported(.locked) {
-            // 退路：冻结当前位置。此时滑块不呈现，所以不存在"拖了没反应"。
+            // 退路：冻结当前位置。此时手动档给不出位移。
             device.focusMode = .locked
             supportsManualFocus = false
+            lastError = "该格式不支持按位置锁定焦距"
         }
 
+        // 不把目标值写成「实测值」——镜头可能根本没动。
+        // 真实位置由 startReadback 每 400ms 从设备读回。
         device.unlockForConfiguration()
-        liveLensPosition = target
+        if supportsManualFocus { lastError = nil }
     }
 
     // MARK: - 回读

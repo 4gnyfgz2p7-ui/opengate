@@ -277,6 +277,26 @@ final class ExposureController: ObservableObject {
         device.unlockForConfiguration()
     }
 
+    /// 系统 AE 不可用时的兜底：按比例缩放 ISO，快门保持当前值。
+    ///
+    /// 只改 ISO 是有意的——24fps 下快门最慢只能到 1/24，一旦顶到那里，
+    /// 再想提亮就只能靠 ISO。两维一起动会让调子变得不可预测。
+    func nudgeISO(factor: Double) {
+        guard let device = device, factor.isFinite, factor > 0 else { return }
+        let format = device.activeFormat
+        let target = min(max(device.iso * Float(factor), format.minISO), format.maxISO)
+        guard abs(target - device.iso) / max(device.iso, 1) > 0.01 else { return }
+
+        let duration = device.exposureDuration
+        do {
+            try device.lockForConfiguration()
+        } catch {
+            return
+        }
+        device.setExposureModeCustom(duration: duration, iso: target, completionHandler: nil)
+        device.unlockForConfiguration()
+    }
+
     private func applyEV() {
         guard let device = device else { return }
         let clamped = min(max(ev, minEV), maxEV)

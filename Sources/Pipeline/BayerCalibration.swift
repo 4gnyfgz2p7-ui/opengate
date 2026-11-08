@@ -59,6 +59,8 @@ final class BayerCalibration {
         var modeCross: [Double] = []
         /// 四种相位各自的 R/G、B/G（八个数），用于在设备值与图像统计冲突时裁决
         var patternLevels: [Double] = []
+        /// 四种相位的「两绿点相对差」，最小者即真实相位
+        var patternGreen: [Double] = []
 
         var summary: String {
             let patterns = ["RGGB", "BGGR", "GRBG", "GBRG"]
@@ -77,6 +79,8 @@ final class BayerCalibration {
             text += "·dev" + patterns[Int(max(0, min(3, devicePattern)))]
             let pl = patternLevels.map { String(format: "%.2f", min($0, 9.99)) }
             text += "·p4" + pl.joined(separator: "/")
+            let pg = patternGreen.map { String(format: "%.3f", min($0, 9.999)) }
+            text += "·gp" + pg.joined(separator: "/")
             text += String(format: "·tv%.4f", bestVariation)
             if !modeCross.isEmpty {
                 // 各排法的相邻差均值，最小者即选中。真实数据上的分离度约 14 倍
@@ -432,6 +436,9 @@ final class BayerCalibration {
         // 哪一组就是真实相位。设备给的 BayerPattern 和图像统计冲突时，
         // 靠这八个数直接裁决。
         var patternLevels = [Double](repeating: 0, count: 8)
+        // 四种相位的「两绿点相对差」。正确相位约 0.002，错族 0.15 以上；
+        // 写进容器后，一次录制就能看出相位判据有没有选对。
+        var patternGreen = [Double](repeating: 9.99, count: 4)
 
         for pattern in 0..<4 {
             let table = colors[pattern]
@@ -475,9 +482,24 @@ final class BayerCalibration {
                 patternLevels[pattern * 2] = redRaw / greenRaw
                 patternLevels[pattern * 2 + 1] = blueRaw / greenRaw
             }
+            let meanLevel = max(greenRaw / count, 1e-6)
             let normalizedPair = greenPair / count
+
+            // 判据必须是**相对量**：两个绿点之差除以画面平均电平。
+            //
+            // 0.5.30 用的是绝对差 + neutrality 惩罚，在暗画面下彻底失效：
+            // 那条片子 raw 只到 861/4095，两绿点差折算成归一化单位只有 0.008，
+            // 而 neutrality 是 log 比值、与亮度无关，量级 0.36，乘 0.5 后
+            // 完全压过前者 —— 于是选中了把红蓝当绿点的那一族（GBRG），
+            // 画面被解成灰的（rgb_mean 55/55/56），这就是"颜色还是错"。
+            //
+            // 除以平均电平之后，这个量对曝光不敏感：正确相位约为 0.002，
+            // 错族约为 0.15 以上，分离度在任何亮度下都成立。
+            let relativeGreen = normalizedPair / meanLevel
+            patternGreen[pattern] = relativeGreen
+
             let neutrality = abs(log(max(redSum, 1e-6) / max(blueSum, 1e-6)))
-            let score = normalizedPair + neutrality * 0.5
+            let score = relativeGreen
 
             if score < bestPatternScore {
                 bestPatternScore = score
@@ -589,6 +611,7 @@ final class BayerCalibration {
         outcome.modePeriodicities = periodicities
         outcome.modeCross = crossRms
         outcome.patternLevels = patternLevels
+        outcome.patternGreen = patternGreen
         return outcome
     }
 }

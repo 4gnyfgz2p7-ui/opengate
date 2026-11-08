@@ -162,7 +162,11 @@ struct CompactSlider: View {
             }
             .frame(width: width, height: knobSize, alignment: .leading)
             .contentShape(Rectangle())
-            .gesture(
+            // 必须用 highPriorityGesture：参数面板在 ScrollView 里，
+            // 普通 .gesture 会被滚动视图的手势抢走——按下去滑块不动、
+            // 松手回弹，表现就是「对焦滑块失效」。系统 Slider 之所以能用，
+            // 是因为它内部同样用了高优先级手势。
+            .highPriorityGesture(
                 // minimumDistance 0：按下即开始调，和系统滑块一致，
                 // 否则对焦要拖出一点点距离才响应，手感发涩
                 DragGesture(minimumDistance: 0)

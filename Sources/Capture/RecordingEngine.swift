@@ -295,6 +295,17 @@ final class RecordingEngine: ObservableObject {
 
                 monitorable = converted
                 statsBox.markConverted()
+
+                // 系统 AE 不可用时的兜底测光。每半秒取一帧，量的是**转换后的
+                // BGRA**（已含 REC.709 传递函数），所以目标值直接按画面观感定，
+                // 不用再折算线性 raw。
+                let stamp = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(buffer))
+                if Int((stamp * 24).rounded()) % 12 == 0,
+                   let mean = RecordingEngine.meanLuma(converted) {
+                    Task { @MainActor in
+                        self?.applyFallbackAutoExposure(mean: mean)
+                    }
+                }
                 let diag = converter.lastDiagnostics
                 statsBox.markDiagnostics(diag.summary, detail: diag.metadataText)
                 if recorder?.appendImageBuffer(
@@ -855,6 +866,57 @@ final class RecordingEngine: ObservableObject {
     }
 
     /// 写进视频文件的诊断串，录完直接从文件读，不用再截图
+    /// 抽样 BGRA 画面的平均亮度（0–1，已含传递函数）。每 24 像素取一个点，
+    /// 4224×3024 约 2.2 万点，够稳且不影响帧率。
+    nonisolated static func meanLuma(_ buffer: CVPixelBuffer) -> Double? {
+        guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA else { return nil }
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+
+        var sum = 0.0
+        var count = 0
+        var y = 0
+        while y < height {
+            let row = base.advanced(by: y * rowBytes).assumingMemoryBound(to: UInt8.self)
+            var x = 0
+            while x < width {
+                let pixel = row + x * 4
+                // BGRA
+                sum += 0.0722 * Double(pixel[0]) + 0.7152 * Double(pixel[1]) + 0.2126 * Double(pixel[2])
+                count += 1
+                x += 24
+            }
+            y += 24
+        }
+        guard count > 0 else { return nil }
+        return sum / Double(count) / 255.0
+    }
+
+    /// 系统 AE 不可用时的兜底：按画面平均亮度调 ISO。
+    ///
+    /// 只在两件事同时成立时动手：
+    /// 1. 曝光模式是「自动」（用户没选手动，就不该抢他的 ISO）
+    /// 2. `activeFormat.isAutoExposureSupported == false` —— 这条格式下
+    ///    写 `exposureMode = .continuousAutoExposure` 会被静默忽略，
+    ///    画面于是停在默认曝光上，正是「0EV 偏暗」的来源
+    ///
+    /// 目标 0.42 是画面平均亮度：正常曝光的中灰大约落在 0.4–0.5。
+    /// 步长限在 ±40%，半秒一次，避免在灯光边沿来回过冲。
+    @MainActor
+    private func applyFallbackAutoExposure(mean: Double) {
+        guard exposure.mode == .autoBoth else { return }
+        guard let device = capture.videoDevice else { return }
+        guard !device.activeFormat.isAutoExposureSupported else { return }
+        let error = 0.42 - mean
+        guard abs(error) > 0.04 else { return }
+        let factor = min(max(1 + error * 1.3, 0.65), 1.5)
+        exposure.nudgeISO(factor: factor)
+    }
+
     var pipelineDiagnosticsText: String {
         var text = stats.snapshot.diagnosticsDetail ?? "—"
         // EV 滑块失效、手动对焦没滑块，两个现象都可能是「这条格式下系统
@@ -867,6 +929,29 @@ final class RecordingEngine: ObservableObject {
                            device.minExposureTargetBias, device.maxExposureTargetBias)
             text += "·fp\(device.isLockingFocusWithCustomLensPositionSupported ? 1 : 0)"
             text += "·fpi\(device.isFocusPointOfInterestSupported ? 1 : 0)"
+
+            // ---- 曝光/对焦的真实运行状态 ----
+            //
+            // 「默认 0EV 偏暗」到底是系统 AE 没在跑、还是 AE 跑了但亮度曲线不同，
+            // 靠猜没有意义，把这四个数写进容器一次就能定：
+            //   ae  = activeFormat.isAutoExposureSupported。0 表示这条格式
+            //         根本不支持自动曝光，`exposureMode = .continuousAutoExposure`
+            //         会被静默忽略，画面就停在默认曝光上（正是"偏暗"的样子）
+            //   em  = 实际 exposureMode（0 锁定 / 1 自动 / 2 连续自动 / 3 自定义）
+            //   iso / dur = 当前 ISO 与快门（dur 写成 1/x）
+            //   ofs = exposureTargetOffset，AE 在跑时应当接近 0
+            //   fm / lp   = 对焦模式与镜头实际位置，验证滑块写入有没有落地
+            text += "·ae\(device.activeFormat.isAutoExposureSupported ? 1 : 0)"
+            text += "·em\(device.exposureMode.rawValue)"
+            text += "·iso\(Int(device.iso.rounded()))"
+            let seconds = CMTimeGetSeconds(device.exposureDuration)
+            text += seconds > 0 ? "·dur1/\(Int((1 / seconds).rounded()))" : "·dur?"
+            text += String(format: "·ofs%.2f", device.exposureTargetOffset)
+            text += "·fm\(device.focusMode.rawValue)"
+            text += String(format: "·lp%.2f", device.lensPosition)
+            if let error = focus.lastError {
+                text += "·fx\(error.prefix(24))"
+            }
         }
         return text
     }
