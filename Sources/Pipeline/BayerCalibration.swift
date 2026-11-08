@@ -76,7 +76,9 @@ final class BayerCalibration {
             text += String(format: "·tv%.4f", bestVariation)
             if !modeCross.isEmpty {
                 // 各排法的相邻差均值，最小者即选中。真实数据上的分离度约 14 倍
-                let list = modeCross.map { $0.isFinite ? String(format: "%.0f", min($0, 9999)) : "x" }
+                // 三位小数：这些值是归一化到 0–1 的平均相邻差，
+                // 正确排法约 0.05、错排 0.7–0.8。用整数格式会全变成 0
+                let list = modeCross.map { $0.isFinite ? String(format: "%.3f", min($0, 9.999)) : "x" }
                 text += "·cx" + list.joined(separator: "/")
             }
             if !modePeriodicities.isEmpty {
