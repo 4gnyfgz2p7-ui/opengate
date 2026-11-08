@@ -358,12 +358,12 @@ final class Log2Transcoder {
         }
 
         writer.endSession(atSourceTime: lastPTS + frameDuration)
-        writer.finishWriting()
-        // finishWriting 是异步的，这里同步等它落盘
-        var waited = 0
-        while writer.status == .writing && waited < 6_000 {
-            usleep(5_000)
-            waited += 1
+        // finishWriting 只有异步版本，用信号量等它落盘。
+        // 这里已经在后台线程，阻塞没有副作用。
+        let flushed = DispatchSemaphore(value: 0)
+        writer.finishWriting { flushed.signal() }
+        if flushed.wait(timeout: .now() + 30) == .timedOut {
+            throw TranscodeError.writerFailed("封盘超时（30 秒）")
         }
         if writer.status == .failed {
             throw TranscodeError.writerFailed(writer.error?.localizedDescription ?? "封盘失败")
