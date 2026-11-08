@@ -16,8 +16,10 @@ struct RecorderView: View {
 
     @StateObject private var engine = RecordingEngine()
     @State private var showSettings = false
-    /// 几何申请迟迟不生效时的放行开关：宁可有瑕疵的界面，不留死黑屏
-    @State private var forceShow = false
+    /// 最近一次「窗口方向与拍摄方向一致」时的完整布局。
+    /// 方向切换的过渡期（窗口还没转到位）沿用它渲染，内容跟着窗口转过去，
+    /// 全程不闪黑——黑屏从机制上被消掉，而不是靠缩短时长。
+    @State private var cachedLayout: CachedLayout?
     @State private var escapeTask: Task<Void, Never>?
     @Environment(\.scenePhase) private var scenePhase
 
@@ -41,13 +43,11 @@ struct RecorderView: View {
             let zones = layoutZones(size: size)
             let landscape = size.width > size.height
 
-            // 方向键按下后、窗口转过去之前的一瞬，布局分支（看窗口尺寸）
-            // 与拍摄画幅（看 degrees）必然互相矛盾——旧版截图里
-            // 「横屏里竖长条预览」正是这一瞬被定格的结果。
-            // 此时只画黑底，等窗口转到与拍摄方向一致再出界面；
-            // 若几何申请迟迟不生效（forceShow 放行），黑屏有上限，不会卡死。
+            // 窗口方向与拍摄方向一致才用当前尺寸算布局；
+            // 方向键按下后、窗口转过去的过渡期沿用最近合法布局
+            // （内容随窗口转过去再就位），不再有黑屏过渡帧。
             let captureLandscape = engine.rotationDegrees == 0 || engine.rotationDegrees == 180
-            let inSync = forceShow || landscape == captureLandscape
+            let inSync = landscape == captureLandscape
 
             // 界面跟着「拍摄方向」按钮走：按一下让窗口本身转过去，
             // 而不是把内容层转 90°（那会把取景和控件各转一次，画面压成一条）。
@@ -55,16 +55,13 @@ struct RecorderView: View {
                 Color.black
 
                 if inSync {
-                    previewPane(rect: zones.preview, degrees: engine.rotationDegrees)
-
-                    // 横屏：时间码与波形都在镜头那一侧的竖轨上，不压画面
-                    if let lens = zones.lens {
-                        lensRail(rect: lens)
-                    } else {
-                        topBarPane(rect: zones.bar, landscape: false)
-                    }
-
-                    controlsPane(rect: zones.controls, landscape: landscape)
+                    layoutContent(zones: zones, landscape: landscape)
+                } else if let cached = cachedLayout {
+                    Color.clear
+                        .overlay {
+                            layoutContent(zones: cached.zones, landscape: cached.landscape, degrees: cached.degrees)
+                                .frame(width: cached.size.width, height: cached.size.height)
+                        }
                 }
             }
             .frame(width: size.width, height: size.height)
@@ -77,6 +74,16 @@ struct RecorderView: View {
                     scale: scene?.screen.scale ?? 3,
                     orientationName: scene.map { orientationName($0.interfaceOrientation) } ?? "未知"
                 )
+                // 同步期间刷新最近合法布局缓存（过渡期就靠它撑住画面）
+                let capLandscape = engine.rotationDegrees == 0 || engine.rotationDegrees == 180
+                if (newSize.width > newSize.height) == capLandscape {
+                    cachedLayout = CachedLayout(
+                        zones: layoutZones(size: newSize),
+                        size: newSize,
+                        landscape: newSize.width > newSize.height,
+                        degrees: engine.rotationDegrees
+                    )
+                }
             }
         }
         .ignoresSafeArea()
@@ -109,6 +116,29 @@ struct RecorderView: View {
         var controls: CGRect
         /// 横屏时的镜头侧竖轨：时间码 + 波形
         var lens: CGRect?
+    }
+
+    /// 过渡期缓存的整块布局（含当时的拍摄角度，预览层在过渡期保持原角度不动）
+    private struct CachedLayout {
+        let zones: Zones
+        let size: CGSize
+        let landscape: Bool
+        let degrees: CGFloat
+    }
+
+    /// 三块分区（预览 / 顶栏或镜头侧竖轨 / 控件）的统一装配。
+    /// 正常态用当前 zones，过渡态用缓存的 zones。
+    @ViewBuilder
+    private func layoutContent(zones: Zones, landscape: Bool, degrees: CGFloat? = nil) -> some View {
+        previewPane(rect: zones.preview, degrees: degrees ?? engine.rotationDegrees)
+
+        if let lens = zones.lens {
+            lensRail(rect: lens)
+        } else {
+            topBarPane(rect: zones.bar, landscape: false)
+        }
+
+        controlsPane(rect: zones.controls, landscape: landscape)
     }
 
     /// 窗口安全区：横屏时刘海/灵动岛在侧边，不能再按固定 14pt 贴边
@@ -158,9 +188,8 @@ struct RecorderView: View {
         case 270: mask = .portraitUpsideDown;  targetName = "portraitUpsideDown(倒置)"
         default:  mask = .portrait;            targetName = "portrait(竖拍)"
         }
-        // 先收紧支持面再申请几何：运行期支持的方向永远只有一个，
-        // 物理转机身不再触发系统自转，方向键申请的落点不会被抢走。
-        AppDelegate.supportedMask = mask
+        // 支持面的写入挪到下方 async 块里，与「VC 重查 → 几何申请」同一轮 runloop，
+        // 保证裁决链读到的支持面就是本次要申请的方向。
         monitor.note("锁定支持面 \(targetName)")
 
         guard let scene = foregroundScene else {
@@ -171,11 +200,18 @@ struct RecorderView: View {
         monitor.noteRequest(targetName, target: target, scene: scene)
         guard scene.interfaceOrientation != target else { return }
 
-        // 几何申请必须挪出当前的 SwiftUI 更新事务：方向键的 onChange
-        // 处在状态传播中，此刻同步调 UIKit 的窗口旋转会重入布局事务，
-        // 最后一帧（纯黑过渡帧）被冻在屏幕上——「一点横就黑、再无响应」。
-        // 挪到下一个 runloop 回合执行：事务先收尾，旋转再开始。
+        // 两条铁律，缺一就被 UISceneErrorDomain 101 拒（「受支持：portrait」）：
+        // 1) 申请挪出 SwiftUI 更新事务，下一轮 runloop 执行；
+        // 2) 根视图控制器会缓存首次查到的支持方向（launch 时 = portrait），
+        //    改完 AppDelegate 支持面必须先 setNeedsUpdateOfSupportedInterfaceOrientations
+        //    让它重查，再发申请——0.5.19 及之前缺第 2 条，前两次申请全被拒，
+        //    设备日志实测黑屏 6.7 s 的直接原因。
         DispatchQueue.main.async {
+            AppDelegate.supportedMask = mask
+            if let root = scene.keyWindow?.rootViewController
+                ?? scene.windows.first(where: { !$0.isHidden })?.rootViewController {
+                root.setNeedsUpdateOfSupportedInterfaceOrientations()
+            }
             scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { error in
                 Task { @MainActor in
                     RotationMonitor.shared.noteRequestResult(error.localizedDescription)
@@ -184,21 +220,14 @@ struct RecorderView: View {
         }
     }
 
-    /// 黑屏逃生门：申请发出 2.5 s 窗口仍未跟上就补发一次；再 1.2 s 仍不齐就放行界面。
-    /// 黑屏必须有上限——「整体显示错乱」远好过「看似死机」。
+    /// 逃生门：申请若仍被拒，1.5 s 后补发一次（期间缓存布局撑住画面，不会黑屏）。
     private func scheduleEscape(_ degrees: CGFloat) {
         escapeTask?.cancel()
         escapeTask = Task {
-            try? await Task.sleep(nanoseconds: 2_500_000_000)
-            guard !Task.isCancelled else { return }
-            guard escapeNeeded(degrees) else { return }
-            forceInterface(degrees)
-
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
             guard !Task.isCancelled else { return }
             if escapeNeeded(degrees) {
-                forceShow = true
-                RotationMonitor.shared.noteEscape(after: 3.7)
+                forceInterface(degrees)
             }
         }
     }
@@ -503,7 +532,6 @@ struct RecorderView: View {
                     sessionReady: engine.sessionReady,
                     sessionRunning: engine.capture.isRunning
                 )
-                forceShow = false
                 scheduleEscape(to)
             } label: {
                 Text(engine.rotation.shortLabel)
