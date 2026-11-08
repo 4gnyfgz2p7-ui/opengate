@@ -76,13 +76,16 @@ final class FileProcessor: ObservableObject {
 
             let target = MovieRecorder.makeOutputURL(tier: tier)
             do {
-                let result = try RawTranscoder.run(
+                // 走与 PC 端 tools/opengate_log2.py 同一条思路：
+                // 解出画面 → 套 Apple Log 2 曲线 → HEVC → 注入 colr(9/2/9) + logs。
+                let result = try await Log2Transcoder.run(
                     rawURL: url,
                     outputURL: target,
-                    tier: tier,
-                    metadata: [],
-                    selfCalibrate: false
-                )
+                    applyCurve: true,
+                    bitRate: 45_000_000
+                ) { line in
+                    TranscodeLog.write(line)
+                }
                 let size = MovieRecorder.fileSize(at: target)
                 await MainActor.run {
                     guard let self else { return }
@@ -91,7 +94,7 @@ final class FileProcessor: ObservableObject {
                     self.status = String(
                         format: "完成：%d 帧 · %.1f 秒 · %.1f MB\n%@",
                         result.frames, result.elapsed,
-                        Double(size) / 1_000_000, result.probe
+                        Double(size) / 1_000_000, result.summary
                     )
                     self.stopLogPolling()
                 }
