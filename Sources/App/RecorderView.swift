@@ -444,6 +444,16 @@ struct RecorderView: View {
                     .frame(maxWidth: .infinity)
             }
 
+            if let note = engine.companionNote {
+                Text(note)
+                    .font(.system(size: 10))
+                    .foregroundStyle(engine.companionURL == nil
+                                     ? Color.orange.opacity(0.85)
+                                     : Color.green.opacity(0.7))
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+            }
+
             VStack(spacing: 8) {
                 ExposureStrip(exposure: engine.exposure, accent: accent, compact: landscape, embedded: true)
                 WhiteBalanceStrip(whiteBalance: engine.whiteBalance, accent: accent, embedded: true)
@@ -1071,6 +1081,22 @@ struct SettingsSheet: View {
             row("像素格式", engine.captureConfiguration?.pixelFormat ?? "—")
             row("GPU 自检", engine.pipelineBadge)
             row("定位", engine.lastLocationText)
+
+            // 只在 RAW 档有意义：副路成功才删母版，失败不动素材
+            if engine.tier.isRawBayer {
+                Toggle(isOn: $engine.discardRAWWhenCompanionSucceeds) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("成品成功后删除 RAW 母版")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.white.opacity(0.85))
+                        Text("副路 HEVC Log 2 写成功才删，失败保留 RAW")
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.white.opacity(0.45))
+                    }
+                }
+                .tint(accent)
+            }
+
             if let note = engine.thermalNote {
                 row("机身温度", note)
             }
@@ -1099,7 +1125,6 @@ struct SettingsSheet: View {
                         Image(systemName: engine.tier == tier ? "checkmark.circle.fill" : "circle")
                             .font(.system(size: 13))
                             .foregroundStyle(engine.tier == tier ? accent : Color.white.opacity(0.25))
-
                         VStack(alignment: .leading, spacing: 2) {
                             Text(tier.displayName)
                                 .font(.system(size: 13, weight: .medium))

@@ -69,8 +69,14 @@ final class CaptureController: NSObject {
 
     private(set) var videoDevice: AVCaptureDevice?
     private(set) var videoOutput = AVCaptureVideoDataOutput()
+    /// 第二路视频输出。RAW 档录制时用它同时产出成品文件——
+    /// 主路拿 btp2 原始 Bayer 存 RAW，这一路拿系统 ISP 的 10-bit YUV
+    /// 直接喂 HEVC 编码器，两路都是硬件直通，不需要解码再编码。
+    private(set) var companionOutput: AVCaptureVideoDataOutput?
     private(set) var audioOutput = AVCaptureAudioDataOutput()
     private(set) var configuration = Configuration()
+
+    private let companionQueue = DispatchQueue(label: "acamera.capture.companion", qos: .userInitiated)
 
     private var videoInput: AVCaptureDeviceInput?
     private var audioInput: AVCaptureDeviceInput?
@@ -80,6 +86,8 @@ final class CaptureController: NSObject {
 
     /// 每一帧视频（已带原始 PTS）
     var onVideoSample: ((CMSampleBuffer) -> Void)?
+    /// 副路画面（系统 ISP 的 YUV），与主路同一时刻、同一曝光
+    var onCompanionSample: ((CMSampleBuffer) -> Void)?
     /// 每一声频块
     var onAudioSample: ((CMSampleBuffer) -> Void)?
 
@@ -260,6 +268,66 @@ final class CaptureController: NSObject {
         videoInput = nil
         audioInput = nil
         videoDevice = nil
+        companionOutput = nil
+    }
+
+    // MARK: - 副路输出（RAW 档的实时成品）
+
+    /// 挂上第二路视频输出，拿系统 ISP 处理好的 YUV。
+    ///
+    /// 与主路并存：主路仍按原设置拿 btp2，这一路单独要 `x420`。
+    /// 两路共用同一次曝光，PTS 来自同一个时钟，天然对齐。
+    ///
+    /// 失败一律返回 false 而不是抛错——副路是附加功能，
+    /// 挂不上就只录主路，不能让整档录制起不来。
+    @discardableResult
+    func enableCompanionOutput() -> Bool {
+        if companionOutput != nil { return true }
+
+        let out = AVCaptureVideoDataOutput()
+        out.alwaysDiscardsLateVideoFrames = true
+
+        session.beginConfiguration()
+        guard session.canAddOutput(out) else {
+            session.commitConfiguration()
+            return false
+        }
+        session.addOutput(out)
+
+        // 优先 10-bit；没有就按 8-bit → BGRA 逐级退
+        let code: OSType
+        if out.availableVideoPixelFormatTypes.contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) {
+            code = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        } else if let fallback = Self.firstProcessedFormat(from: out.availableVideoPixelFormatTypes) {
+            code = fallback
+        } else {
+            session.removeOutput(out)
+            session.commitConfiguration()
+            return false
+        }
+        out.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: code]
+
+        if let connection = out.connection(with: .video) {
+            if connection.isVideoStabilizationSupported {
+                connection.preferredVideoStabilizationMode = .off
+            }
+            if connection.isVideoRotationAngleSupported(0) {
+                connection.videoRotationAngle = 0
+            }
+        }
+
+        session.commitConfiguration()
+        out.setSampleBufferDelegate(self, queue: companionQueue)
+        companionOutput = out
+        return true
+    }
+
+    func disableCompanionOutput() {
+        guard let out = companionOutput else { return }
+        session.beginConfiguration()
+        session.removeOutput(out)
+        session.commitConfiguration()
+        companionOutput = nil
     }
 
     /// 换一个能吐 YUV 的格式。
@@ -674,6 +742,8 @@ extension CaptureController: AVCaptureVideoDataOutputSampleBufferDelegate,
         if output === videoOutput {
             deliveredVideoFrames += 1
             onVideoSample?(sampleBuffer)
+        } else if output === companionOutput {
+            onCompanionSample?(sampleBuffer)
         } else if output === audioOutput {
             onAudioSample?(sampleBuffer)
         }

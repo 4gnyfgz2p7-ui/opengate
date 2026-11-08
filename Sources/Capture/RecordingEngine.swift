@@ -224,6 +224,16 @@ final class RecordingEngine: ObservableObject {
 
     private let recorderBox = RecorderBox()
 
+    /// 副路写入器：RAW 档录制时同时产出的成品文件。
+    /// 与主路是两个独立的 AVAssetWriter，同一帧时间戳、同一曝光。
+    /// 走 RecorderBox 是因为写线程在采集队列、创建/收尾在主线程。
+    private let companionBox = RecorderBox()
+    private(set) var companionURL: URL?
+    /// 副路当前状态，界面显示用
+    @Published private(set) var companionNote: String?
+    /// 副路成功时删除 RAW 母版，只留成品
+    @Published var discardRAWWhenCompanionSucceeds = false
+
     /// 中转任务：录制时落 ProRes RAW，停止后转成用户选的档位。
     /// 记下临时文件与最终目标，成功后删临时文件，失败则保留素材。
     private var relayPending: (raw: URL, final: URL, tier: QualityTier)?
@@ -275,6 +285,13 @@ final class RecordingEngine: ObservableObject {
         let gate = FrameGate()
         let statsBox = stats
         let wbBox = wbGains
+
+        // 副路：系统 ISP 已经处理好的 YUV，直接进第二个写入器。
+        // 不解码、不转色彩——编码器要的就是这个格式，硬件编码器接住即可。
+        capture.onCompanionSample = { [weak self] buffer in
+            guard let self, let rec = self.companionBox.get() else { return }
+            _ = rec.appendVideo(buffer)
+        }
 
         capture.onVideoSample = { [weak self] buffer in
             let recorder = box.get()
@@ -850,6 +867,43 @@ final class RecordingEngine: ObservableObject {
                     rawMetadata: rawMetadata
                 )
                 self.recorderBox.set(recorder)
+
+                // ---- 双路：RAW 档同时产出一份成品 ----
+                //
+                // 主路存 btp2 原始 Bayer，副路拿系统 ISP 处理好的 10-bit YUV，
+                // 直接交给 HEVC 硬件编码器。两路都是直通，没有解码再编码，
+                // 所以 24 fps 实时跑得动——离线解 RAW 只有 1-2 fps，那条路不行。
+                self.companionBox.set(nil)
+                self.companionURL = nil
+                self.companionNote = nil
+                if recordingTier.isRawBayer {
+                    if self.capture.enableCompanionOutput() {
+                        let stem = finalURL.deletingPathExtension().lastPathComponent
+                        let companion = finalURL.deletingLastPathComponent()
+                            .appendingPathComponent(stem + "_Log2")
+                            .appendingPathExtension("mov")
+                        do {
+                            let rec = try MovieRecorder(
+                                outputURL: companion,
+                                tier: .hevcLongGOP,
+                                width: width,
+                                height: height,
+                                metadata: metadata,
+                                withAudio: false,
+                                appleLog2: true,
+                                videoTransform: CGAffineTransform(rotationAngle: degrees * .pi / 180)
+                            )
+                            self.companionBox.set(rec)
+                            self.companionURL = companion
+                            self.companionNote = "副路：HEVC Log 2 · 与 RAW 同帧"
+                        } catch {
+                            self.capture.disableCompanionOutput()
+                            self.companionNote = "副路写入器被拒，只录 RAW：\(error.localizedDescription)"
+                        }
+                    } else {
+                        self.companionNote = "系统不允许第二路视频输出，只录 RAW"
+                    }
+                }
                 self.relayPending = relay
                     ? (raw: outputURL, final: finalURL, tier: selectedTier)
                     : nil
@@ -885,6 +939,20 @@ final class RecordingEngine: ObservableObject {
             }
             self.recorderBox.set(nil)
             var outcome = await recorder.finish()
+
+            // 副路收尾：与主路同一次 stop，不额外等待。
+            // 先摘回调再拆输出，避免收尾期间还有帧进来写已关闭的 writer。
+            var companionOutcome: MovieRecorder.Outcome?
+            if let companion = self.companionBox.get() {
+                self.companionBox.set(nil)
+                companionOutcome = await companion.finish()
+            }
+            self.capture.disableCompanionOutput()
+            if let result = companionOutcome, result.finishedCleanly {
+                self.companionNote = "副路已保存 \(result.url.lastPathComponent) · \(result.writtenVideoFrames) 帧"
+            } else if self.companionURL != nil {
+                self.companionNote = "副路没有写成功，RAW 不受影响"
+            }
 
             // ---- 中转：把刚录的 ProRes RAW 转成用户选的档位 ----
             if let relay = self.relayPending {
@@ -940,6 +1008,16 @@ final class RecordingEngine: ObservableObject {
                         note: "转码失败，已保留 ProRes RAW：\(error.localizedDescription)"
                     )
                 }
+            }
+
+            // 只要成品：副路写成功就把 RAW 母版删掉。
+            // RAW 在这套流程里是中间产物——成品已经有 Log 2 曲线和可用编码，
+            // 留着只是占 55 MB/s × 时长。开关默认关，素材默认不丢。
+            if self.discardRAWWhenCompanionSucceeds,
+               let result = companionOutcome, result.finishedCleanly {
+                try? FileManager.default.removeItem(at: outcome.url)
+                self.companionNote = "已删除 RAW 母版，只留 \(result.url.lastPathComponent)"
+                outcome = result
             }
 
             self.history.insert(outcome, at: 0)
