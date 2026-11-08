@@ -617,9 +617,11 @@ final class BayerCalibration {
             whiteBalanceRed = Float(pow(deviceRed, wbStrength))
             whiteBalanceBlue = Float(pow(deviceBlue, wbStrength))
             wbFromDevice = true
-        } else if levelG > 0.01 {
-            // 画面太暗（绿通道分位低于 1% 满量程）时三通道都被噪声主导，
-            // 算出来的比例没有意义，宁可不动白平衡
+        } else if levelG > 0.003 {
+            // 画面太暗时三通道都被噪声主导，算出来的比例没有意义。
+            // 但阈值不能定太高：RAW 域的绿通道分位本来就低（这张片子均值
+            // 只有 0.026 满量程），按 0.01 卡会把正常场景一并拒掉，
+            // 增益停在 1.00/1.00——诊断里的 wb1.00/1.00 就是这么来的。
             if levelR > 1e-6 {
                 // 4 倍之外的比例不是白平衡能解释的，多半是通道算错了，别硬拉
                 let ratio = min(4.0, max(0.25, levelG / levelR))
