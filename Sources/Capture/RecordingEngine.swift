@@ -727,8 +727,6 @@ final class RecordingEngine: ObservableObject {
         refreshWhiteBalanceGains()
 
         let selectedTier = tier
-        // 每次开录重读一次校准结果：上次录制可能刚把它算出来
-        Self.bayerSolution = BayerSelfCalibration.saved
         // 颜色链路：不再用自研 btp2 解包。
         //
         // 相机给的是 btp2 私有打包，自研解包与官方解码始终对不上
@@ -740,11 +738,23 @@ final class RecordingEngine: ObservableObject {
         // 重新编码成用户选的档位。
         //
         // 代价是临时空间与一次转码等待，换来的是颜色由 Apple 解码器保证。
-        // 自校准一旦成立，自研解包就有了可信位序，可以直接实时录，
-        // 不必再走 ProRes RAW 中转（省掉临时空间和转码等待）。
-        let needsRelay = !BayerSelfCalibration.hasSolution
-        let relay = needsRelay
-            && !selectedTier.isRawBayer
+        //
+        // ---- 为什么不再走实时自研解包 ----
+        //
+        // 自校准确实能把 btp2 的位序算对，但位序只是入口。解出来之后还要
+        // 做白平衡、相机矩阵、滚降——每一层都是在系统结果上的二次加工。
+        // 同一帧实测对比：
+        //
+        //   官方直通   暗部 p5=20.1  中位饱和度 0.168
+        //   自研管线   暗部 p5=56.2  中位饱和度 0.149
+        //
+        // 黑位被抬高 36 级，饱和度掉 11%——画面"发灰"就是这个。滚降
+        // l/(l+0.25) 是凹函数，暗部斜率高，数学上必然把黑抬起来，
+        // 调参数救不回来。
+        //
+        // 系统有完整的 RAW 处理（线性化 + 矩阵 + tone mapping），
+        // 没有理由再叠一层。所以这里无条件走中转，颜色全部交给系统。
+        let relay = !selectedTier.isRawBayer
             && captureConfiguration?.isBayer == true
         let recordingTier: QualityTier = relay ? .proResRAW : selectedTier
         let width = Int(captureConfiguration?.width ?? 4224)
@@ -800,10 +810,13 @@ final class RecordingEngine: ObservableObject {
                 width: width,
                 height: height,
                 frameRate: VideoSettingsBuilder.frameRate,
-                colorPipeline: selectedTier.isRawBayer
-                    ? "proresraw-bayer-passthrough"
-                    : (self.captureConfiguration?.isBayer == true
-                        ? "bayer12-demosaic-rec709"
+                // 颜色链路标记：中转录制最终是系统转码出来的，
+                // 不能再标成 bayer12-demosaic-rec709——那是自研解包时代的产物，
+                // 日志和成片元数据会互相矛盾。
+                colorPipeline: relay
+                    ? "system-raw-pipeline"
+                    : (selectedTier.isRawBayer
+                        ? "proresraw-bayer-passthrough"
                         : "system-isp-sdr"),
                 audioDescription: AudioSettings.description,
                 locationOutcome: locationOutcome,
@@ -831,13 +844,9 @@ final class RecordingEngine: ObservableObject {
                     ? (raw: outputURL, final: finalURL, tier: selectedTier)
                     : nil
                 self.relayMetadata = metadata
-                // 中转的这一次顺便把 btp2 原始字节存下来，
-                // 转码时用官方解码结果反推位序，成功后就不必再中转
-                if relay {
-                    // 先清掉上一次的残留：混进新切片会让帧序号冲突
-                    BayerDump.clear()
-                    BayerDump.enable()
-                }
+                // 不再 dump btp2 原始字节：自校准没有用处了。
+                // 位序算得再对，后面那套调色也只是在系统结果上二次加工。
+                BayerDump.clear()
             } catch {
                 self.state = .failed(error.localizedDescription)
                 return
