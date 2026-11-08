@@ -115,9 +115,13 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
     ///
     /// 数值按**每像素多少 bit** 折算，不按「感觉画质高」拍脑袋定。
     /// 4224×3024 @24fps = 306 M像素/秒，于是：
-    ///   50 Mb/s  ÷ 306 M = 0.16 bit/像素（长 GOP，接近手机出厂的日常档）
-    ///  130 Mb/s ÷ 306 M = 0.42 bit/像素（全 I 帧，约为长 GOP 的 2.6 倍，
-    ///                       帧内编码缺少时域预测，同画质本就该是这个倍数）
+    ///   20 Mb/s  ÷ 306 M = 0.065 bit/像素（长 GOP）
+    ///   60 Mb/s  ÷ 306 M = 0.20 bit/像素（全 I 帧，3 倍）
+    ///
+    /// 0.065 bit/像素 是对着 Apple 相机实测定的：它 3840×2160@24 的 H.264
+    /// 是 12.4 Mb/s = 0.062 bit/像素。我们分辨率大 1.54 倍，按同等 bpp 折算
+    /// 就是 19 Mb/s；而 HEVC 同画质比 H.264 省 30% 以上，所以 20 Mb/s
+    /// 应当在观感上不输它。之前的 50 Mb/s 是 0.16 bpp，等于硬塞 2.5 倍冗余。
     ///
     /// 更早还写过 200 / 500 Mb/s（0.65 / 1.63 bit/像素），两个数都离谱：
     /// - 长 GOP 1.48 GB/分钟，比 iPhone 大 3 倍，「最小文件档」名不副实；
@@ -127,8 +131,8 @@ enum QualityTier: String, CaseIterable, Identifiable, Codable {
     var averageBitRate: Int? {
         switch self {
         case .proResHQ, .proResLT, .proResRAW: return nil
-        case .hevcLongGOP: return 50_000_000
-        case .hevcAllIntra: return 130_000_000
+        case .hevcLongGOP: return 20_000_000
+        case .hevcAllIntra: return 60_000_000
         }
     }
 

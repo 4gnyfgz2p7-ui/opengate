@@ -61,6 +61,8 @@ final class BayerCalibration {
         var patternLevels: [Double] = []
         /// 四种相位的「两绿点相对差」，最小者即真实相位
         var patternGreen: [Double] = []
+        /// 白平衡是否来自设备 AWB（false 表示退回了灰度世界）
+        var wbFromDevice = false
 
         var summary: String {
             let patterns = ["RGGB", "BGGR", "GRBG", "GBRG"]
@@ -74,6 +76,7 @@ final class BayerCalibration {
             }
             if redBlueSwapped { text += "·sw" }
             text += String(format: "·wb%.2f/%.2f", Double(whiteBalanceRed), Double(whiteBalanceBlue))
+            text += (wbFromDevice ? "d" : "g")
             text += String(format: "·lv%.2f/%.2f", min(levelRed, 9.99), min(levelBlue, 9.99))
             text += String(format: "·bw%.0f/%.0f", blackLevel, whiteLevel)
             text += "·dev" + patterns[Int(max(0, min(3, devicePattern)))]
@@ -232,7 +235,21 @@ final class BayerCalibration {
         preferredPattern: Int32
     ) -> Outcome {
 
+        /// 相位/白平衡采样的步长。必须是**偶数**：quad 四个位置的
+        /// 颜色分配假设 index 0 落在 (偶, 偶)，步长为奇数会让对齐逐次旋转。
         let step = 24
+
+        /// 排法比对的扫描步长，必须是**奇数**。
+        ///
+        /// 这里踩过一个很隐蔽的坑：打包周期是 8 个像素一组（2px/3B 时
+        /// 每 4 组共 12 字节），而步长 24 正好是 8 的整数倍 —— 采样永远落在
+        /// 每组第 0、1 个字节上，而那两位在真实格式里恰好都是合法高字节。
+        /// 于是 8px/12B 那几种错排也被算成「很平滑」，和正确排法打平：
+        ///   step=24 → 0.017 0.018 … 0.017 0.017（mode 0/1/6/9/10 并列）
+        ///   step=27 → 0.415 0.417 … 0.018 0.017（只有 9/10 低）
+        /// 奇数步长与 8、4、2 都互质，能把所有字节位置都扫到。
+        let scanStep = 27
+
         let invRange = 1.0 / Double(max(white - black, 1))
         let blackValue = Double(black)
         let bytes = base.assumingMemoryBound(to: UInt8.self)
@@ -262,9 +279,9 @@ final class BayerCalibration {
         var maxSample = [Double](repeating: 0, count: candidateCount)
         var sampleCount = 0.0
 
-        var sampleY = step
+        var sampleY = scanStep
         while sampleY + 2 < height {
-            var sampleX = step
+            var sampleX = scanStep
             while sampleX + 2 < width {
                 for mode in 0..<candidateCount {
                     let center = value(mode, sampleX, sampleY)
@@ -280,9 +297,9 @@ final class BayerCalibration {
                     if center > maxSample[mode] { maxSample[mode] = center }
                 }
                 sampleCount += 1
-                sampleX += step
+                sampleX += scanStep
             }
-            sampleY += step
+            sampleY += scanStep
         }
 
         // 每种排法的同色/异色比，只作为诊断留档
@@ -575,11 +592,25 @@ final class BayerCalibration {
             redBlueSwapped = true
         }
 
+        // 白平衡优先取**设备自己的 AWB 增益**（deviceWhiteBalanceGains，绿归一）。
+        //
+        // 原来这里是纯粹的灰度世界：把每通道 60% 分位拉到相等。问题是它假设
+        // 画面平均是灰的，遇到大面积单色就会把白拉偏——0.5.32 那条片子整屋蓝柜子，
+        // 测下来最亮的墙面 B/R 仍有 1.16，白窗帘偏青，正是这个原因。
+        // Apple 相机用的就是 deviceWhiteBalanceGains，直接拿来用即可。
+        // 设备值缺失或越界时才退回灰度世界。
         var whiteBalanceRed: Float = 1
         var whiteBalanceBlue: Float = 1
-        // 画面太暗（绿通道分位低于 1% 满量程）时三通道都被噪声主导，
-        // 算出来的比例没有意义，宁可不动白平衡
-        if levelG > 0.01 {
+        var wbFromDevice = false
+        let deviceRed = Double(redGain)
+        let deviceBlue = Double(blueGain)
+        if deviceRed > 0.2, deviceRed < 5, deviceBlue > 0.2, deviceBlue < 5 {
+            whiteBalanceRed = Float(deviceRed)
+            whiteBalanceBlue = Float(deviceBlue)
+            wbFromDevice = true
+        } else if levelG > 0.01 {
+            // 画面太暗（绿通道分位低于 1% 满量程）时三通道都被噪声主导，
+            // 算出来的比例没有意义，宁可不动白平衡
             if levelR > 1e-6 {
                 // 0.35–2.8 之外的比例不是白平衡能解释的，多半是通道算错了，别硬拉
                 whiteBalanceRed = Float(min(2.8, max(0.35, levelG / levelR)))
@@ -612,6 +643,7 @@ final class BayerCalibration {
         outcome.modeCross = crossRms
         outcome.patternLevels = patternLevels
         outcome.patternGreen = patternGreen
+        outcome.wbFromDevice = wbFromDevice
         return outcome
     }
 }

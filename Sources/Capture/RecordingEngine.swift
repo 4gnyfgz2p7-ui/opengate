@@ -113,6 +113,27 @@ final class FrameStats {
 
 /// Bayer 转换很贵（19 MB 拷贝 + 1270 万像素 demosaic），
 /// 源却按 60 fps 送帧。这里按 30 fps 放行，写入端再按 24 帧网格去重。
+/// 设备 AWB 增益的跨线程传递。
+///
+/// 采集回调跑在专用队列上，而 `deviceWhiteBalanceGains` 只能在持有设备的
+/// 线程上取；主线程算好写进来，回调只做一次加锁读。
+final class WBGainsBox {
+    private let lock = NSLock()
+    private var value: (red: Float, blue: Float)?
+
+    func set(red: Float, blue: Float) {
+        lock.lock()
+        value = (red, blue)
+        lock.unlock()
+    }
+
+    func get() -> (red: Float, blue: Float)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 final class FrameGate {
     private let lock = NSLock()
     private var last: CMTime = .invalid
@@ -213,6 +234,9 @@ final class RecordingEngine: ObservableObject {
     private let stats = FrameStats()
     private var recovering = false
 
+    /// 设备 AWB 增益（绿归一），供采集回调读取
+    private let wbGains = WBGainsBox()
+
     /// 管线降级说明，显示在设置页
     @Published private(set) var pipelineNote: String?
 
@@ -242,6 +266,7 @@ final class RecordingEngine: ObservableObject {
         let converter = bayerConverter
         let gate = FrameGate()
         let statsBox = stats
+        let wbBox = wbGains
 
         capture.onVideoSample = { [weak self] buffer in
             let recorder = box.get()
@@ -285,7 +310,7 @@ final class RecordingEngine: ObservableObject {
 
                 guard let converted = converter.convert(
                     imageBuffer,
-                    parameters: RecordingEngine.bayerParameters(from: imageBuffer)
+                    parameters: RecordingEngine.bayerParameters(from: imageBuffer, wb: wbBox.get())
                 ) else {
                     let diag = converter.lastDiagnostics
                     statsBox.markDiagnostics(diag.summary, detail: diag.metadataText)
@@ -341,6 +366,22 @@ final class RecordingEngine: ObservableObject {
         }
     }
 
+    /// 从设备取一次 AWB 增益写进盒子里。
+    ///
+    /// 录制期间白平衡是锁定的（解包后按场景自定或按设备值），所以只需要
+    /// 在开录前取一次。取不到就留空，标定会退回灰度世界。
+    @MainActor
+    private func refreshWhiteBalanceGains() {
+        guard let device = capture.videoDevice else { return }
+        let gains = device.deviceWhiteBalanceGains
+        guard gains.greenGain > 0.0001 else { return }
+        let red = gains.redGain / gains.greenGain
+        let blue = gains.blueGain / gains.greenGain
+        // 越界说明这组值不可用（设备还没收敛），交给灰度世界
+        guard red > 0.2, red < 5, blue > 0.2, blue < 5 else { return }
+        wbGains.set(red: red, blue: blue)
+    }
+
     /// 切档时清掉所有「只对某一档成立」的临时状态。
     ///
     /// 不清会串味，而且串得很难查：
@@ -386,6 +427,7 @@ final class RecordingEngine: ObservableObject {
             exposure.attach(to: device)
             whiteBalance.attach(to: device)
             focus.attach(to: device)
+            refreshWhiteBalanceGains()
         }
         sessionReady = capture.isRunning
         stats.reset()
@@ -401,7 +443,10 @@ final class RecordingEngine: ObservableObject {
     /// 这些值跟着每一帧走（自动白平衡时每帧都在变），所以不缓存。
     /// 读不到就用 12-bit 的常规默认值：黑 0、白 4095、增益 1——
     /// 画面会偏一点，但不会因为缺一个键就完全不出来。
-    nonisolated static func bayerParameters(from buffer: CVPixelBuffer) -> BayerConverter.Parameters {
+    nonisolated static func bayerParameters(
+        from buffer: CVPixelBuffer,
+        wb: (red: Float, blue: Float)? = nil
+    ) -> BayerConverter.Parameters {
         var parameters = BayerConverter.Parameters()
 
         guard let attachments = CMCopyDictionaryOfAttachments(
@@ -425,16 +470,13 @@ final class RecordingEngine: ObservableObject {
         parameters.blackLevel = max(0, black)
         parameters.whiteLevel = max(parameters.blackLevel + 1, white)
 
-        if let red = scalar(attachments["ProResRAW_WhiteBalanceRedFactor"]), red > 0 {
-            parameters.redGain = red
-        }
-        if let blue = scalar(attachments["ProResRAW_WhiteBalanceBlueFactor"]), blue > 0 {
-            parameters.blueGain = blue
-        }
-        if let gain = scalar(attachments["ProResRAW_GainFactor"]), gain > 0, gain != 1 {
-            parameters.redGain /= gain
-            parameters.greenGain /= gain
-            parameters.blueGain /= gain
+        // 白平衡用设备自己的 AWB 增益，不用 ProResRAW_WhiteBalance*Factor。
+        // 后者量纲不明（0.5.14 按它乘完画面偏品红）；而 deviceWhiteBalanceGains
+        // 是 Apple 相机 AWB 的原始输出，对这颗传感器的光谱响应与当前光源都已收敛，
+        // 正是我们想要的。"绿归一"之后直接可以当 RGB 乘数用。
+        if let wb = wb, wb.red > 0, wb.blue > 0 {
+            parameters.redGain = wb.red
+            parameters.blueGain = wb.blue
         }
 
         if let pattern = scalar(attachments["ProResRAW_BayerPattern"]) {
@@ -597,6 +639,7 @@ final class RecordingEngine: ObservableObject {
             exposure.attach(to: device)
             whiteBalance.attach(to: device)
             focus.attach(to: device)
+            refreshWhiteBalanceGains()
         }
         sessionReady = capture.isRunning
         stats.reset()
@@ -649,6 +692,10 @@ final class RecordingEngine: ObservableObject {
             state = .failed("ProRes RAW 需要全幅 Bayer 通路，当前会话是系统 ISP（\(width)×\(height)）。切走再切回该档位可重建会话。")
             return
         }
+
+        // 开录这一刻取一次设备的 AWB 增益：attach 之后光线可能已经变了，
+        // 而录制期间白平衡是锁定的，这一次就是整段的值。
+        refreshWhiteBalanceGains()
 
         let selectedTier = tier
         let width = Int(captureConfiguration?.width ?? 4224)
