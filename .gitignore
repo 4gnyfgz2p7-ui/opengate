@@ -24,3 +24,4 @@ _local/
 
 # 本地分析产物
 _analysis/
+.commitmsg

@@ -3,6 +3,7 @@ import AVFoundation
 import CoreImage
 import CoreVideo
 import CoreMedia
+import Darwin
 
 /// 把已录好的 ProRes RAW 转成 HEVC + Apple Log 2。
 ///
@@ -56,6 +57,8 @@ final class Log2Transcoder {
             }
         }
     }
+
+    private enum FrameOutcome { case ok, ended, failed }
 
     // Apple Log 2 曲线常数（白皮书）
     private static let gamma: Float = 0.08550479
@@ -161,7 +164,16 @@ final class Log2Transcoder {
             if reader.canAdd(out) {
                 reader.add(out)
                 audioOutput = out
-                log("音频轨 \(audioTrack.formatDescriptions.count) 个描述")
+                // 音频全程不解码、不重采样、不改位深：读端和写端的
+                // outputSettings 都是 nil，样本原样从这里搬到那里。
+                if let fmt = audioTrack.formatDescriptions.first {
+                    let code = fourCC(CMFormatDescriptionGetMediaSubType(fmt))
+                    if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt)?.pointee {
+                        log("音频原样搬运 · \(code) · \(Int(asbd.mSampleRate)) Hz · \(asbd.mChannelsPerFrame) ch · \(asbd.mBitsPerChannel) bit")
+                    } else {
+                        log("音频原样搬运 · \(code)")
+                    }
+                }
             }
         }
 
@@ -208,6 +220,19 @@ final class Log2Transcoder {
         }
         writer.add(videoInput)
 
+        // 用 adaptor 的缓冲池复用像素缓冲。之前每帧 CVPixelBufferCreate
+        // 新建 51 MB IOSurface，113 帧后池子见底、VideoToolbox 被回收。
+        // 池化的缓冲在 ARC 释放后会被回收再分配，不会一路涨上去。
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: videoInput,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: report.width,
+                kCVPixelBufferHeightKey as String: report.height,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+            ]
+        )
+
         var audioInput: AVAssetWriterInput?
         if audioOutput != nil {
             // nil = 不做转码，源是什么格式就写什么格式。
@@ -229,7 +254,13 @@ final class Log2Transcoder {
         // workingColorSpace 设 NSNull：不做色彩管理，kernel 拿到什么值就是
         // 什么值，输出也原样落地。否则 CI 会在输入输出两端各做一次 gamma，
         // 套完曲线再被编码一遍，出来的不是 Log。
-        let ciContext = CIContext(options: [.workingColorSpace: NSNull()])
+        // cacheIntermediates 必须关。CoreImage 会把 4224×3024 的中间纹理
+        // 缓存起来，几百帧下来把 IOSurface 吃光，VideoToolbox 会话被系统
+        // 回收，append 返回 -11819（AVErrorMediaServicesWereReset）。
+        let ciContext = CIContext(options: [
+            .workingColorSpace: NSNull(),
+            .cacheIntermediates: false,
+        ])
         let outputColorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         var kernel: CIColorKernel?
         if applyCurve {
@@ -274,6 +305,15 @@ final class Log2Transcoder {
         let frameRect = CGRect(x: 0, y: 0, width: report.width, height: report.height)
 
         func makeDestination() -> CVPixelBuffer? {
+            // 先试缓冲池；池暂时空（编码器还没释放）时退回临时分配，
+            // 宁可多占一块也不让这一帧丢掉。
+            if let pool = adaptor.pixelBufferPool {
+                var pooled: CVPixelBuffer?
+                if CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pooled) == kCVReturnSuccess,
+                   let pooled {
+                    return pooled
+                }
+            }
             var buffer: CVPixelBuffer?
             let status = CVPixelBufferCreate(kCFAllocatorDefault, report.width, report.height,
                                              kCVPixelFormatType_32BGRA,
@@ -302,31 +342,40 @@ final class Log2Transcoder {
             var didWork = false
 
             if !videoDone, videoInput.isReadyForMoreMediaData {
-                if let sample = videoOutput.copyNextSampleBuffer() {
+                // 每帧一个 autoreleasepool。CoreImage 的中间图、渲染用的
+                // IOSurface 都要在下一帧开始前真正释放；靠 ARC 等它自己回收，
+                // 一百多帧后就把 VideoToolbox 会话拖垮（-11819）。
+                let outcome: FrameOutcome = autoreleasepool {
+                    guard let sample = videoOutput.copyNextSampleBuffer() else { return .ended }
+                    let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+                    let dur = CMSampleBufferGetDuration(sample)
+                    lastPTS = pts
+                    if dur.isValid, dur > .zero { frameDuration = dur }
+
+                    // 没开曲线也没开 LUT：原样串流，连 CoreImage 都不进
+                    guard kernel != nil || lutFilter != nil else {
+                        return videoInput.append(sample) ? .ok : .failed
+                    }
+                    guard let src = CMSampleBufferGetImageBuffer(sample),
+                          let dst = makeDestination() else { return .failed }
+
+                    render(src: src, to: dst, kernel: kernel, lutFilter: lutFilter,
+                           context: ciContext, colorSpace: outputColorSpace, frameRect: frameRect)
+                    return adaptor.append(dst, withPresentationTime: pts) ? .ok : .failed
+                }
+
+                switch outcome {
+                case .ok:
                     didWork = true
-                    lastPTS = CMSampleBufferGetPresentationTimeStamp(sample)
-                    if CMSampleBufferGetDuration(sample).isValid,
-                       CMSampleBufferGetDuration(sample) > .zero {
-                        frameDuration = CMSampleBufferGetDuration(sample)
-                    }
-                    if let toAppend = process(sample: sample, kernel: kernel,
-                                              lutFilter: lutFilter,
-                                              context: ciContext, colorSpace: outputColorSpace,
-                                              frameRect: frameRect,
-                                              makeDestination: makeDestination) {
-                        if videoInput.append(toAppend) {
-                            report.frames += 1
-                        } else {
-                            failed = describe(writer, frame: report.frames,
-                                              buffer: toAppend, input: videoInput)
-                            videoDone = true
-                            videoInput.markAsFinished()
-                        }
-                    }
-                } else {
+                    report.frames += 1
+                case .ended:
                     videoDone = true
                     videoInput.markAsFinished()
                     log("视频读完 · \(report.frames) 帧")
+                case .failed:
+                    failed = describe(writer, frame: report.frames, input: videoInput)
+                    videoDone = true
+                    videoInput.markAsFinished()
                 }
             }
 
@@ -353,7 +402,7 @@ final class Log2Transcoder {
             }
             if Date().timeIntervalSince(lastTick) > 10 {
                 lastTick = Date()
-                log("进度 \(report.frames) 帧 · \(Int(Date().timeIntervalSince(t0))) 秒")
+                log("进度 \(report.frames) 帧 · \(Int(Date().timeIntervalSince(t0))) 秒 · 内存 \(Int(footprintMB()))MB")
                 // 120 秒没有新帧就认定卡死：解码器可能挂在一个坏样本上，
                 // 再等下去只会让用户以为 App 假死。
                 if Date().timeIntervalSince(lastProgress) > 120 {
@@ -414,18 +463,19 @@ final class Log2Transcoder {
 
     /// 把一帧解出的画面套上曲线，返回可交给编码器的样本。
     /// 不套曲线或渲染失败时原样返回，绝不因为增强失败而丢帧。
-    private static func process(sample: CMSampleBuffer,
-                                kernel: CIColorKernel?,
-                                lutFilter: CIFilter?,
-                                context: CIContext,
-                                colorSpace: CGColorSpace,
-                                frameRect: CGRect,
-                                makeDestination: () -> CVPixelBuffer?) -> CMSampleBuffer? {
-        guard kernel != nil || lutFilter != nil else { return sample }
-        guard let src = CMSampleBufferGetImageBuffer(sample) else { return sample }
-
-        // 曲线与 LUT 串在一条 CoreImage 图上，最终只渲染一次：
-        // 解出的 YUV → Log 2 曲线 → LUT → BGRA。中间不落缓冲。
+    /// 把一帧画到给定的 BGRA 缓冲上：解出的画面 → Log 2 曲线 → LUT。
+    /// 两者串在一条 CoreImage 图上，最终只渲染一次。
+    ///
+    /// 渲染边界必须用固定的 frameRect。CIColorCube 这类逐点滤镜的
+    /// `outputImage.extent` 是 `CGRect.infinite`，拿它当 bounds 会输出空帧，
+    /// 编码器随即以 -11819 拒收。
+    private static func render(src: CVImageBuffer,
+                               to dst: CVPixelBuffer,
+                               kernel: CIColorKernel?,
+                               lutFilter: CIFilter?,
+                               context: CIContext,
+                               colorSpace: CGColorSpace,
+                               frameRect: CGRect) {
         var image = CIImage(cvPixelBuffer: src)
         if let kernel, let curved = kernel.apply(extent: frameRect, arguments: [image]) {
             image = curved
@@ -433,44 +483,32 @@ final class Log2Transcoder {
         if let lutFilter {
             lutFilter.setValue(image, forKey: kCIInputImageKey)
             if let filtered = lutFilter.outputImage {
-                // 必裁：CIColorCube 的 outputImage.extent 是 CGRect.infinite
                 image = filtered.cropped(to: frameRect)
             }
         }
-        guard let dst = makeDestination() else { return sample }
         context.render(image, to: dst, bounds: frameRect, colorSpace: colorSpace)
+    }
 
-        var format: CMVideoFormatDescription?
-        guard CMVideoFormatDescriptionCreateForImageBuffer(
-            allocator: kCFAllocatorDefault,
-            imageBuffer: dst,
-            formatDescriptionOut: &format
-        ) == noErr, let format else { return sample }
-
-        var timing = CMSampleTimingInfo(
-            duration: CMSampleBufferGetDuration(sample),
-            presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sample),
-            decodeTimeStamp: .invalid
+    /// 当前进程的物理内存占用（MB）。
+    /// 转码是几百帧的长跑，这个数字一路涨就说明有东西没释放，
+    /// 比事后猜「是不是内存不够」直接得多。
+    private static func footprintMB() -> Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
         )
-        var rebuilt: CMSampleBuffer?
-        let status = CMSampleBufferCreateForImageBuffer(
-            allocator: kCFAllocatorDefault,
-            imageBuffer: dst,
-            dataReady: true,
-            makeDataReadyCallback: nil,
-            refcon: nil,
-            formatDescription: format,
-            sampleTiming: &timing,
-            sampleBufferOut: &rebuilt
-        )
-        guard status == noErr, let rebuilt else { return sample }
-        return rebuilt
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        return Double(info.phys_footprint) / 1_048_576
     }
 
     /// 把编码器拒帧时的现场拼成一行人话：状态、错误域与码、底层错误、
     /// 以及这一帧的像素格式和尺寸。只有 domain 和 code 才能定位。
     private static func describe(_ writer: AVAssetWriter, frame: Int,
-                                 buffer: CMSampleBuffer,
                                  input: AVAssetWriterInput) -> String {
         var parts = ["编码器拒帧（第 \(frame) 帧）"]
         parts.append("writer=\(writer.status.rawValue)")
@@ -483,10 +521,7 @@ final class Log2Transcoder {
         } else {
             parts.append("writer.error 为空")
         }
-        if let fmt = CMSampleBufferGetFormatDescription(buffer) {
-            let dims = CMVideoFormatDescriptionGetDimensions(fmt)
-            parts.append("帧 \(dims.width)×\(dims.height) \(fourCC(CMFormatDescriptionGetMediaSubType(fmt)))")
-        }
+        parts.append("memory=\(Int(footprintMB()))MB")
         parts.append("input=\(input.isReadyForMoreMediaData ? "ready" : "busy")")
         return parts.joined(separator: " · ")
     }
