@@ -45,7 +45,9 @@ def _mk_colr(primaries, transfer, matrix):
 
 
 def _mk_logs(identifier):
-    payload = identifier.encode('ascii') + b'\x00'
+    # 官方样本里 logs 的 body 就是裸标识符，没有 null 结尾
+    # （IMG_0032-1.mov: 44 字节 box = 8 header + 36 字节字符串）
+    payload = identifier.encode('ascii')
     return struct.pack('>I4s', 8 + len(payload), b'logs') + payload
 
 
@@ -103,8 +105,8 @@ def describe(path):
     return out
 
 
-def inject(input_path, output_path=None, primaries=9, transfer=2, matrix=9,
-           log_id='com.apple.rec2020.apple-log'):
+def inject(input_path, output_path=None, primaries=2, transfer=2, matrix=9,
+           log_id='com.apple.apple-wide-gamut.apple-log'):
     out = output_path or input_path
     buf = bytearray(open(input_path, 'rb').read())
     p = _pick_video_entry(buf)

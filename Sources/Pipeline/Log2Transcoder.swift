@@ -26,12 +26,14 @@ final class Log2Transcoder {
         var frames = 0
         var audioBuffers = 0
         var appliedCurve = false
+        var appliedLUT: String?
         var tagDelta = 0
         var elapsed: TimeInterval = 0
 
         var summary: String {
             "\(width)×\(height) · \(sourceFormat) \(bitDepth)bit · \(frames) 帧"
                 + (appliedCurve ? " · 已套 Log 2 曲线" : " · 直通")
+                + (appliedLUT.map { " · LUT \($0)" } ?? "")
                 + (audioBuffers > 0 ? " · 音频 \(audioBuffers) 块" : " · 无音频")
                 + " · 标记 +\(tagDelta)B"
         }
@@ -84,6 +86,7 @@ final class Log2Transcoder {
     static func run(rawURL: URL,
                     outputURL: URL,
                     applyCurve: Bool = true,
+                    lut: CubeLUT? = nil,
                     bitRate: Int = 45_000_000,
                     log: (String) -> Void = { _ in }) throws -> Report {
 
@@ -244,6 +247,16 @@ final class Log2Transcoder {
                 log("曲线内核就绪（Apple Log 2 · 白皮书常数）")
             }
         }
+        var lutFilter: CIFilter?
+        if let lut {
+            lutFilter = lut.makeFilter()
+            if lutFilter == nil {
+                log("LUT 滤镜创建失败（\(lut.title)），本片不套 LUT")
+            } else {
+                report.appliedLUT = "\(lut.title) \(lut.size)³"
+                log("LUT 就绪：\(lut.title) · \(lut.size)³")
+            }
+        }
         report.appliedCurve = (kernel != nil)
 
         // 渲染目标用 BGRA8：CoreImage 的原生格式，任何机器上都不会失败。
@@ -292,6 +305,7 @@ final class Log2Transcoder {
                         frameDuration = CMSampleBufferGetDuration(sample)
                     }
                     if let toAppend = process(sample: sample, kernel: kernel,
+                                              lutFilter: lutFilter,
                                               context: ciContext, colorSpace: outputColorSpace,
                                               makeDestination: makeDestination) {
                         if videoInput.append(toAppend) {
@@ -373,7 +387,11 @@ final class Log2Transcoder {
 
         // ---- 6. 注入色彩标记 ----
         do {
-            let tag = try MovTag.inject(outputURL)
+            // 烧过 LUT 的画面已是显示参考，不能再标 Log：
+            // 标成 BT.709 三件套，并且不写 logs atom。
+            let tag = report.appliedLUT == nil
+                ? try MovTag.inject(outputURL)
+                : try MovTag.inject(outputURL, primaries: 1, transfer: 1, matrix: 1, logID: "")
             report.tagDelta = tag.delta
             log("标记 colr \(tag.primaries)/\(tag.transfer)/\(tag.matrix) · logs · +\(tag.delta)B · 修正 \(tag.chunksShifted) 个 chunk")
         } catch {
@@ -391,16 +409,27 @@ final class Log2Transcoder {
     /// 不套曲线或渲染失败时原样返回，绝不因为增强失败而丢帧。
     private static func process(sample: CMSampleBuffer,
                                 kernel: CIColorKernel?,
+                                lutFilter: CIFilter?,
                                 context: CIContext,
                                 colorSpace: CGColorSpace,
                                 makeDestination: () -> CVPixelBuffer?) -> CMSampleBuffer? {
-        guard let kernel else { return sample }
+        guard kernel != nil || lutFilter != nil else { return sample }
         guard let src = CMSampleBufferGetImageBuffer(sample) else { return sample }
 
-        let ci = CIImage(cvPixelBuffer: src)
-        guard let out = kernel.apply(extent: ci.extent, arguments: [ci]) else { return sample }
+        // 曲线与 LUT 串在一条 CoreImage 图上，最终只渲染一次：
+        // 解出的 YUV → Log 2 曲线 → LUT → BGRA。中间不落缓冲。
+        var image = CIImage(cvPixelBuffer: src)
+        if let kernel, let curved = kernel.apply(extent: image.extent, arguments: [image]) {
+            image = curved
+        }
+        if let lutFilter {
+            lutFilter.setValue(image, forKey: kCIInputImageKey)
+            if let filtered = lutFilter.outputImage {
+                image = filtered
+            }
+        }
         guard let dst = makeDestination() else { return sample }
-        context.render(out, to: dst, bounds: ci.extent, colorSpace: colorSpace)
+        context.render(image, to: dst, bounds: image.extent, colorSpace: colorSpace)
 
         var format: CMVideoFormatDescription?
         guard CMVideoFormatDescriptionCreateForImageBuffer(

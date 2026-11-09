@@ -51,7 +51,7 @@ enum MovTag {
                 out["transfer"] = Int(body[6]) << 8 | Int(body[7])
                 out["matrix"] = Int(body[8]) << 8 | Int(body[9])
             } else if kid.type == "logs" {
-                out["logs"] = String(decoding: body.dropLast(), as: UTF8.self)
+                out["logs"] = String(decoding: body, as: UTF8.self)
             }
         }
         return out
@@ -59,11 +59,14 @@ enum MovTag {
 
     /// 注入标记。原地改写，成功返回变更摘要。
     @discardableResult
+    /// 默认值取自 iPhone 17 Pro Max 原生 Apple Log 2 文件（IMG_0032-1.mov）：
+    /// colr = nclc 2/2/9，logs = com.apple.apple-wide-gamut.apple-log。
+    /// primaries 写 2 而不是 9 —— Apple 用 BT.709 作占位，真实色域由 logs 表达。
     static func inject(_ url: URL,
-                       primaries: Int = 9,
+                       primaries: Int = 2,
                        transfer: Int = 2,
                        matrix: Int = 9,
-                       logID: String = "com.apple.rec2020.apple-log") throws -> Result {
+                       logID: String = "com.apple.apple-wide-gamut.apple-log") throws -> Result {
 
         var bytes = [UInt8](try Data(contentsOf: url))
         guard let moov = boxes(bytes, 0, bytes.count)?.first(where: { $0.type == "moov" }) else {
@@ -88,7 +91,10 @@ enum MovTag {
             }
         }
         kidsData.append(makeColr(primaries: primaries, transfer: transfer, matrix: matrix))
-        kidsData.append(makeLogs(logID))
+        // 空标识符表示这片已经烧过 LUT、不再是 Log 素材，不写 logs atom
+        if !logID.isEmpty {
+            kidsData.append(makeLogs(logID))
+        }
 
         // 重建 entry
         var entryBody = Data(fixedHeader)
@@ -271,8 +277,9 @@ enum MovTag {
     }
 
     private static func makeLogs(_ identifier: String) -> Data {
-        var payload = Data(identifier.utf8)
-        payload.append(0)
+        // 官方样本的 logs body 就是裸标识符，没有 null 结尾
+        // （44 字节 box = 8 header + 36 字节字符串）
+        let payload = Data(identifier.utf8)
         var d = Data()
         d.append(be32(UInt32(8 + payload.count)))
         d.append(contentsOf: Array("logs".utf8))

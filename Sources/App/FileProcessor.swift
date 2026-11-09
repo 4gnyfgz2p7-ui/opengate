@@ -24,6 +24,14 @@ final class FileProcessor: ObservableObject {
     /// 异常名与原因，不必去翻「设置 → 隐私与安全性 → 分析数据」。
     @Published private(set) var lastCrash: String?
 
+    // ---- LUT ----
+    /// 当前安装的 LUT 名，nil 表示没装
+    @Published private(set) var lutName: String? = LUTStore.currentName
+    /// 转码时是否烧录 LUT
+    @Published private(set) var lutEnabled = LUTStore.isEnabled
+    @Published private(set) var lutBusy = false
+    @Published private(set) var lutMessage: String?
+
     init() {
         lastCrash = Self.shortCrash()
     }
@@ -39,6 +47,44 @@ final class FileProcessor: ObservableObject {
     func dismissCrash() {
         lastCrash = nil
         try? FileManager.default.removeItem(at: Diagnostics.crashURL)
+    }
+
+    func setLUTEnabled(_ on: Bool) {
+        lutEnabled = on
+        LUTStore.isEnabled = on
+    }
+
+    /// 导入 .cube。先解析校验再落盘：格式不对就当场报出来，
+    /// 不留一个装不上的文件在后面让转码失败。
+    func importLUT(from url: URL) {
+        guard !lutBusy else { return }
+        lutBusy = true
+        lutMessage = nil
+        Task.detached(priority: .userInitiated) { [weak self] in
+            do {
+                let lut = try LUTStore.install(from: url)
+                await MainActor.run {
+                    guard let self else { return }
+                    self.lutBusy = false
+                    self.lutName = lut.title
+                    self.lutEnabled = true
+                    self.lutMessage = "已装入 \(lut.title) · \(lut.size)³ · \(lut.size * lut.size * lut.size) 项"
+                }
+            } catch {
+                await MainActor.run {
+                    guard let self else { return }
+                    self.lutBusy = false
+                    self.lutMessage = "LUT 导入失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func removeLUT() {
+        LUTStore.remove()
+        lutName = nil
+        lutEnabled = false
+        lutMessage = "已移除"
     }
 
     /// 输出固定用 HEVC 长 GOP：文件小、编码快，便于快速比对。
@@ -105,6 +151,7 @@ final class FileProcessor: ObservableObject {
                 .appendingPathComponent(base.deletingPathExtension().lastPathComponent + "_Log2")
                 .appendingPathExtension("mov")
 
+            let activeLUT = LUTStore.activeLUT()
             do {
                 // 同步阻塞：解码、套曲线、编码、写标记全在这一个线程里完成。
                 // 早先用回调并行驱动，音视频两个队列抢同一个计数器，
@@ -113,6 +160,7 @@ final class FileProcessor: ObservableObject {
                     rawURL: url,
                     outputURL: target,
                     applyCurve: true,
+                    lut: activeLUT,
                     bitRate: 45_000_000
                 ) { line in
                     TranscodeLog.write(line)

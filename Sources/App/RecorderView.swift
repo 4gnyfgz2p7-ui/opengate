@@ -1032,6 +1032,7 @@ struct SettingsSheet: View {
     /// 离线处理本地文件：输入固定成一个文件，改一版就能对同一段素材比对一次。
     @StateObject private var processor = FileProcessor()
     @State private var showImporter = false
+    @State private var showLUTImporter = false
 
     var body: some View {
         NavigationStack {
@@ -1044,6 +1045,7 @@ struct SettingsSheet: View {
                     rotationSection
                     historySection
                     offlineSection
+                    lutSection
                 }
                 .padding(18)
             }
@@ -1058,6 +1060,18 @@ struct SettingsSheet: View {
                 switch result {
                 case .success(let urls):
                     if let url = urls.first { processor.process(url) }
+                case .failure(let error):
+                    processor.reportPickerFailure(error)
+                }
+            }
+            .fileImporter(
+                isPresented: $showLUTImporter,
+                allowedContentTypes: [UTType(filenameExtension: "cube") ?? .data],
+                allowsMultipleSelection: false
+            ) { result in
+                switch result {
+                case .success(let urls):
+                    if let url = urls.first { processor.importLUT(from: url) }
                 case .failure(let error):
                     processor.reportPickerFailure(error)
                 }
@@ -1298,6 +1312,75 @@ struct SettingsSheet: View {
                             proxy.scrollTo(last, anchor: .bottom)
                         }
                     }
+                }
+            }
+        }
+    }
+
+    private var lutSection: some View {
+        section("LUT") {
+            VStack(alignment: .leading, spacing: 9) {
+                Text("装一个 .cube 3D LUT。开启后转码按「解出的画面 → Log 2 曲线 → LUT」烧进成片。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 7) {
+                    Image(systemName: "cube.transparent")
+                        .font(.system(size: 12))
+                        .foregroundStyle(processor.lutName == nil ? Color.white.opacity(0.35) : accent)
+                    Text(processor.lutName ?? "未装入")
+                        .font(.system(size: 12))
+                        .foregroundStyle(processor.lutName == nil ? Color.white.opacity(0.45) : Color.white)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    if processor.lutBusy {
+                        ProgressView().scaleEffect(0.7)
+                    }
+                }
+
+                HStack(spacing: 10) {
+                    Button {
+                        showLUTImporter = true
+                    } label: {
+                        Label("导入 .cube", systemImage: "square.and.arrow.down")
+                            .font(.system(size: 11.5))
+                    }
+                    .disabled(processor.lutBusy)
+
+                    if processor.lutName != nil {
+                        Button(role: .destructive) {
+                            processor.removeLUT()
+                        } label: {
+                            Text("移除").font(.system(size: 11.5))
+                        }
+                        .disabled(processor.lutBusy)
+                    }
+                    Spacer(minLength: 0)
+                }
+
+                if processor.lutName != nil {
+                    Toggle(isOn: Binding(
+                        get: { processor.lutEnabled },
+                        set: { processor.setLUTEnabled($0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("转码时烧录 LUT")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.white.opacity(0.85))
+                            Text("开启后成片标 BT.709，不再是 Log")
+                                .font(.system(size: 9.5))
+                                .foregroundStyle(.white.opacity(0.45))
+                        }
+                    }
+                    .tint(accent)
+                }
+
+                if let message = processor.lutMessage {
+                    Text(message)
+                        .font(.system(size: 9.5, design: .monospaced))
+                        .foregroundStyle(message.hasPrefix("LUT 导入失败") ? Color.red : Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
