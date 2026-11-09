@@ -166,7 +166,7 @@ final class Log2Transcoder {
                 audioOutput = out
                 // 音频全程不解码、不重采样、不改位深：读端和写端的
                 // outputSettings 都是 nil，样本原样从这里搬到那里。
-                if let fmt = audioTrack.formatDescriptions.first {
+                if let fmt = audioTrack.formatDescriptions.first as? CMFormatDescription {
                     let code = fourCC(CMFormatDescriptionGetMediaSubType(fmt))
                     if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt)?.pointee {
                         log("音频原样搬运 · \(code) · \(Int(asbd.mSampleRate)) Hz · \(asbd.mChannelsPerFrame) ch · \(asbd.mBitsPerChannel) bit")
