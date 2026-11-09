@@ -860,3 +860,55 @@ stsz/stco。成本高，先不改；如果手机仍不认，这是下一个要�
 `.cube` 3D LUT 走 `CIColorCube`，接在 Log 曲线之后，两者合成一条
 CoreImage 图，最终只渲染一次。烧过 LUT 的成片标 BT.709 三件套并且
 **不写 `logs`**——画面已经是显示参考，再标 Log 就是谎报。
+
+---
+
+## 十九、-11819：每帧新建 CVPixelBuffer 会把 VideoToolbox 拖垮（2026-11-09）
+
+### 现象
+
+转码跑到**第 113 帧**失败，前 112 帧全部正常，日志：
+
+```
+失败：写入失败：编码器拒帧（第 113 帧）· writer=3 ·
+AVFoundationErrorDomain -11819：无法完成操作 · 帧 4224×3024 BGRA · input=ready
+```
+
+`writer=3` 是 `AVAssetWriterStatus.failed`，`input=ready` 说明不是节流问题。
+
+### -11819 是什么
+
+`AVErrorMediaServicesWereReset`，iOS 专有。含义是**后台的 VideoToolbox
+会话被系统回收了**。不是格式错、不是参数错——格式错第一帧就会拒，不会
+让你跑满 112 帧。
+
+### 根因
+
+每帧 `CVPixelBufferCreate` 新建一块 51 MB 的 IOSurface
+（4224×3024×4，BGRA8），ARC 的释放跟不上创建速度；`CIContext` 默认还会
+缓存中间渲染纹理。两者叠加，一百多帧后把资源吃空。
+
+推算：113 × 51 MB ≈ 5.7 GB。「跑到一百多帧才崩」正是这个数量级的特征。
+
+### 修法（三条一起，缺一不可）
+
+1. **每帧包 `autoreleasepool`** —— 帧末强制释放 IOSurface 与 CI 中间对象，
+   不指望 ARC 在下一帧前自己回收
+2. **`CIContext(options: [.cacheIntermediates: false])`** —— 关掉中间纹理缓存
+3. **改用 `AVAssetWriterInputPixelBufferAdaptor` 的 `pixelBufferPool`** ——
+   缓冲复用，池暂时空时才退回临时分配
+
+修后稳态内存约 150–250 MB，不再是线性增长。
+
+### 另一个同症状的坑（0.5.52）
+
+`CIColorCube` 这类逐点滤镜的 `outputImage.extent` 是 **`CGRect.infinite`**。
+拿它当 `context.render` 的 bounds，输出缓冲会留空，编码器同样拒帧。
+必须 `cropped(to:)` 到一个固定的画面矩形，且 render 的 bounds 也用那个矩形。
+
+### 诊断经验
+
+- 只打 `localizedDescription` 只会得到「无法完成操作」，**必须打 domain + code
+  + `NSUnderlyingErrorKey`**，否则定位不了
+- 进度日志带上 `phys_footprint`，内存曲线比事后猜「是不是内存不够」直接
+- 失败帧号本身是证据：第 1 帧失败 = 格式/参数；一百多帧失败 = 资源累积
