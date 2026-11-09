@@ -807,3 +807,56 @@ tools/转AppleLog2.bat      拖放即用
 `probe` 会读 aprn 帧头（白点 65520、黑 256、BayerPattern、ColorMatrix、
 GainFactor、CCT 5555K），`transcode` 自动把 BayerPattern 3→0 再解，
 不必手工 patch。
+
+---
+
+## 十八、十七节被推翻：官方 colr 是 2/2/9，logs 是 apple-wide-gamut（2026-11-09）
+
+十七节的 9/2/9 + `com.apple.rec2020.apple-log` 是**错的**。当时依据的是
+二手资料（LogForge 对 iPhone 15 Pro Max 的比对），没有验证本机。这次拿到
+iPhone 17 Pro Max 原生 Apple Log 2 样本（IMG_0032-1.mov），逐字节对账后
+结论如下。
+
+### 官方真值（实测）
+
+| 项 | 值 | 十七节写的（错） |
+|---|---|---|
+| `colr`/`nclc` primaries | **2**（BT.709 占位） | 9 |
+| `colr`/`nclc` transfer | 2（unspecified） | 2 ✓ |
+| `colr`/`nclc` matrix | 9（BT.2020 nc） | 9 ✓ |
+| `logs` | **`com.apple.apple-wide-gamut.apple-log`** | `com.apple.rec2020.apple-log` |
+| `logs` 长度 | **36 字节，无 null 结尾** | 27 字节 + null |
+| VUI primaries / transfer / matrix | **2 / 2 / 9** | 9 / 1 / 9（编码器写的） |
+| video_full_range_flag | 0（video range） | 0 ✓ |
+
+primaries 写 2 而不是 9，是因为 QuickTime 的 nclc 编码表里没有
+"Apple Wide Gamut"，Apple 拿 BT.709 做占位，真实色域由 `logs` 的
+`apple-wide-gamut` 表达。matrix 仍是 9，因为色度矩阵确实用 BT.2020 系数。
+
+### 改完之后的读数
+
+`ffmpeg -i` 对原生样本与自产样本的解读**完全一致**：
+
+```
+IMG_0032-1.mov   yuv422p10le(tv, bt2020nc/unknown/unknown), 3840x2160
+自产对齐后        yuv420p10le(tv, bt2020nc/unknown/unknown), 4224x3024
+```
+
+剩下的差异只有编码参数（Rext/4:2:2 对 Main10/4:2:0）和分辨率，与标记无关。
+
+### 仍未对齐：码流里的 VUI
+
+`AVAssetWriter` 写 `AVVideoColorPropertiesKey` 时，把
+`AVVideoTransferFunction_ITU_R_709_2` 直接写进了 SPS 的
+`transfer_characteristics`，于是码流说 BT.709、容器说 unspecified。
+官方样本两边都是 2。
+
+AVFoundation 没有 "unspecified" 常量，改码流要在
+hvcC 和每一帧的带内 SPS 上做位级改写，长度可能变化，要连带修
+stsz/stco。成本高，先不改；如果手机仍不认，这是下一个要动的点。
+
+### LUT
+
+`.cube` 3D LUT 走 `CIColorCube`，接在 Log 曲线之后，两者合成一条
+CoreImage 图，最终只渲染一次。烧过 LUT 的成片标 BT.709 三件套并且
+**不写 `logs`**——画面已经是显示参考，再标 Log 就是谎报。

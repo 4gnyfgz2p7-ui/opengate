@@ -268,6 +268,11 @@ final class Log2Transcoder {
             kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
         ]
 
+        // 画面矩形。CoreImage 的逐点滤镜（CIColorCube 就是）输出 extent 是
+        // 无限矩形，拿它当 render 的 bounds，输出缓冲会留空，编码器随即拒帧。
+        // 全程只用这个固定矩形。
+        let frameRect = CGRect(x: 0, y: 0, width: report.width, height: report.height)
+
         func makeDestination() -> CVPixelBuffer? {
             var buffer: CVPixelBuffer?
             let status = CVPixelBufferCreate(kCFAllocatorDefault, report.width, report.height,
@@ -307,11 +312,13 @@ final class Log2Transcoder {
                     if let toAppend = process(sample: sample, kernel: kernel,
                                               lutFilter: lutFilter,
                                               context: ciContext, colorSpace: outputColorSpace,
+                                              frameRect: frameRect,
                                               makeDestination: makeDestination) {
                         if videoInput.append(toAppend) {
                             report.frames += 1
                         } else {
-                            failed = "编码器拒帧：\(writer.error?.localizedDescription ?? "未知")"
+                            failed = describe(writer, frame: report.frames,
+                                              buffer: toAppend, input: videoInput)
                             videoDone = true
                             videoInput.markAsFinished()
                         }
@@ -412,6 +419,7 @@ final class Log2Transcoder {
                                 lutFilter: CIFilter?,
                                 context: CIContext,
                                 colorSpace: CGColorSpace,
+                                frameRect: CGRect,
                                 makeDestination: () -> CVPixelBuffer?) -> CMSampleBuffer? {
         guard kernel != nil || lutFilter != nil else { return sample }
         guard let src = CMSampleBufferGetImageBuffer(sample) else { return sample }
@@ -419,17 +427,18 @@ final class Log2Transcoder {
         // 曲线与 LUT 串在一条 CoreImage 图上，最终只渲染一次：
         // 解出的 YUV → Log 2 曲线 → LUT → BGRA。中间不落缓冲。
         var image = CIImage(cvPixelBuffer: src)
-        if let kernel, let curved = kernel.apply(extent: image.extent, arguments: [image]) {
+        if let kernel, let curved = kernel.apply(extent: frameRect, arguments: [image]) {
             image = curved
         }
         if let lutFilter {
             lutFilter.setValue(image, forKey: kCIInputImageKey)
             if let filtered = lutFilter.outputImage {
-                image = filtered
+                // 必裁：CIColorCube 的 outputImage.extent 是 CGRect.infinite
+                image = filtered.cropped(to: frameRect)
             }
         }
         guard let dst = makeDestination() else { return sample }
-        context.render(image, to: dst, bounds: image.extent, colorSpace: colorSpace)
+        context.render(image, to: dst, bounds: frameRect, colorSpace: colorSpace)
 
         var format: CMVideoFormatDescription?
         guard CMVideoFormatDescriptionCreateForImageBuffer(
@@ -456,6 +465,30 @@ final class Log2Transcoder {
         )
         guard status == noErr, let rebuilt else { return sample }
         return rebuilt
+    }
+
+    /// 把编码器拒帧时的现场拼成一行人话：状态、错误域与码、底层错误、
+    /// 以及这一帧的像素格式和尺寸。只有 domain 和 code 才能定位。
+    private static func describe(_ writer: AVAssetWriter, frame: Int,
+                                 buffer: CMSampleBuffer,
+                                 input: AVAssetWriterInput) -> String {
+        var parts = ["编码器拒帧（第 \(frame) 帧）"]
+        parts.append("writer=\(writer.status.rawValue)")
+        if let error = writer.error {
+            let ns = error as NSError
+            parts.append("\(ns.domain) \(ns.code)：\(ns.localizedDescription)")
+            if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+                parts.append("底层 \(underlying.domain) \(underlying.code)：\(underlying.localizedDescription)")
+            }
+        } else {
+            parts.append("writer.error 为空")
+        }
+        if let fmt = CMSampleBufferGetFormatDescription(buffer) {
+            let dims = CMVideoFormatDescriptionGetDimensions(fmt)
+            parts.append("帧 \(dims.width)×\(dims.height) \(fourCC(CMFormatDescriptionGetMediaSubType(fmt)))")
+        }
+        parts.append("input=\(input.isReadyForMoreMediaData ? "ready" : "busy")")
+        return parts.joined(separator: " · ")
     }
 
     private static func fourCC(_ code: OSType) -> String {
