@@ -244,18 +244,29 @@ final class Log2Transcoder {
         }
         writer.add(videoInput)
 
-        // 用 adaptor 的缓冲池复用像素缓冲。之前每帧 CVPixelBufferCreate
-        // 新建 51 MB IOSurface，113 帧后池子见底、VideoToolbox 被回收。
-        // 池化的缓冲在 ARC 释放后会被回收再分配，不会一路涨上去。
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: videoInput,
-            sourcePixelBufferAttributes: [
+        // 自建 BGRA 缓冲池：格式写死，不依赖编码器偏好。
+        //
+        // 上一版直接用 adaptor.pixelBufferPool，成片色度全部落在 0.500
+        // （中性灰），说明那块缓冲不是可控的三通道格式 —— CI 渲染进去的
+        // 颜色在写帧时被抹掉了。这里显式指定 32BGRA，CI 写进去就是确定的
+        // R/G/B。每帧 CVPixelBufferCreate 同样不行：4224×3024 每块 51 MB，
+        // 113 帧后把 VideoToolbox 拖垮（-11819）。
+        var poolOut: CVPixelBufferPool?
+        let poolStatus = CVPixelBufferPoolCreate(
+            kCFAllocatorDefault,
+            [kCVPixelBufferPoolMinimumBufferCountKey as String: 6] as CFDictionary,
+            [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                 kCVPixelBufferWidthKey as String: report.width,
                 kCVPixelBufferHeightKey as String: report.height,
                 kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
-            ]
+                kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
+            ] as CFDictionary,
+            &poolOut
         )
+        if poolStatus != kCVReturnSuccess || poolOut == nil {
+            log("缓冲池创建失败，退回逐帧分配")
+        }
 
         var audioInput: AVAssetWriterInput?
         if audioOutput != nil {
@@ -318,10 +329,14 @@ final class Log2Transcoder {
         // 全程只用这个固定矩形。
         let frameRect = CGRect(x: 0, y: 0, width: report.width, height: report.height)
 
+        // 池是否可用。首帧若渲染成灰度，说明这块池缓冲不接受三通道写入，
+        // 立刻永久切回逐帧分配 —— 宁可变慢，也不能再出一版灰片。
+        var usePool = (poolOut != nil)
+
         func makeDestination() -> CVPixelBuffer? {
-            // 先试缓冲池；池暂时空（编码器还没释放）时退回临时分配，
+            // 先用自建 BGRA 池；池暂时空（编码器还没释放）时退回临时分配，
             // 宁可多占一块也不让这一帧丢掉。
-            if let pool = adaptor.pixelBufferPool {
+            if usePool, let pool = poolOut {
                 var pooled: CVPixelBuffer?
                 if CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pooled) == kCVReturnSuccess,
                    let pooled {
@@ -375,7 +390,33 @@ final class Log2Transcoder {
 
                     render(src: src, to: dst, kernel: kernel, lutFilter: lutFilter,
                            context: ciContext, colorSpace: outputColorSpace, frameRect: frameRect)
-                    return adaptor.append(dst, withPresentationTime: pts) ? .ok : .failed
+
+                    // 像素自检：首帧与每 48 帧抽一次中心区。三通道相等就是
+                    // 灰度，说明颜色在渲染这一步就没了，不必等看成片才发现。
+                    if report.frames == 0 || report.frames % 48 == 0 {
+                        log("像素自检 #\(report.frames) · \(fourCC(CVPixelBufferGetPixelFormatType(dst))) · \(sampleRGB(dst))")
+                    }
+
+                    // 首帧灰度就当场纠正：弃用池缓冲，改用逐帧分配重渲染这一帧。
+                    // 这一层是保险 —— 万一池的行为与预期不符，也不会把整条片子
+                    // 渲染成灰度。
+                    var frameBuffer = dst
+                    if report.frames == 0, spreadOf(dst) < 0.005 {
+                        usePool = false
+                        log("首帧渲染成灰度，已弃用池缓冲，改逐帧分配重渲染")
+                        if let fresh = makeDestination() {
+                            render(src: src, to: fresh, kernel: kernel, lutFilter: lutFilter,
+                                   context: ciContext, colorSpace: outputColorSpace, frameRect: frameRect)
+                            frameBuffer = fresh
+                            log("重渲染自检 · \(sampleRGB(fresh))")
+                        }
+                    }
+
+                    // 写帧走 0.5.51 实拍验证过的那条路：重建 sample buffer。
+                    // adaptor.append 直接塞 CVPixelBuffer 实测会把色度抹成
+                    // 中性值（U/V 全部 ≈0.500），画面只剩亮度。
+                    guard let rebuilt = rebuildSample(from: frameBuffer, like: sample) else { return .failed }
+                    return videoInput.append(rebuilt) ? .ok : .failed
                 }
 
                 switch outcome {
@@ -478,6 +519,92 @@ final class Log2Transcoder {
 
     /// 把一帧解出的画面套上曲线，返回可交给编码器的样本。
     /// 不套曲线或渲染失败时原样返回，绝不因为增强失败而丢帧。
+    /// 用渲染好的像素缓冲重建 sample buffer，时间戳沿用源样本。
+    /// 这是 0.5.51 实拍验证过颜色正确的写入路径。
+    private static func rebuildSample(from buffer: CVPixelBuffer,
+                                      like source: CMSampleBuffer) -> CMSampleBuffer? {
+        var format: CMVideoFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: buffer,
+            formatDescriptionOut: &format
+        ) == noErr, let format else { return nil }
+
+        var timing = CMSampleTimingInfo(
+            duration: CMSampleBufferGetDuration(source),
+            presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(source),
+            decodeTimeStamp: .invalid
+        )
+        var out: CMSampleBuffer?
+        let status = CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: buffer,
+            formatDescription: format,
+            sampleTiming: &timing,
+            sampleBufferOut: &out
+        )
+        guard status == noErr, let out else { return nil }
+        return out
+    }
+
+    /// 抽中心区 64×64，报告三通道均值与色差。
+    /// 色差是 R/G/B 两两差的最大值：接近 0 就是灰度图。
+    private static func sampleRGB(_ buffer: CVPixelBuffer) -> String {
+        let stats = rgbStats(buffer)
+        guard stats.count > 0 else { return stats.text.isEmpty ? "无采样" : stats.text }
+        return String(format: "R %.3f G %.3f B %.3f · 色差 %.3f · 亮度跨度 %.3f",
+                      stats.sumR / stats.count, stats.sumG / stats.count,
+                      stats.sumB / stats.count, stats.spread, stats.lumaRange)
+    }
+
+    /// 中心区的最大通道差：接近 0 就是灰度。
+    private static func spreadOf(_ buffer: CVPixelBuffer) -> Double {
+        rgbStats(buffer).spread
+    }
+
+    private struct RGBStats {
+        var sumR = 0.0, sumG = 0.0, sumB = 0.0, count = 0.0, spread = 0.0
+        var minLuma = 1.0, maxLuma = 0.0
+        var text = ""
+        /// 中心区的亮度跨度。整幅被压缩时这个数字会明显偏小。
+        var lumaRange: Double { max(0, maxLuma - minLuma) }
+    }
+
+    private static func rgbStats(_ buffer: CVPixelBuffer) -> RGBStats {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        var stats = RGBStats()
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else {
+            stats.text = "无法读取"
+            return stats
+        }
+
+        let w = CVPixelBufferGetWidth(buffer)
+        let h = CVPixelBufferGetHeight(buffer)
+        let bpr = CVPixelBufferGetBytesPerRow(buffer)
+        let px = base.assumingMemoryBound(to: UInt8.self)
+        let step = max(1, min(w, h) / 64)
+
+        var y = h / 4
+        while y < h * 3 / 4 {
+            var x = w / 4
+            while x < w * 3 / 4 {
+                let p = y * bpr + x * 4
+                let b = Double(px[p]) / 255
+                let g = Double(px[p + 1]) / 255
+                let r = Double(px[p + 2]) / 255
+                stats.sumR += r; stats.sumG += g; stats.sumB += b; stats.count += 1
+                stats.spread = max(stats.spread, max(abs(r - g), max(abs(g - b), abs(r - b))))
+                let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+                stats.minLuma = min(stats.minLuma, luma)
+                stats.maxLuma = max(stats.maxLuma, luma)
+                x += step
+            }
+            y += step
+        }
+        return stats
+    }
+
     /// 把一帧画到给定的 BGRA 缓冲上：解出的画面 → Log 2 曲线 → LUT。
     /// 两者串在一条 CoreImage 图上，最终只渲染一次。
     ///
