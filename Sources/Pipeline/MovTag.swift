@@ -59,11 +59,17 @@ enum MovTag {
 
     /// 注入标记。原地改写，成功返回变更摘要。
     @discardableResult
-    /// 默认值取自 iPhone 17 Pro Max 原生 Apple Log 2 文件（IMG_0032-1.mov）：
-    /// colr = nclc 2/2/9，logs = com.apple.apple-wide-gamut.apple-log。
-    /// primaries 写 2 而不是 9 —— Apple 用 BT.709 作占位，真实色域由 logs 表达。
+    /// 两项分开取：
+    ///
+    /// - `colr` 用 9/2/9 —— 这是 0.5.51 验证过画面正确的那一套。
+    ///   官方原片写的是 2/2/9，但 primaries=2 会让不认 logs atom 的播放器
+    ///   把宽色域按 BT.709 解释，画面偏色。以画面正确为准。
+    /// - `logs` 用官方原片里的 `com.apple.apple-wide-gamut.apple-log`，
+    ///   这是 Apple Log 2 的真正标识（IMG_0032-1.mov 实测）。
+    ///
+    /// 烧过 LUT 的成片是 P3 + PQ，用 12/16/9 且不写 logs。
     static func inject(_ url: URL,
-                       primaries: Int = 2,
+                       primaries: Int = 9,
                        transfer: Int = 2,
                        matrix: Int = 9,
                        logID: String = "com.apple.apple-wide-gamut.apple-log") throws -> Result {
@@ -277,8 +283,8 @@ enum MovTag {
     }
 
     private static func makeLogs(_ identifier: String) -> Data {
-        // 官方样本的 logs body 就是裸标识符，没有 null 结尾
-        // （44 字节 box = 8 header + 36 字节字符串）
+        // 官方格式：裸标识符，不带 null
+        //（IMG_0032-1.mov 的 logs 是 44 字节 = 8 header + 36 字节字符串）
         let payload = Data(identifier.utf8)
         var d = Data()
         d.append(be32(UInt32(8 + payload.count)))

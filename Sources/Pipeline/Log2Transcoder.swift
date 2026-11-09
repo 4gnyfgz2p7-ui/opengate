@@ -174,6 +174,23 @@ final class Log2Transcoder {
             throw TranscodeError.readerFailed(reader.error?.localizedDescription ?? "无法开始读取")
         }
 
+        // ---- 2.5 LUT：先建滤镜 ----
+        // 编码器的 colorProperties 要按"有没有 LUT"切换，所以必须提前建。
+        // LUT 的输入是 Log 值，输出是 PQ 编码的 P3 值，编码器得按 P3 + PQ 写。
+        let lutFilter: CIFilter?
+        if let lut {
+            if let made = lut.makeFilter() {
+                lutFilter = made
+                report.appliedLUT = "\(lut.title) \(lut.size)³"
+                log("LUT 就绪：\(lut.title) · \(lut.size)³")
+            } else {
+                lutFilter = nil
+                log("LUT 滤镜创建失败，本片按 Log 直出")
+            }
+        } else {
+            lutFilter = nil
+        }
+
         // ---- 3. 编码 ----
         let writer: AVAssetWriter
         do {
@@ -186,6 +203,24 @@ final class Log2Transcoder {
         // AVVideoLogTransferFunctionKey 确实存在，但转码这边不需要它：
         // Log 身份最后靠 MovTag 注入的 colr + logs 表达，比让 writer
         // 自己写更可控，也不依赖 SDK 版本。
+        // 无 LUT：BT.2020 原色 + BT.709 传递函数（Log 素材，标记按 9/2/9 注入）
+        // 有 LUT：P3-D65 + PQ（LUT 输出就是 PQ 值，标记按 12/16/9 注入）
+        let colorProperties: [String: Any]
+        if lutFilter != nil {
+            colorProperties = [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_P3_D65,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_SMPTE_ST_2084_PQ,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020,
+            ]
+        } else {
+            colorProperties = [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020,
+            ]
+        }
+        log("编码色彩：\(lutFilter != nil ? "P3-D65 + PQ" : "BT.2020 + BT.709")")
+
         let compression: [String: Any] = [
             AVVideoAverageBitRateKey: bitRate,
             AVVideoExpectedSourceFrameRateKey: 24,
@@ -197,11 +232,7 @@ final class Log2Transcoder {
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: report.width,
             AVVideoHeightKey: report.height,
-            AVVideoColorPropertiesKey: [
-                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020,
-            ],
+            AVVideoColorPropertiesKey: colorProperties,
             AVVideoCompressionPropertiesKey: compression,
         ]
 
@@ -269,16 +300,6 @@ final class Log2Transcoder {
                 log("曲线内核编译失败，本片按直通输出")
             } else {
                 log("曲线内核就绪（Apple Log 2 · 白皮书常数）")
-            }
-        }
-        var lutFilter: CIFilter?
-        if let lut {
-            lutFilter = lut.makeFilter()
-            if lutFilter == nil {
-                log("LUT 滤镜创建失败（\(lut.title)），本片不套 LUT")
-            } else {
-                report.appliedLUT = "\(lut.title) \(lut.size)³"
-                log("LUT 就绪：\(lut.title) · \(lut.size)³")
             }
         }
         report.appliedCurve = (kernel != nil)
@@ -436,11 +457,12 @@ final class Log2Transcoder {
 
         // ---- 6. 注入色彩标记 ----
         do {
-            // 烧过 LUT 的画面已是显示参考，不能再标 Log：
-            // 标成 BT.709 三件套，并且不写 logs atom。
+            // 两条路径的标记分开：
+            // 关 LUT → colr 9/2/9 + logs(apple-wide-gamut)，是 Log 素材
+            // 开 LUT → colr 12/16/9（P3-D65 + PQ），不写 logs，不是 Log 了
             let tag = report.appliedLUT == nil
                 ? try MovTag.inject(outputURL)
-                : try MovTag.inject(outputURL, primaries: 1, transfer: 1, matrix: 1, logID: "")
+                : try MovTag.inject(outputURL, primaries: 12, transfer: 16, matrix: 9, logID: "")
             report.tagDelta = tag.delta
             log("标记 colr \(tag.primaries)/\(tag.transfer)/\(tag.matrix) · logs · +\(tag.delta)B · 修正 \(tag.chunksShifted) 个 chunk")
         } catch {

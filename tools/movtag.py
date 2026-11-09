@@ -105,7 +105,7 @@ def describe(path):
     return out
 
 
-def inject(input_path, output_path=None, primaries=2, transfer=2, matrix=9,
+def inject(input_path, output_path=None, primaries=9, transfer=2, matrix=9,
            log_id='com.apple.apple-wide-gamut.apple-log'):
     out = output_path or input_path
     buf = bytearray(open(input_path, 'rb').read())
@@ -122,7 +122,9 @@ def inject(input_path, output_path=None, primaries=2, transfer=2, matrix=9,
             continue
         kids.append(bytes(buf[co:co+cs]))
     kids.append(_mk_colr(primaries, transfer, matrix))
-    kids.append(_mk_logs(log_id))
+    # 空标识符表示已烧过 LUT、不再是 Log 素材，不写 logs atom
+    if log_id:
+        kids.append(_mk_logs(log_id))
 
     head = bytes(buf[e_off:e_off+e_hdr+vh])            # size+type+固定头(78)
     entry_type = bytes(buf[e_off+4:e_off+8])
