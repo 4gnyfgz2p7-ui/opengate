@@ -72,15 +72,30 @@ final class Log2Transcoder {
     ///
     /// 常数一律带 `f` 后缀 —— 不带的话 OpenCL 会按 double 解析，
     /// 部分 GPU 上直接编译失败，内核返回 nil，曲线被静默跳过。
+    /// 白点目标。1.0 的 Log 值（1200% 白）在 LUT 里对应 1662 nits，
+    /// 而 100% 白只到 143 nits。素材里没有 1200% 高光时，LUT 的上半段
+    /// 永远走不到，画面就被顶在 143 nits 上。这里按目标白点反推增益，
+    /// 让 100% 白落在指定的亮度上，LUT 的可用段随之被打开。
     private static let curveKernelSource = """
     kernel vec4 log2curve(__sample s) {
-        vec3 r = clamp(s.rgb, 0.0, 1.0);
-        vec3 logPart = %GAMMA% * log2(r + %BETA%) + %DELTA%;
-        vec3 diff = r - (%R0%);
+        // 不做逐通道截断。之前 clamp(0,1) 让 R/G 先撞顶、B 不撞，
+        // 高光就变成一块饱和黄。这里只挡负数，上限交给 LUT 的域。
+        vec3 x = max(s.rgb, 0.0) * %GAIN%;
+        vec3 logPart = %GAMMA% * log2(x + %BETA%) + %DELTA%;
+        vec3 diff = x - (%R0%);
         vec3 toe = %C% * diff * diff;
-        vec3 outRGB = mix(toe, logPart, step(%RT%, r));
-        outRGB = mix(vec3(0.0), outRGB, step(%R0%, r));
-        return vec4(clamp(outRGB, 0.0, 1.0), s.a);
+        vec3 v = mix(toe, logPart, step(%RT%, x));
+        v = mix(vec3(0.0), v, step(%R0%, x));
+
+        // 高光去饱和：越接近白点越向中性收，模拟相机的肩部。
+        // 判定用增益前的线性值，避免增益把整幅都算成高光。
+        float L0 = max(max(s.r, s.g), s.b);
+        float t = clamp((L0 - %KNEE%) / %WIDTH%, 0.0, 1.0);
+        float k = t * t * (3.0 - 2.0 * t) * %DESAT%;
+        float Lv = max(max(v.r, v.g), v.b);
+        v = mix(v, vec3(Lv), k);
+
+        return vec4(clamp(v, 0.0, 1.0), s.a);
     }
     """
 
@@ -90,6 +105,7 @@ final class Log2Transcoder {
                     outputURL: URL,
                     applyCurve: Bool = true,
                     lut: CubeLUT? = nil,
+                    whiteNits: Double = 500,
                     bitRate: Int = 45_000_000,
                     log: (String) -> Void = { _ in }) throws -> Report {
 
@@ -311,6 +327,20 @@ final class Log2Transcoder {
         }()
         log("渲染色彩：\(lutFilter != nil ? "Display P3" : "BT.2020")")
         var kernel: CIColorKernel?
+        // 100% 白在 LUT 里落在 142.6 nits。按目标白点反推线性增益，
+        // 让 100% 白正好落在用户选的亮度上。上限 12 倍是为了不让
+        // 严重欠曝的素材被拉成噪点一片。
+        //
+        // 只有走 LUT（PQ 输出）时才加增益：关 LUT 的成片是 Apple Log 2
+        // 素材，Log 值必须保持标准，加了增益就是谎报。
+        let gain = lutFilter == nil
+            ? 1.0
+            : Float(min(max(whiteNits / 142.6, 1.0), 12.0))
+        let knee: Float = 0.75
+        let kneeWidth: Float = 0.25
+        // 过曝往白走，这是相机的肩部行为。逐通道硬截会让 R/G 先撞顶、
+        // B 落在后面，于是溢出的区域变成饱和黄 —— 那不是场景的颜色。
+        let desat: Float = lutFilter == nil ? 0.0 : 0.95
         if applyCurve {
             let source = curveKernelSource
                 .replacingOccurrences(of: "%GAMMA%", with: "\(gamma)f")
@@ -319,11 +349,15 @@ final class Log2Transcoder {
                 .replacingOccurrences(of: "%C%", with: "\(c)f")
                 .replacingOccurrences(of: "%R0%", with: "\(r0)f")
                 .replacingOccurrences(of: "%RT%", with: "\(rt)f")
+                .replacingOccurrences(of: "%GAIN%", with: String(format: "%.5ff", gain))
+                .replacingOccurrences(of: "%KNEE%", with: String(format: "%.4ff", knee))
+                .replacingOccurrences(of: "%WIDTH%", with: String(format: "%.4ff", kneeWidth))
+                .replacingOccurrences(of: "%DESAT%", with: String(format: "%.4ff", desat))
             kernel = CIColorKernel(source: source)
             if kernel == nil {
                 log("曲线内核编译失败，本片按直通输出")
             } else {
-                log("曲线内核就绪（Apple Log 2 · 白皮书常数）")
+                log("曲线内核就绪 · 白点 \(Int(whiteNits)) nits · 增益 \(String(format: "%.2f", gain))× · 去饱和 \(Int(knee * 100))% 起")
             }
         }
         report.appliedCurve = (kernel != nil)

@@ -1368,12 +1368,49 @@ struct SettingsSheet: View {
                             Text("转码时烧录 LUT")
                                 .font(.system(size: 12))
                                 .foregroundStyle(.white.opacity(0.85))
-                            Text("开启后成片标 BT.709，不再是 Log")
+                            Text("开启后成片标 P3 + PQ，切成 HDR")
                                 .font(.system(size: 9.5))
                                 .foregroundStyle(.white.opacity(0.45))
                         }
                     }
                     .tint(accent)
+                }
+
+                if processor.lutEnabled {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("白点")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.white.opacity(0.78))
+
+                        HStack(spacing: 6) {
+                            ForEach(FileProcessor.peakOptions, id: \.self) { nits in
+                                Button {
+                                    processor.setPeakNits(nits)
+                                } label: {
+                                    Text(nits == 1662 ? "满档" : "\(nits)")
+                                        .font(.system(size: 10.5,
+                                                      weight: processor.peakNits == nits ? .semibold : .regular))
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 5)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 6)
+                                                .fill(processor.peakNits == nits
+                                                      ? accent.opacity(0.26)
+                                                      : Color.white.opacity(0.06))
+                                        )
+                                        .foregroundStyle(processor.peakNits == nits
+                                                         ? accent
+                                                         : Color.white.opacity(0.6))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+
+                        Text("100% 白落在多少 nits。LUT 里 100% 白本来只有 143，1200% 白才到 1662。")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.white.opacity(0.4))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
 
                 if let message = processor.lutMessage {

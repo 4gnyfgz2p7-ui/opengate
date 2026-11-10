@@ -32,6 +32,24 @@ final class FileProcessor: ObservableObject {
     @Published private(set) var lutBusy = false
     @Published private(set) var lutMessage: String?
 
+    // ---- 白点 ----
+    /// 100% 白要落在多少 nits。
+    ///
+    /// LUT 里 100% 白的 Log 0.6934 对应 143 nits，1200% 白的 Log 1.0
+    /// 对应 1662 nits。素材里没有 1200% 高光时，靠增益把白点抬上去，
+    /// LUT 的上半段才会被真正用到。203 是标准 HDR 扩散白，1662 是 LUT 顶。
+    static let peakOptions = [203, 500, 1000, 1662]
+
+    @Published private(set) var peakNits: Int = {
+        let stored = UserDefaults.standard.integer(forKey: "peak.nits")
+        return stored == 0 ? 500 : stored
+    }()
+
+    func setPeakNits(_ nits: Int) {
+        peakNits = nits
+        UserDefaults.standard.set(nits, forKey: "peak.nits")
+    }
+
     init() {
         lastCrash = Self.shortCrash()
     }
@@ -161,6 +179,7 @@ final class FileProcessor: ObservableObject {
                     outputURL: target,
                     applyCurve: true,
                     lut: activeLUT,
+                    whiteNits: Double(peakNits),
                     bitRate: 45_000_000
                 ) { line in
                     TranscodeLog.write(line)
