@@ -170,8 +170,11 @@ def demosaic(x):
     return {c: box3(pl[c]) / np.maximum(box3(mk[c]), 1e-6) for c in 'RGB'}
 
 
-def frame_to_log2(raw):
-    lin = np.clip(raw / WHITE_LEVEL, 0, 1)
+def frame_to_log2(raw, gain=1.0):
+    # gain 取自 prrf 帧头的 GainFactor。传感器增益必须乘进来，否则整体会
+    # 暗约 gain 倍（实测 2.977 → 中位线性 0.052 而非 0.153）。
+    # 该画面 p99.9 线性值 0.63，乘 2.977 后经 Log 曲线落在 0.772，不会削顶。
+    lin = np.clip(raw * gain / WHITE_LEVEL, 0, 1)
     c = demosaic(lin)
     rgb = np.stack([c['R'], c['G'], c['B']], -1)
     awg = np.clip(rgb @ CAM2AWG.T, 0, None)
@@ -233,7 +236,7 @@ def transcode(src, dst, bitrate="45M", maxrate="90M", preset="medium", fps=None,
         if len(buf) < FB:
             break
         raw = np.frombuffer(buf, dtype=np.uint16).reshape(H, W).astype(np.float32)
-        logv = frame_to_log2(raw)
+        logv = frame_to_log2(raw, gain=info.get('gain', 1.0) or 1.0)
         u16 = (np.clip(logv, 0, 1) * 65535.0 + 0.5).astype(np.uint16)
         try:
             enc.stdin.write(u16.tobytes())

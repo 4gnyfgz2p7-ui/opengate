@@ -296,7 +296,20 @@ final class Log2Transcoder {
             .workingColorSpace: NSNull(),
             .cacheIntermediates: false,
         ])
-        let outputColorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        // 渲染色彩空间必须与成片要写的色彩空间一致：
+        //   开 LUT → 输出是 Display P3 的 PQ 值 → 渲染到 P3
+        //   关 LUT → 输出是 Apple Wide Gamut（按 BT.2020 近似）的 Log 值 → 渲染到 BT.2020
+        //
+        // 之前两条路径都写 sRGB。数值在窄色域里被解释一次，编码器再按宽色域
+        // 写标记，播放器按宽色域解码，饱和度就被放大 —— 高对比边缘本来就带
+        // 镜头色差，被这一层放大后直接推成 B=0 的纯色块。
+        let outputColorSpace: CGColorSpace = {
+            if lutFilter != nil {
+                return CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+            }
+            return CGColorSpace(name: CGColorSpace.itur_2020) ?? CGColorSpaceCreateDeviceRGB()
+        }()
+        log("渲染色彩：\(lutFilter != nil ? "Display P3" : "BT.2020")")
         var kernel: CIColorKernel?
         if applyCurve {
             let source = curveKernelSource
