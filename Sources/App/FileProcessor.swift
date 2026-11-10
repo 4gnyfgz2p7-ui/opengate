@@ -154,6 +154,9 @@ final class FileProcessor: ObservableObject {
         startLogPolling()
 
         let tier = self.tier
+        // 主线程读一次带进闭包：peakNits 是 MainActor 隔离的，
+        // 在 detached 任务里直接读会编译不过。
+        let whiteNits = Double(peakNits)
 
         Task.detached(priority: .userInitiated) { [weak self] in
             // 「文件」App 给出的 URL 是安全作用域资源，必须显式开合。
@@ -179,7 +182,7 @@ final class FileProcessor: ObservableObject {
                     outputURL: target,
                     applyCurve: true,
                     lut: activeLUT,
-                    whiteNits: Double(peakNits),
+                    whiteNits: whiteNits,
                     bitRate: 45_000_000
                 ) { line in
                     TranscodeLog.write(line)
