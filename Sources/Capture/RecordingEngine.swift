@@ -178,7 +178,7 @@ final class RecordingEngine: ObservableObject {
     // MARK: - 对外状态
 
     @Published private(set) var state: RecordingState = .idle
-    @Published var tier: QualityTier = .proresRAW {
+    @Published var tier: QualityTier = .proResRAW {
         didSet {
             // 录制中不允许切档：四档编码器参数不同，必须停录重建
             if state.isBusy && tier != oldValue {
