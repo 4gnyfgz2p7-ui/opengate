@@ -35,10 +35,11 @@ final class FileProcessor: ObservableObject {
     // ---- 白点 ----
     /// 100% 白要落在多少 nits。
     ///
-    /// LUT 里 100% 白的 Log 0.6934 对应 143 nits，1200% 白的 Log 1.0
-    /// 对应 1662 nits。素材里没有 1200% 高光时，靠增益把白点抬上去，
-    /// LUT 的上半段才会被真正用到。203 是标准 HDR 扩散白，1662 是 LUT 顶。
-    static let peakOptions = [203, 500, 1000, 1662]
+    /// 100% 白在 LUT 里落多少 nits，由 LUT 自身决定（当前这版是 157）。
+    /// 1200% 白的 Log 1.0 对应 LUT 顶 2000 nits。素材里没有 1200% 高光时，
+    /// 靠增益把白点抬上去，LUT 的上半段才会被真正用到。
+    /// 203 是标准 HDR 扩散白，2000 是 LUT 顶。
+    static let peakOptions = [203, 500, 1000, 2000]
 
     @Published private(set) var peakNits: Int = {
         let stored = UserDefaults.standard.integer(forKey: "peak.nits")

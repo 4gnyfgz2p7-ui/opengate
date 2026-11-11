@@ -333,9 +333,13 @@ final class Log2Transcoder {
         //
         // 只有走 LUT（PQ 输出）时才加增益：关 LUT 的成片是 Apple Log 2
         // 素材，Log 值必须保持标准，加了增益就是谎报。
+        // 参考白从 LUT 自身读：100% 白（Log 0.69336945）在这个 3D LUT 里
+        // 对应多少 nits。不同版本的 LUT 白点不同（旧 136、新 157），
+        // 写死常数会让所有档位整体偏移。
+        let refWhite: Double = lut.map { Self.pqToNits($0.neutralOutput(at: delta)) } ?? 157.0
         let gain = lutFilter == nil
             ? 1.0
-            : Float(min(max(whiteNits / 142.6, 1.0), 12.0))
+            : Float(min(max(whiteNits / refWhite, 1.0), 12.0))
         let knee: Float = 0.75
         let kneeWidth: Float = 0.25
         // 过曝往白走，这是相机的肩部行为。逐通道硬截会让 R/G 先撞顶、
@@ -357,7 +361,7 @@ final class Log2Transcoder {
             if kernel == nil {
                 log("曲线内核编译失败，本片按直通输出")
             } else {
-                log("曲线内核就绪 · 白点 \(Int(whiteNits)) nits · 增益 \(String(format: "%.2f", gain))× · 去饱和 \(Int(knee * 100))% 起")
+                log("曲线内核就绪 · 白点 \(Int(whiteNits)) nits · LUT 参考白 \(String(format: "%.1f", refWhite)) nits · 增益 \(String(format: "%.2f", gain))× · 去饱和 \(Int(knee * 100))% 起")
             }
         }
         report.appliedCurve = (kernel != nil)
@@ -676,6 +680,20 @@ final class Log2Transcoder {
             }
         }
         context.render(image, to: dst, bounds: frameRect, colorSpace: colorSpace)
+    }
+
+    /// PQ 码值（0–1）换算成绝对亮度 nits。SMPTE ST 2084。
+    private static func pqToNits(_ n: Float) -> Double {
+        let m1 = 0.1593017578125
+        let m2 = 78.84375
+        let c1 = 0.8359375
+        let c2 = 18.8515625
+        let c3 = 18.6875
+        let p = pow(Double(max(min(n, 1), 0)), 1.0 / m2)
+        let num = max(p - c1, 0)
+        let den = c2 - c3 * p
+        guard den > 1e-9 else { return 10000 }
+        return 10000 * pow(num / den, 1.0 / m1)
     }
 
     /// 当前进程的物理内存占用（MB）。

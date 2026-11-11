@@ -1387,7 +1387,7 @@ struct SettingsSheet: View {
                                 Button {
                                     processor.setPeakNits(nits)
                                 } label: {
-                                    Text(nits == 1662 ? "满档" : "\(nits)")
+                                    Text(nits == 2000 ? "满档" : "\(nits)")
                                         .font(.system(size: 10.5,
                                                       weight: processor.peakNits == nits ? .semibold : .regular))
                                         .frame(maxWidth: .infinity)
@@ -1406,7 +1406,7 @@ struct SettingsSheet: View {
                             }
                         }
 
-                        Text("100% 白落在多少 nits。LUT 里 100% 白本来只有 143，1200% 白才到 1662。")
+                        Text("100% 白落在多少 nits。这版 LUT 里 100% 白是 157，1200% 白才到 2000。")
                             .font(.system(size: 9))
                             .foregroundStyle(.white.opacity(0.4))
                             .fixedSize(horizontal: false, vertical: true)

@@ -120,6 +120,20 @@ struct CubeLUT {
                        cubeData: rgba.withUnsafeBufferPointer { Data(buffer: $0) })
     }
 
+    /// 中性轴（R=G=B）在给定输入下的输出 PQ 码值。
+    ///
+    /// `.cube` 是 R 变化最快，所以 (v,v,v) 落在 i·N² + i·N + i。
+    /// 用来读 LUT 自己的白点：不同版本的同名 LUT，100% 白可能是
+    /// 136 nits 也可能是 157 nits，写死一个常数必然偏。
+    func neutralOutput(at v: Float) -> Float {
+        let n = size
+        let i = min(max(Int((v * Float(n - 1)).rounded()), 0), n - 1)
+        let scalar = (i * n * n + i * n + i) * 4
+        return cubeData.withUnsafeBytes { raw in
+            raw.load(fromByteOffset: scalar * MemoryLayout<Float>.size, as: Float.self)
+        }
+    }
+
     /// 建一个可复用的 CIColorCube。转码循环里每帧调用它即可。
     func makeFilter() -> CIFilter? {
         guard let filter = CIFilter(name: "CIColorCube") else { return nil }
