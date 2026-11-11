@@ -436,24 +436,6 @@ struct RecorderView: View {
                     .frame(maxWidth: .infinity)
             }
 
-            if let hint = engine.logCaptureHint {
-                Text(hint)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.white.opacity(0.5))
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: .infinity)
-            }
-
-            if let note = engine.companionNote {
-                Text(note)
-                    .font(.system(size: 10))
-                    .foregroundStyle(engine.companionURL == nil
-                                     ? Color.orange.opacity(0.85)
-                                     : Color.green.opacity(0.7))
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: .infinity)
-            }
-
             VStack(spacing: 8) {
                 ExposureStrip(exposure: engine.exposure, accent: accent, compact: landscape, embedded: true)
                 WhiteBalanceStrip(whiteBalance: engine.whiteBalance, accent: accent, embedded: true)
@@ -1096,21 +1078,6 @@ struct SettingsSheet: View {
             row("GPU 自检", engine.pipelineBadge)
             row("定位", engine.lastLocationText)
 
-            // 只在 RAW 档有意义：副路成功才删母版，失败不动素材
-            if engine.tier.isRawBayer {
-                Toggle(isOn: $engine.discardRAWWhenCompanionSucceeds) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("成品成功后删除 RAW 母版")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.white.opacity(0.85))
-                        Text("副路 HEVC Log 2 写成功才删，失败保留 RAW")
-                            .font(.system(size: 9.5))
-                            .foregroundStyle(.white.opacity(0.45))
-                    }
-                }
-                .tint(accent)
-            }
-
             if let note = engine.thermalNote {
                 row("机身温度", note)
             }
@@ -1170,10 +1137,8 @@ struct SettingsSheet: View {
     private var displaySection: some View {
         section("显示") {
             Toggle(isOn: $engine.waveformEnabled) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("波形监看")
-                        .font(.system(size: 13))
-                }
+                Text("波形监看")
+                    .font(.system(size: 13))
             }
             .tint(accent)
 
@@ -1238,10 +1203,6 @@ struct SettingsSheet: View {
     private var offlineSection: some View {
         section("离线处理") {
             VStack(alignment: .leading, spacing: 8) {
-                Text("选一个 ProRes RAW 文件，走官方解码重编码。同一个文件可以反复处理，不必重录。")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
                 Button {
                     showImporter = true
                 } label: {
@@ -1260,58 +1221,18 @@ struct SettingsSheet: View {
                     .background(Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
                 }
                 .disabled(processor.busy)
-                Text(processor.status)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(processor.status.hasPrefix("失败") ? Color.red : Color.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
 
-                // 上次异常终止的现场。闪退之后重开 App 就能在这里读到
-                // 异常名与原因，不用去系统设置里翻 .ips。
-                if let crash = processor.lastCrash {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text("上次异常退出")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(Color.orange)
-                            Spacer(minLength: 0)
-                            Button("清除") { processor.dismissCrash() }
-                                .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
-                        }
-                        Text(crash)
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundStyle(.secondary)
+                if let toast = processor.toast {
+                    HStack(spacing: 6) {
+                        Image(systemName: toast.hasPrefix("失败")
+                              ? "exclamationmark.triangle.fill"
+                              : "checkmark.circle.fill")
+                        Text(toast)
+                            .lineLimit(3)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
-                }
-
-                // 转码日志。每一步都写进 transcode.log，这里直接显示，
-                // 不必再跑一次「文件」App 去拷贝。出问题时第一现场就在这里。
-                if !processor.logLines.isEmpty {
-                    ScrollViewReader { proxy in
-                        ScrollView(.vertical, showsIndicators: true) {
-                            VStack(alignment: .leading, spacing: 1) {
-                                ForEach(Array(processor.logLines.enumerated()), id: \.offset) { index, line in
-                                    Text(line)
-                                        .font(.system(size: 9, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .id(index)
-                                }
-                            }
-                            .padding(6)
-                        }
-                        .frame(height: 108)
-                        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
-                        .onChange(of: processor.logLines.count) { _, _ in
-                            guard let last = processor.logLines.indices.last else { return }
-                            proxy.scrollTo(last, anchor: .bottom)
-                        }
-                    }
+                    .font(.system(size: 11))
+                    .foregroundStyle(toast.hasPrefix("失败") ? Color.red : Color.green)
                 }
             }
         }
@@ -1320,11 +1241,6 @@ struct SettingsSheet: View {
     private var lutSection: some View {
         section("LUT") {
             VStack(alignment: .leading, spacing: 9) {
-                Text("装一个 .cube 3D LUT。开启后转码按「解出的画面 → Log 2 曲线 → LUT」烧进成片。")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
                 HStack(spacing: 7) {
                     Image(systemName: "cube.transparent")
                         .font(.system(size: 12))
@@ -1364,53 +1280,11 @@ struct SettingsSheet: View {
                         get: { processor.lutEnabled },
                         set: { processor.setLUTEnabled($0) }
                     )) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("转码时烧录 LUT")
-                                .font(.system(size: 12))
-                                .foregroundStyle(.white.opacity(0.85))
-                            Text("开启后成片标 P3 + PQ，切成 HDR")
-                                .font(.system(size: 9.5))
-                                .foregroundStyle(.white.opacity(0.45))
-                        }
+                        Text("转码时烧录 LUT")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.white.opacity(0.85))
                     }
                     .tint(accent)
-                }
-
-                if processor.lutEnabled {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("白点")
-                            .font(.system(size: 11.5))
-                            .foregroundStyle(.white.opacity(0.78))
-
-                        HStack(spacing: 6) {
-                            ForEach(FileProcessor.peakOptions, id: \.self) { nits in
-                                Button {
-                                    processor.setPeakNits(nits)
-                                } label: {
-                                    Text(nits == 2000 ? "满档" : "\(nits)")
-                                        .font(.system(size: 10.5,
-                                                      weight: processor.peakNits == nits ? .semibold : .regular))
-                                        .frame(maxWidth: .infinity)
-                                        .padding(.vertical, 5)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 6)
-                                                .fill(processor.peakNits == nits
-                                                      ? accent.opacity(0.26)
-                                                      : Color.white.opacity(0.06))
-                                        )
-                                        .foregroundStyle(processor.peakNits == nits
-                                                         ? accent
-                                                         : Color.white.opacity(0.6))
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-
-                        Text("100% 白落在多少 nits。这版 LUT 里 100% 白是 157，1200% 白才到 2000。")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.white.opacity(0.4))
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
                 }
 
                 if let message = processor.lutMessage {

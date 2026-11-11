@@ -178,7 +178,7 @@ final class RecordingEngine: ObservableObject {
     // MARK: - 对外状态
 
     @Published private(set) var state: RecordingState = .idle
-    @Published var tier: QualityTier = .hevcLongGOP {
+    @Published var tier: QualityTier = .proresRAW {
         didSet {
             // 录制中不允许切档：四档编码器参数不同，必须停录重建
             if state.isBusy && tier != oldValue {
@@ -251,7 +251,6 @@ final class RecordingEngine: ObservableObject {
     /// 内存转码状态，界面显示用
     @Published private(set) var companionNote: String?
     /// 转码成功时删除 RAW 母版，只留成品
-    @Published var discardRAWWhenCompanionSucceeds = false
 
     /// 中转任务：录制时落 ProRes RAW，停止后转成用户选的档位。
     /// 记下临时文件与最终目标，成功后删临时文件，失败则保留素材。
@@ -884,39 +883,12 @@ final class RecordingEngine: ObservableObject {
                 )
                 self.recorderBox.set(recorder)
 
-                // ---- 内存分叉：一边落 RAW，一边解成成品 ----
-                //
-                // 只有一路采集。同一份 btp2 样本进两个去处：
-                //   1) RAW 写入器，原始字节原样落盘
-                //   2) VideoToolbox 解码 → HEVC 写入器
-                // 解码在独立串行队列，跟不上就丢帧，主路不受影响。
+                // 只录 RAW。之前那套「同一份 btp2 在内存里再解一份成品」实测
+                // VT 会话创建失败（-12906），成品从来没写成功过，还占着解码
+                // 资源。转码改走设置页的离线处理，那里是验证通的那条链路。
                 self.liveBox.set(nil)
                 self.companionURL = nil
                 self.companionNote = nil
-                if recordingTier.isRawBayer {
-                    let stem = finalURL.deletingPathExtension().lastPathComponent
-                    let companion = finalURL.deletingLastPathComponent()
-                        .appendingPathComponent(stem + "_Log2")
-                        .appendingPathExtension("mov")
-                    do {
-                        let rec = try MovieRecorder(
-                            outputURL: companion,
-                            tier: .hevcLongGOP,
-                            width: width,
-                            height: height,
-                            metadata: metadata,
-                            withAudio: false,
-                            appleLog2: true,
-                            videoTransform: CGAffineTransform(rotationAngle: degrees * .pi / 180)
-                        )
-                        let live = LiveRawTranscoder(recorder: rec)
-                        self.liveBox.set(live)
-                        self.companionURL = companion
-                        self.companionNote = "内存转码中 · HEVC Log 2"
-                    } catch {
-                        self.companionNote = "成品写入器被拒，只录 RAW：\(error.localizedDescription)"
-                    }
-                }
                 self.relayPending = relay
                     ? (raw: outputURL, final: finalURL, tier: selectedTier)
                     : nil
@@ -953,23 +925,7 @@ final class RecordingEngine: ObservableObject {
             self.recorderBox.set(nil)
             var outcome = await recorder.finish()
 
-            // 内存转码收尾：先停采集里的分叉，再等解码队列排空，
-            // 最后关成品写入器。RAW 已经写完，这里怎么做都不影响它。
-            let live = self.liveBox.get()
             self.liveBox.set(nil)
-
-            var companionOutcome: MovieRecorder.Outcome?
-            if let live {
-                let stats = await live.finish()
-                companionOutcome = await live.recorder.finish()
-                if let result = companionOutcome, result.finishedCleanly {
-                    self.companionNote = "成品 \(result.url.lastPathComponent) · \(stats.summary)"
-                } else {
-                    self.companionNote = "成品没写成功（\(stats.summary)），RAW 不受影响"
-                }
-            } else if self.companionURL != nil {
-                self.companionNote = "成品没有写成功，RAW 不受影响"
-            }
 
             // ---- 中转：把刚录的 ProRes RAW 转成用户选的档位 ----
             if let relay = self.relayPending {
@@ -1025,16 +981,6 @@ final class RecordingEngine: ObservableObject {
                         note: "转码失败，已保留 ProRes RAW：\(error.localizedDescription)"
                     )
                 }
-            }
-
-            // 只要成品：副路写成功就把 RAW 母版删掉。
-            // RAW 在这套流程里是中间产物——成品已经有 Log 2 曲线和可用编码，
-            // 留着只是占 55 MB/s × 时长。开关默认关，素材默认不丢。
-            if self.discardRAWWhenCompanionSucceeds,
-               let result = companionOutcome, result.finishedCleanly {
-                try? FileManager.default.removeItem(at: outcome.url)
-                self.companionNote = "已删除 RAW 母版，只留 \(result.url.lastPathComponent)"
-                outcome = result
             }
 
             self.history.insert(outcome, at: 0)

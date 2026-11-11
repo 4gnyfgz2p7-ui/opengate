@@ -32,23 +32,18 @@ final class FileProcessor: ObservableObject {
     @Published private(set) var lutBusy = false
     @Published private(set) var lutMessage: String?
 
-    // ---- 白点 ----
-    /// 100% 白要落在多少 nits。
-    ///
-    /// 100% 白在 LUT 里落多少 nits，由 LUT 自身决定（当前这版是 157）。
-    /// 1200% 白的 Log 1.0 对应 LUT 顶 2000 nits。素材里没有 1200% 高光时，
-    /// 靠增益把白点抬上去，LUT 的上半段才会被真正用到。
-    /// 203 是标准 HDR 扩散白，2000 是 LUT 顶。
-    static let peakOptions = [203, 500, 1000, 2000]
+    /// 转码完成的提示，3 秒后自动消失。设置页不再显示滚动日志。
+    @Published private(set) var toast: String?
+    private var toastTask: Task<Void, Never>?
 
-    @Published private(set) var peakNits: Int = {
-        let stored = UserDefaults.standard.integer(forKey: "peak.nits")
-        return stored == 0 ? 500 : stored
-    }()
-
-    func setPeakNits(_ nits: Int) {
-        peakNits = nits
-        UserDefaults.standard.set(nits, forKey: "peak.nits")
+    private func showToast(_ text: String) {
+        toast = text
+        toastTask?.cancel()
+        toastTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run { self?.toast = nil }
+        }
     }
 
     init() {
@@ -155,9 +150,6 @@ final class FileProcessor: ObservableObject {
         startLogPolling()
 
         let tier = self.tier
-        // 主线程读一次带进闭包：peakNits 是 MainActor 隔离的，
-        // 在 detached 任务里直接读会编译不过。
-        let whiteNits = Double(peakNits)
 
         Task.detached(priority: .userInitiated) { [weak self] in
             // 「文件」App 给出的 URL 是安全作用域资源，必须显式开合。
@@ -183,7 +175,6 @@ final class FileProcessor: ObservableObject {
                     outputURL: target,
                     applyCurve: true,
                     lut: activeLUT,
-                    whiteNits: whiteNits,
                     bitRate: 45_000_000
                 ) { line in
                     TranscodeLog.write(line)
@@ -201,6 +192,7 @@ final class FileProcessor: ObservableObject {
                         Double(size) / 1_000_000, result.summary
                     )
                     self.stopLogPolling()
+                    self.showToast("已保存 \(target.lastPathComponent)")
                     self.lastCrash = nil
                     try? FileManager.default.removeItem(at: Diagnostics.crashURL)
                 }
@@ -209,6 +201,7 @@ final class FileProcessor: ObservableObject {
                     guard let self else { return }
                     self.busy = false
                     self.status = "失败：\(error.localizedDescription)"
+                    self.showToast("失败：\(error.localizedDescription)")
                     TranscodeLog.write("失败：\(error.localizedDescription)")
                     self.stopLogPolling()
                 }

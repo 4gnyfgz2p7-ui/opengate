@@ -105,7 +105,6 @@ final class Log2Transcoder {
                     outputURL: URL,
                     applyCurve: Bool = true,
                     lut: CubeLUT? = nil,
-                    whiteNits: Double = 500,
                     bitRate: Int = 45_000_000,
                     log: (String) -> Void = { _ in }) throws -> Report {
 
@@ -333,13 +332,12 @@ final class Log2Transcoder {
         //
         // 只有走 LUT（PQ 输出）时才加增益：关 LUT 的成片是 Apple Log 2
         // 素材，Log 值必须保持标准，加了增益就是谎报。
-        // 参考白从 LUT 自身读：100% 白（Log 0.69336945）在这个 3D LUT 里
-        // 对应多少 nits。不同版本的 LUT 白点不同（旧 136、新 157），
-        // 写死常数会让所有档位整体偏移。
-        let refWhite: Double = lut.map { Self.pqToNits($0.neutralOutput(at: delta)) } ?? 157.0
-        let gain = lutFilter == nil
-            ? 1.0
-            : Float(min(max(whiteNits / refWhite, 1.0), 12.0))
+        // 完全按 LUT 映射：不再对输入做任何整体提亮。
+        //
+        // 之前按白点目标反推增益（最高 12 倍），暗部被一起抬起来，
+        // 观感就是「暗部偏亮、对比度不够」。LUT 自己已经把 Log 映射到
+        // 0–2000 nits，多余的那层增益只会把黑位推离 0。
+        let gain: Float = 1.0
         let knee: Float = 0.75
         let kneeWidth: Float = 0.25
         // 过曝往白走，这是相机的肩部行为。逐通道硬截会让 R/G 先撞顶、
@@ -361,7 +359,7 @@ final class Log2Transcoder {
             if kernel == nil {
                 log("曲线内核编译失败，本片按直通输出")
             } else {
-                log("曲线内核就绪 · 白点 \(Int(whiteNits)) nits · LUT 参考白 \(String(format: "%.1f", refWhite)) nits · 增益 \(String(format: "%.2f", gain))× · 去饱和 \(Int(knee * 100))% 起")
+                log("曲线内核就绪 · LUT 1:1 映射 · 去饱和 \(Int(knee * 100))% 起")
             }
         }
         report.appliedCurve = (kernel != nil)

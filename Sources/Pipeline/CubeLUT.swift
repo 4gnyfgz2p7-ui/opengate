@@ -162,8 +162,13 @@ enum LUTStore {
         UserDefaults.standard.string(forKey: "lut.currentName")
     }
 
+    /// 默认开启：装了 LUT 就是要用，不该让用户再点一次。
+    /// 只有显式关过（UserDefaults 有值且为 false）才关。
     static var isEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: "lut.enabled") }
+        get {
+            if UserDefaults.standard.object(forKey: "lut.enabled") == nil { return true }
+            return UserDefaults.standard.bool(forKey: "lut.enabled")
+        }
         set { UserDefaults.standard.set(newValue, forKey: "lut.enabled") }
     }
 
