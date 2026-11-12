@@ -159,7 +159,7 @@ final class Log2Transcoder {
         // 这条请求只对 ProRes RAW 有意义（其它编码本来就是显示域信号，
         // 再套 Log 曲线是错的），所以按 codec 门控，并且先真解一帧验证。
         var codec: FourCharCode = 0
-        if let fd = videoTrack.formatDescriptions.first as? CMFormatDescription {
+        if let fd = videoTrack.formatDescriptions.first {
             codec = CMFormatDescriptionGetMediaSubType(fd)
         }
         let isRAWSource = FourCC.string(codec) == "aprn" || FourCC.string(codec) == "aprh"
