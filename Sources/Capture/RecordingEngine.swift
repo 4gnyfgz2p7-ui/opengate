@@ -245,6 +245,9 @@ final class RecordingEngine: ObservableObject {
     let capture = CaptureController()
     let location = LocationProvider()
     let exposure = ExposureController()
+    /// 设备写入器：曝光的手动调节与自动闭环都通过它落到设备上，
+    /// 加锁与写入跑在后台串行队列，不占主线程。
+    let deviceServo = DeviceServo()
     let whiteBalance = WhiteBalanceController()
     let focus = FocusController()
     let waveform = WaveformSampler()
@@ -320,6 +323,7 @@ final class RecordingEngine: ObservableObject {
         let converter = bayerConverter
         let gate = FrameGate()
         let meterClock = MeterClock()
+        let servo = deviceServo
         let statsBox = stats
         let wbBox = wbGains
         let liveBox = self.liveBox
@@ -344,7 +348,9 @@ final class RecordingEngine: ObservableObject {
                     sample = RecordingEngine.meanLuma(imageBuffer)
                 }
                 if let sample {
-                    Task { @MainActor in self?.applyFallbackAutoExposure(mean: sample) }
+                    // 直接喂给后台闭环：以前这里每帧跳一次主线程，
+                    // 主线程上再抢设备锁，拖滑块时就卡住了。
+                    servo.feed(sample)
                 }
             }
 
@@ -496,9 +502,11 @@ final class RecordingEngine: ObservableObject {
         captureConfiguration = config
         capture.start()
         if let device = capture.videoDevice {
-            exposure.attach(to: device)
-            whiteBalance.attach(to: device)
-            focus.attach(to: device)
+            exposure.attach(to: device,
+                            isBayer: captureConfiguration?.isBayer == true,
+                            servo: deviceServo)
+            whiteBalance.attach(to: device, servo: deviceServo)
+            focus.attach(to: device, servo: deviceServo)
             refreshWhiteBalanceGains()
         }
         sessionReady = capture.isRunning
@@ -666,8 +674,10 @@ final class RecordingEngine: ObservableObject {
             // 会话跑起来之后再接管曝光与白平衡：此时 activeFormat 已生效，
             // ISO 与快门范围才是这台设备真正可用的范围。
             if let device = self.capture.videoDevice {
-                self.exposure.attach(to: device)
-                self.whiteBalance.attach(to: device)
+                self.exposure.attach(to: device,
+                                     isBayer: self.captureConfiguration?.isBayer == true,
+                                     servo: self.deviceServo)
+                self.whiteBalance.attach(to: device, servo: self.deviceServo)
             }
             if self.bayerConverter == nil {
                 let reason = BayerConverter.compileNote ?? "未知原因"
@@ -729,9 +739,11 @@ final class RecordingEngine: ObservableObject {
         captureConfiguration = config
         capture.start()
         if let device = capture.videoDevice {
-            exposure.attach(to: device)
-            whiteBalance.attach(to: device)
-            focus.attach(to: device)
+            exposure.attach(to: device,
+                            isBayer: captureConfiguration?.isBayer == true,
+                            servo: deviceServo)
+            whiteBalance.attach(to: device, servo: deviceServo)
+            focus.attach(to: device, servo: deviceServo)
             refreshWhiteBalanceGains()
         }
         sessionReady = capture.isRunning
@@ -1215,52 +1227,6 @@ final class RecordingEngine: ObservableObject {
         return sum / Double(count) / 255.0
     }
 
-    /// 平滑后的亮度读数。闭环每帧都跑，单帧噪点必须滤掉，
-    /// 否则 ISO 会跟着画面里的高频细节抖出一层呼吸。
-    private var smoothedLuma: Double?
-
-    /// 自动曝光的闭环。
-    ///
-    /// **48 Hz 采样、单步 ≤0.025 EV、反馈量走 EV 而不是 ISO。**
-    ///
-    /// 三个数字各自解决一件事：
-    /// - 48 Hz：采样率决定平滑度上限。同样的光线变化拆成 48 小步，
-    ///   看到的是渐变；2 Hz 时一次变化只剩两小步，怎么调都是跳。
-    /// - 0.025 EV（亮度差 1.7%）：单步小到看不出台阶，48 Hz 下每秒
-    ///   仍能走 1.2 EV，跟得上场景切换。
-    /// - EV 而不是 ISO：btp2 的 ISO 是量化的，按百分比推会被吞掉，
-    ///   攒够一档才生效 —— 那正是「一格一格切」的来源。改为先动快门
-    ///   （连续量），只在快门撞界时才落到 ISO，见 `applyExposureStep`。
-    ///
-    /// 输入先过一阶低通（α=0.25），滤掉单帧噪点；死区 0.006 让它在
-    /// 目标附近彻底停手，不然会一直微抖。
-    @MainActor
-    private func applyFallbackAutoExposure(mean: Double) {
-        guard exposure.mode == .autoBoth else { return }
-        guard let device = capture.videoDevice else { return }
-
-        // btp2 绕开 ISP，系统 AE 实际上不干活（写 continuousAutoExposure
-        // 会被静默忽略），但 `exposureMode` 仍可能读回 continuousAutoExposure。
-        // 拿这个值当判据，闭环永远启动不了 —— 于是 RAW 档要么曝光冻住，
-        // 要么只剩系统那条粗粒度的在动，看着就是一格一格切。
-        // 所以全幅 Bayer 档不看这个标志，直接由本闭环接管。
-        if captureConfiguration?.isBayer != true,
-           device.exposureMode == .continuousAutoExposure {
-            return
-        }
-
-        let smoothed = (smoothedLuma ?? mean) * 0.75 + mean * 0.25
-        smoothedLuma = smoothed
-
-        let error = 0.42 - smoothed
-        guard abs(error) > 0.006 else { return }
-
-        // 0.14 ≈ 中灰处 1 EV 对应的观感亮度变化（实测拟合）。
-        let ev = error / 0.14
-        let step = min(max(ev * 0.5, -0.025), 0.025)
-        exposure.applyExposureStep(ev: step)
-    }
-
     var pipelineDiagnosticsText: String {
         var text = stats.snapshot.diagnosticsDetail ?? "—"
         // EV 滑块失效、手动对焦没滑块，两个现象都可能是「这条格式下系统
@@ -1272,6 +1238,12 @@ final class RecordingEngine: ObservableObject {
             text += String(format: "·eb%.1f/%.1f",
                            device.minExposureTargetBias, device.maxExposureTargetBias)
             text += "·fp\(device.isLockingFocusWithCustomLensPositionSupported ? 1 : 0)"
+            // 快门能力的真实上下界：shn 是最快快门，shm 是格式允许的最慢快门（秒）。
+            // 24 fps 下闭环把 shm 再夹到 1/24；若 shm 明显大于 1/24，
+            // 说明硬件支持更长曝光，只是视频档不能用（会掉帧）。
+            let capability = device.activeFormat
+            text += String(format: "·shn1/%.0f", 1.0 / max(CMTimeGetSeconds(capability.minExposureDuration), 1e-6))
+            text += String(format: "·shm%.3f", CMTimeGetSeconds(capability.maxExposureDuration))
             text += "·fpi\(device.isFocusPointOfInterestSupported ? 1 : 0)"
 
             // ---- 曝光/对焦的真实运行状态 ----

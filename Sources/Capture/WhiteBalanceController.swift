@@ -62,12 +62,15 @@ final class WhiteBalanceController: ObservableObject {
     // MARK: - 内部
 
     private weak var device: AVCaptureDevice?
+    /// 设备写入器：所有 lockForConfiguration 都在它的后台队列上做
+    private var servo: DeviceServo?
     private var readbackTask: Task<Void, Never>?
 
     // MARK: - 绑定
 
-    func attach(to device: AVCaptureDevice) {
+    func attach(to device: AVCaptureDevice, servo: DeviceServo) {
         self.device = device
+        self.servo = servo
 
         // 接管时把设备当前估算值读进滑块，避免一进来就跳色
         if let gains = Self.readableGains(of: device) {
@@ -107,12 +110,10 @@ final class WhiteBalanceController: ObservableObject {
     func detach() {
         readbackTask?.cancel()
         readbackTask = nil
-        if let device = device {
-            try? device.lockForConfiguration()
+        servo?.perform { device in
             if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
                 device.whiteBalanceMode = .continuousAutoWhiteBalance
             }
-            device.unlockForConfiguration()
         }
         device = nil
     }
@@ -167,32 +168,40 @@ final class WhiteBalanceController: ObservableObject {
     // MARK: - 应用
 
     private func applyMode() {
-        guard let device = device else { return }
-        try? device.lockForConfiguration()
-        switch mode {
-        case .auto:
-            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
-                device.whiteBalanceMode = .continuousAutoWhiteBalance
+        guard let device else { return }
+        // 换算在主线程做完（不加锁），只有那一小段写入进设备队列。
+        // 主线程上加锁会把取景界面和滑块一起卡住。
+        let target = mode
+        let gains = target == .manual ? manualGains(on: device) : nil
+        servo?.perform { device in
+            switch target {
+            case .auto:
+                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                    device.whiteBalanceMode = .continuousAutoWhiteBalance
+                }
+            case .locked:
+                if device.isWhiteBalanceModeSupported(.locked) {
+                    device.whiteBalanceMode = .locked
+                }
+            case .manual:
+                if let gains {
+                    device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+                }
             }
-        case .locked:
-            if device.isWhiteBalanceModeSupported(.locked) {
-                device.whiteBalanceMode = .locked
-            }
-        case .manual:
-            writeManualGains(device)
         }
-        device.unlockForConfiguration()
     }
 
     private func applyManual() {
-        guard let device = device, mode == .manual else { return }
-        try? device.lockForConfiguration()
-        writeManualGains(device)
-        device.unlockForConfiguration()
+        guard let device, mode == .manual else { return }
+        let gains = manualGains(on: device)
+        servo?.perform { device in
+            device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+        }
     }
 
-    /// 调用前必须已 lockForConfiguration
-    private func writeManualGains(_ device: AVCaptureDevice) {
+    /// 按当前色温/色调算出增益并裁剪到设备允许范围。**纯换算，不加锁**，
+    /// 因此可以在主线程安全调用，再把结果丢给设备队列去写。
+    private func manualGains(on device: AVCaptureDevice) -> AVCaptureDevice.WhiteBalanceGains {
         let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
             temperature: min(max(temperature, Self.temperatureRange.lowerBound), Self.temperatureRange.upperBound),
             tint: min(max(tint, Self.tintRange.lowerBound), Self.tintRange.upperBound)
@@ -204,10 +213,7 @@ final class WhiteBalanceController: ObservableObject {
         gains.redGain = min(max(gains.redGain, 1), upper)
         gains.greenGain = min(max(gains.greenGain, 1), upper)
         gains.blueGain = min(max(gains.blueGain, 1), upper)
-
-        // 白平衡的手动写入 API 叫 Locked 而不是 Custom——与曝光不同。
-        // 它同时把 whiteBalanceMode 置为 .locked 并应用给定增益。
-        device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+        return gains
     }
 
     // MARK: - 回读

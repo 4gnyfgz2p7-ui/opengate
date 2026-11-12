@@ -113,7 +113,6 @@ final class ExposureController: ObservableObject {
     @Published private(set) var liveISO: Float = 0
     @Published private(set) var liveShutterSeconds: Double = 0
     @Published private(set) var liveOffsetEV: Float = 0
-    @Published private(set) var isServoActive = false
 
     // MARK: - 可用范围
 
@@ -123,24 +122,21 @@ final class ExposureController: ObservableObject {
     // MARK: - 内部
 
     private weak var device: AVCaptureDevice?
-    private var servoTask: Task<Void, Never>?
     private var readbackTask: Task<Void, Never>?
 
-    /// 闭环步进阻尼。1.0 会在一次调整里对准，容易来回振荡；
-    /// 0.45 大约 3–5 个周期收敛，肉眼看不到跳变。
-    private let servoDamping: Float = 0.45
-
-    /// 闭环频率（Hz）。5 Hz 足够跟上光线变化，又不会把
-    /// `lockForConfiguration` 的调用堆起来。
-    private let servoHz: Double = 5
-
-    /// 单次调整的幅度上限（EV），防止光线突变时画面猛跳
-    private let maxStepEV: Float = 0.6
+    /// 设备写入器。所有 `lockForConfiguration` 都交给它，在主线程之外执行。
+    private var servo: DeviceServo?
+    /// 当前采集是不是全幅 Bayer（btp2）。这一档系统 AE 不干活，
+    /// 自动曝光得由软件闭环接管；其它档交给系统连续 AE。
+    private var isBayerFormat = false
 
     // MARK: - 绑定设备
 
-    func attach(to device: AVCaptureDevice) {
+    func attach(to device: AVCaptureDevice, isBayer: Bool, servo: DeviceServo) {
         self.device = device
+        self.isBayerFormat = isBayer
+        self.servo = servo
+        servo.attach(device)
         let format = device.activeFormat
 
         let minISO = max(format.minISO, 1)
@@ -170,17 +166,10 @@ final class ExposureController: ObservableObject {
     }
 
     func detach() {
-        servoTask?.cancel(); servoTask = nil
         readbackTask?.cancel(); readbackTask = nil
-        isServoActive = false
         // 交还系统控制，避免离开界面后曝光冻在最后一帧
-        if let device = device {
-            try? device.lockForConfiguration()
-            if device.isExposureModeSupported(.continuousAutoExposure) {
-                device.exposureMode = .continuousAutoExposure
-            }
-            device.unlockForConfiguration()
-        }
+        servo?.detach()
+        servo = nil
         device = nil
     }
 
@@ -194,49 +183,55 @@ final class ExposureController: ObservableObject {
     /// btp2 这类绕过 ISP 的全幅格式里，`maxExposureTargetBias` 可能等于
     /// `minExposureTargetBias`（都为 0）。那种情况下 `setExposureTargetBias`
     /// 不报错也不生效——这正是「EV 滑块拖了没反应」的成因。
-    /// 不支持时改由闭环吞下这个偏移，见 `servoStep`。
+    /// 不支持时改由闭环吞下这个偏移，见 `DeviceServo` 的半自动驱动。
     private var supportsExposureBias: Bool {
         guard let device = device else { return false }
         return device.maxExposureTargetBias > device.minExposureTargetBias + 0.001
     }
 
     private func applyMode() {
-        guard let device = device else { return }
+        guard let device = device, let servo else { return }
+        let bias = clampBias(ev, on: device)
 
         if mode.usesNativeAuto {
-            servoTask?.cancel(); servoTask = nil
-            isServoActive = false
-            try? device.lockForConfiguration()
-            if device.isExposureModeSupported(.continuousAutoExposure) {
-                device.exposureMode = .continuousAutoExposure
-            }
-            // iOS 没有 isExposureTargetBiasSupported，支持范围由 min/maxExposureTargetBias 给出
-            device.setExposureTargetBias(clampBias(ev, on: device), completionHandler: nil)
-            device.unlockForConfiguration()
+            // 全幅 Bayer 档：系统 AE 被静默忽略，交给软件闭环；
+            // 其它档：交系统连续 AE，闭环不参与。
+            if !isBayerFormat { servo.setContinuous(bias: bias) }
+            syncDrive()
             return
         }
 
-        // 手动/混合模式：先落到 custom，再按当前设定写一次
-        try? device.lockForConfiguration()
-        if device.isExposureModeSupported(.custom) {
-            let duration = clampDuration(self.shutterSeconds)
-            let targetISO = clampISO(mode.isoIsManual ? self.iso : device.iso)
-            // custom 模式必须同时给 duration 与 ISO，
-            // "自动"的那一维先取当前实时值，随后由闭环接管
-            device.setExposureModeCustom(duration: duration, iso: targetISO, completionHandler: nil)
-            device.setExposureTargetBias(clampBias(ev, on: device), completionHandler: nil)
-        }
-        device.unlockForConfiguration()
+        // 手动/混合模式：先把两维落到设备，再由闭环负责"自动"的那一维
+        let duration = mode.shutterIsManual ? clampDuration(shutterSeconds) : device.exposureDuration
+        let targetISO = mode.isoIsManual ? clampISO(iso) : device.iso
+        servo.write(duration: duration, iso: targetISO, bias: bias)
+        syncDrive()
+    }
 
-        updateServo()
+    /// 把「闭环该驱动哪一维」同步给设备队列。
+    ///
+    /// 半自动两档以前跑在主线程上的 5 Hz Task 里，每步还要抢设备锁，
+    /// 表现就是"拖完滑块要等两三秒才动"。现在闭环整个搬进设备队列，
+    /// 主线程只负责告诉它驱动哪一维。
+    private func syncDrive() {
+        guard let servo else { return }
+        let biasOK = supportsExposureBias
+        switch mode {
+        case .autoBoth:
+            servo.setDrive(isBayerFormat ? .auto : .off, ev: ev, biasSupported: biasOK)
+        case .manualISO:
+            servo.setDrive(.semiShutter, ev: ev, biasSupported: biasOK)
+        case .manualShutter:
+            servo.setDrive(.semiISO, ev: ev, biasSupported: biasOK)
+        case .manualBoth:
+            servo.setDrive(.off, ev: ev, biasSupported: biasOK)
+        }
     }
 
     private func applyManualISO() {
         guard let device = device, mode.isoIsManual, !mode.usesNativeAuto else { return }
 
         let newISO = clampISO(iso)
-        try? device.lockForConfiguration()
-
         var duration = clampDuration(shutterSeconds)
 
         // ISO 优先（快门自动）下，改 ISO 不应改变画面亮度：
@@ -251,8 +246,8 @@ final class ExposureController: ObservableObject {
             }
         }
 
-        device.setExposureModeCustom(duration: duration, iso: newISO, completionHandler: nil)
-        device.unlockForConfiguration()
+        servo?.hold(1.2)
+        servo?.write(duration: duration, iso: newISO, bias: nil)
     }
 
     private func applyManualShutter() {
@@ -272,75 +267,8 @@ final class ExposureController: ObservableObject {
             }
         }
 
-        try? device.lockForConfiguration()
-        device.setExposureModeCustom(duration: duration, iso: targetISO, completionHandler: nil)
-        device.unlockForConfiguration()
-    }
-
-    /// 系统 AE 不可用时的兜底：按比例缩放 ISO，快门保持当前值。
-    ///
-    /// 只改 ISO 是有意的——24fps 下快门最慢只能到 1/24，一旦顶到那里，
-    /// 再想提亮就只能靠 ISO。两维一起动会让调子变得不可预测。
-    /// 按 EV 增量推进一步曝光。**优先动快门，ISO 只在快门撞界时才动。**
-    ///
-    /// 这是"曝光一下一下跳"的根因所在。btp2（全幅 RAW）这条格式下，
-    /// 传感器增益（ISO）实际可设的值是量化的——按 3% 的量去推，
-    /// 写下去会被直接吞掉，等误差攒够一整档才突然生效，肉眼就是
-    /// 一格一格地切。快门没有这个问题：`exposureDuration` 是连续
-    /// CMTime，写多少就是多少，3% 的变化就是 3%。
-    ///
-    /// 所以闭环的顺序反过来：先用快门走完差额；快门到 1/24 或 1/8000
-    /// 顶住了，才把剩下的差额交给 ISO。ISO 一次至少走 1/12 档，
-    /// 免得反复写一个不会生效的值。
-    ///
-    /// - Parameter ev: 正的变亮，负的变暗。单位 EV。
-    func applyExposureStep(ev: Double) {
-        guard let device = device, ev.isFinite, abs(ev) > 0.0004 else { return }
-
-        let format = device.activeFormat
-        let frameInterval = 1.0 / Double(VideoSettingsBuilder.frameRate)
-        let minDuration = max(CMTimeGetSeconds(format.minExposureDuration), 1.0 / 32000.0)
-        let maxDuration = min(CMTimeGetSeconds(format.maxExposureDuration), frameInterval)
-
-        let currentDuration = CMTimeGetSeconds(device.exposureDuration)
-        let currentISO = device.iso
-        guard currentDuration > 0, currentISO > 0 else { return }
-
-        // 曝光量 ∝ duration。先按 duration 算，超出边界的那部分留给 ISO。
-        var desiredDuration = currentDuration * pow(2.0, ev)
-        var overflowEV = 0.0
-        if desiredDuration > maxDuration {
-            overflowEV = log2(desiredDuration / maxDuration)
-            desiredDuration = maxDuration
-        } else if desiredDuration < minDuration {
-            overflowEV = log2(desiredDuration / minDuration)
-            desiredDuration = minDuration
-        }
-
-        var targetISO = currentISO
-        if abs(overflowEV) > 0.0004 {
-            let scaled = clampISO(currentISO * Float(pow(2.0, overflowEV)))
-            // 不到 1/12 档的 ISO 变化写下去不会生效，等它攒够再写。
-            if abs(log2(Double(scaled) / Double(currentISO))) >= 1.0 / 12.0 {
-                targetISO = scaled
-            }
-        }
-
-        let durationMoved = abs(desiredDuration - currentDuration) / currentDuration > 1e-5
-        let isoMoved = abs(targetISO - currentISO) / max(currentISO, 1) > 1e-3
-        guard durationMoved || isoMoved else { return }
-
-        do {
-            try device.lockForConfiguration()
-        } catch {
-            return
-        }
-        device.setExposureModeCustom(
-            duration: CMTime(seconds: desiredDuration, preferredTimescale: 1_000_000),
-            iso: targetISO,
-            completionHandler: nil
-        )
-        device.unlockForConfiguration()
+        servo?.hold(1.2)
+        servo?.write(duration: duration, iso: targetISO, bias: nil)
     }
 
     private func applyEV() {
@@ -348,85 +276,13 @@ final class ExposureController: ObservableObject {
         let clamped = min(max(ev, minEV), maxEV)
 
         // 支持就用系统 bias（它对自动与半自动都直接生效）。
-        // 不支持时什么都不写——`servoStep` 会把 ev 当作闭环目标，
+        // 不支持时什么都不写——半自动闭环会把 ev 当作目标，
         // 从 ISO/快门那一维补出来。
         guard supportsExposureBias else { return }
 
-        try? device.lockForConfiguration()
-        device.setExposureTargetBias(clampBias(clamped, on: device), completionHandler: nil)
-        device.unlockForConfiguration()
-    }
-
-    // MARK: - 软件闭环
-
-    private func updateServo() {
-        servoTask?.cancel()
-        guard mode.needsServo, device != nil else {
-            isServoActive = false
-            return
-        }
-        isServoActive = true
-
-        servoTask = Task { [weak self] in
-            let interval = UInt64((1.0 / (self?.servoHz ?? 5)) * 1_000_000_000)
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: interval)
-                guard let self = self, !Task.isCancelled else { return }
-                await MainActor.run { self.servoStep() }
-            }
-        }
-    }
-
-    /// 单步闭环：按曝光偏差改变"自动"的那一维。
-    private func servoStep() {
-        guard let device = device, mode.needsServo else { return }
-
-        let offset = device.exposureTargetOffset
-        guard offset.isFinite else { return }
-
-        // 闭环目标：支持系统 bias 时目标是 0（bias 已经表达过 EV），
-        // 不支持时目标就是 EV 本身 —— 系统不给补偿，就由这一维补出来。
-        // 这是 EV 滑块在 btp2 格式下能生效的关键。
-        let targetOffset: Float = supportsExposureBias ? 0 : ev
-        let error = offset - targetOffset
-
-        // 偏差过小就别动，避免在目标附近来回抖
-        guard abs(error) > 0.08 else { return }
-
-        let step = min(max(-error * servoDamping, -maxStepEV), maxStepEV)
-        let factor = powf(2.0, step)
-
-        try? device.lockForConfiguration()
-
-        if mode == .manualISO {
-            // ISO 固定，调快门
-            let current = CMTimeGetSeconds(device.exposureDuration)
-            let desired = current * Double(factor)
-            let clamped = clampDuration(desired)
-            if abs(CMTimeGetSeconds(clamped) - current) > 1e-6 {
-                device.setExposureModeCustom(
-                    duration: clamped,
-                    iso: clampISO(iso),
-                    completionHandler: nil
-                )
-                liveShutterSeconds = CMTimeGetSeconds(clamped)
-            }
-        } else if mode == .manualShutter {
-            // 快门固定，调 ISO
-            let current = device.iso
-            let desired = current * factor
-            let clamped = clampISO(desired)
-            if abs(clamped - current) > 0.5 {
-                device.setExposureModeCustom(
-                    duration: clampDuration(shutterSeconds),
-                    iso: clamped,
-                    completionHandler: nil
-                )
-                liveISO = clamped
-            }
-        }
-
-        device.unlockForConfiguration()
+        servo?.hold(0.8)
+        servo?.writeBias(clampBias(clamped, on: device))
+        syncDrive()
     }
 
     // MARK: - 回读
