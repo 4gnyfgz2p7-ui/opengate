@@ -374,6 +374,10 @@ final class RecordingEngine: ObservableObject {
                         presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(buffer)
                     ) == true {
                         statsBox.markAppended()
+                    } else if let reason = recorder?.appendFailureDescription {
+                        // 拒帧原因必须留下来：两秒零写入时那句自动停止说明
+                        // 就是从这里取的，否则界面上只剩「未接受该画面格式」。
+                        statsBox.markFailure(reason)
                     }
                     return
                 }

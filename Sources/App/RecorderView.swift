@@ -22,6 +22,10 @@ struct RecorderView: View {
     /// 全程不闪黑——黑屏从机制上被消掉，而不是靠缩短时长。
     @State private var cachedLayout: CachedLayout?
     @State private var escapeTask: Task<Void, Never>?
+    /// 顶部小弹窗。录制失败、自动停止这类「必须看见」的消息走这里，
+    /// 3 秒自动消失——不再指望用户去盯顶部那行 10.5pt 的小字。
+    @State private var banner: String?
+    @State private var bannerTask: Task<Void, Never>?
     @Environment(\.scenePhase) private var scenePhase
 
     var onShowProbe: () -> Void
@@ -36,6 +40,16 @@ struct RecorderView: View {
     private var statusMessage: String? {
         if case .failed(let reason) = engine.state { return reason }
         return engine.autoStopReason
+    }
+
+    private func flashBanner(_ text: String) {
+        banner = text
+        bannerTask?.cancel()
+        bannerTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            banner = nil
+        }
     }
 
     var body: some View {
@@ -66,6 +80,24 @@ struct RecorderView: View {
                 }
             }
             .frame(width: size.width, height: size.height)
+            .overlay(alignment: .top) {
+                if let banner {
+                    Text(banner)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.white)
+                        .lineLimit(3)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .background(Color.black.opacity(0.74), in: Capsule())
+                        .overlay(Capsule().stroke(Color.white.opacity(0.12), lineWidth: 0.5))
+                        .padding(.horizontal, 28)
+                        .padding(.top, 52)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.16), value: banner)
             .onChange(of: size, initial: true) { _, newSize in
                 // 旋转链路监测：窗口尺寸/安全区/方向，含实际像素分辨率
                 let scene = foregroundScene
@@ -91,6 +123,14 @@ struct RecorderView: View {
         .onAppear {
             engine.prepareSession()
             forceInterface(engine.rotationDegrees)
+        }
+        .onChange(of: statusMessage) { _, message in
+            if let message { flashBanner(message) }
+        }
+        // 通路降级（Bayer → 系统 ISP）也让用户看见：那时 RAW 一定录不了，
+        // 不给提示就表现为「点了录制什么都没发生」。
+        .onChange(of: engine.pipelineNote) { _, note in
+            if let note { flashBanner(note) }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {

@@ -81,6 +81,13 @@ final class Log2Transcoder {
         // 不做逐通道截断。之前 clamp(0,1) 让 R/G 先撞顶、B 不撞，
         // 高光就变成一块饱和黄。这里只挡负数，上限交给 LUT 的域。
         vec3 x = max(s.rgb, 0.0) * %GAIN%;
+
+        // 暗部对比。这颗 LUT 是「线性场景值 × 166.7」的直映射，没有趾部，
+        // 于是暗部全是同一档灰、发闷。这里在白卡以下做一次阴影 gamma：
+        // r' = r^γ（γ>1 把整段暗部压下去，γ=1 为恒等），白卡及以上原样
+        // 传给后面 —— 高光的亮度和内容因此一点不动。
+        vec3 shadow = pow(min(x, vec3(1.0)), vec3(%SHADOWGAMMA%));
+        x = mix(shadow, x, step(vec3(1.0), x));
         vec3 logPart = %GAMMA% * log2(x + %BETA%) + %DELTA%;
         vec3 diff = x - (%R0%);
         vec3 toe = %C% * diff * diff;
@@ -374,6 +381,10 @@ final class Log2Transcoder {
         // 过曝往白走，这是相机的肩部行为。逐通道硬截会让 R/G 先撞顶、
         // B 落在后面，于是溢出的区域变成饱和黄 —— 那不是场景的颜色。
         let desat: Float = lutFilter == nil ? 0.0 : 0.95
+        // 暗部对比强度。1.0 = 原样；1.35 实测把 18% 灰从 30 压到 16 nits、
+        // 中位从 7.0 压到 2.3 nits，白卡与高光不动。
+        // 只在输出 PQ 时才生效：关 LUT 的成片必须是标准 Apple Log 2。
+        let shadowGamma: Float = lutFilter == nil ? 1.0 : 1.35
 
         // ---- 高光肩 ----
         // 白卡在 Log 域是常数（apple_log(1.0) = 0.6946）；满阱位置由帧头
@@ -408,6 +419,7 @@ final class Log2Transcoder {
                 .replacingOccurrences(of: "%DESAT%", with: String(format: "%.4ff", desat))
                 .replacingOccurrences(of: "%LOGWHITE%", with: String(format: "%.6ff", logWhite))
                 .replacingOccurrences(of: "%HIGHSCALE%", with: String(format: "%.5ff", highScale))
+                .replacingOccurrences(of: "%SHADOWGAMMA%", with: String(format: "%.4ff", shadowGamma))
             kernel = CIColorKernel(source: source)
             if kernel == nil {
                 log("曲线内核编译失败，本片按直通输出")
