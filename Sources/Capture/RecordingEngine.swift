@@ -1199,32 +1199,74 @@ final class RecordingEngine: ObservableObject {
         return sqrt(linear)
     }
 
+    /// 非全幅通路（系统 ISP 出的 BGRA / 420v）的测光。
+    ///
+    /// **返回的是 sqrt(归一化亮度)，和 `meanBayer` 同一个刻度。**
+    /// 闭环只认这一个刻度：目标 0.42 在两条通路上代表同一个亮度，
+    /// 不然换个档位同一个 EV 就变成另一个亮度了。
+    /// sqrt 只是把亮度压一压，单调性不变，闭环照样收敛。
     nonisolated static func meanLuma(_ buffer: CVPixelBuffer) -> Double? {
-        guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA else { return nil }
+        let format = CVPixelBufferGetPixelFormatType(buffer)
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
-        let width = CVPixelBufferGetWidth(buffer)
-        let height = CVPixelBufferGetHeight(buffer)
-        let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
 
-        var sum = 0.0
-        var count = 0
-        var y = 0
-        while y < height {
-            let row = base.advanced(by: y * rowBytes).assumingMemoryBound(to: UInt8.self)
-            var x = 0
-            while x < width {
-                let pixel = row + x * 4
-                // BGRA
-                sum += 0.0722 * Double(pixel[0]) + 0.7152 * Double(pixel[1]) + 0.2126 * Double(pixel[2])
-                count += 1
-                x += 24
+        switch format {
+        case kCVPixelFormatType_32BGRA:
+            let width = CVPixelBufferGetWidth(buffer)
+            let height = CVPixelBufferGetHeight(buffer)
+            let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+
+            var sum = 0.0
+            var count = 0
+            var y = 0
+            while y < height {
+                let row = base.advanced(by: y * rowBytes).assumingMemoryBound(to: UInt8.self)
+                var x = 0
+                while x < width {
+                    let pixel = row + x * 4
+                    // BGRA
+                    sum += 0.0722 * Double(pixel[0]) + 0.7152 * Double(pixel[1]) + 0.2126 * Double(pixel[2])
+                    count += 1
+                    x += 24
+                }
+                y += 24
             }
-            y += 24
+            guard count > 0 else { return nil }
+            let linear = min(max(sum / Double(count) / 255.0, 0), 1)
+            return sqrt(linear)
+
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+            // Y 平面就是亮度，直接读它，不用碰 CbCr。
+            let width = CVPixelBufferGetWidthOfPlane(buffer, 0)
+            let height = CVPixelBufferGetHeightOfPlane(buffer, 0)
+            let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+            let videoRange = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            // 视频范围是 16…235，按 16/219 摊回 0…1；全范围就是 0…255。
+            let floorV: Double = videoRange ? 16 : 0
+            let span: Double = videoRange ? 219 : 255
+
+            var sum = 0.0
+            var count = 0
+            var y = 0
+            while y < height {
+                let row = base.advanced(by: y * rowBytes).assumingMemoryBound(to: UInt8.self)
+                var x = 0
+                while x < width {
+                    sum += Double(row[x])
+                    count += 1
+                    x += 24
+                }
+                y += 24
+            }
+            guard count > 0 else { return nil }
+            let linear = min(max((sum / Double(count) - floorV) / span, 0), 1)
+            return sqrt(linear)
+
+        default:
+            return nil
         }
-        guard count > 0 else { return nil }
-        return sum / Double(count) / 255.0
     }
 
     var pipelineDiagnosticsText: String {
@@ -1245,6 +1287,9 @@ final class RecordingEngine: ObservableObject {
             text += String(format: "·shn1/%.0f", 1.0 / max(CMTimeGetSeconds(capability.minExposureDuration), 1e-6))
             text += String(format: "·shm%.3f", CMTimeGetSeconds(capability.maxExposureDuration))
             text += "·fpi\(device.isFocusPointOfInterestSupported ? 1 : 0)"
+            // 闭环最近一步：aim 目标读数、m 实测读数、e 误差（EV）、
+            // d/i 闭环写下去的快门与 ISO、"停"表示已在死区内没写。
+            text += "·" + deviceServo.loopState
 
             // ---- 曝光/对焦的真实运行状态 ----
             //

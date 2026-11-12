@@ -94,12 +94,12 @@ final class ExposureController: ObservableObject {
 
     /// 手动 ISO。范围由设备格式决定。
     @Published var iso: Float = 100 {
-        didSet { if mode.isoIsManual && iso != oldValue { applyManualISO() } }
+        didSet { if !suppressWrites && mode.isoIsManual && iso != oldValue { applyManualISO() } }
     }
 
     /// 手动快门（秒）。无级，不吸附档位。
     @Published var shutterSeconds: Double = 1.0 / 50.0 {
-        didSet { if mode.shutterIsManual && shutterSeconds != oldValue { applyManualShutter() } }
+        didSet { if !suppressWrites && mode.shutterIsManual && shutterSeconds != oldValue { applyManualShutter() } }
     }
 
     /// EV 补偿。正值提亮，负值压暗。
@@ -126,6 +126,8 @@ final class ExposureController: ObservableObject {
 
     /// 设备写入器。所有 `lockForConfiguration` 都交给它，在主线程之外执行。
     private var servo: DeviceServo?
+    /// 程序自己改这两个发布值时不要触发写入（只有用户拖动才该写）。
+    private var suppressWrites = false
     /// 当前采集是不是全幅 Bayer（btp2）。这一档系统 AE 不干活，
     /// 自动曝光得由软件闭环接管；其它档交给系统连续 AE。
     private var isBayerFormat = false
@@ -159,7 +161,13 @@ final class ExposureController: ObservableObject {
             max(CMTimeGetSeconds(device.exposureDuration), shutterRange.lowerBound),
             shutterRange.upperBound
         )
-        ev = min(max(device.exposureTargetBias, minEV), maxEV)
+        // 系统 bias 只在系统自己的 AE 干活时才有意义。btp2 这类格式给的
+        // 范围是 0…0，往这里夹一下就把用户设的 EV 抹成 0 了——EV 滑块
+        // 就是这么"看起来永远停在中间"的。不支持时保留用户原来的值。
+        if supportsExposureBias {
+            ev = min(max(device.exposureTargetBias, device.minExposureTargetBias),
+                     device.maxExposureTargetBias)
+        }
 
         applyMode()
         startReadback()
@@ -202,6 +210,22 @@ final class ExposureController: ObservableObject {
         }
 
         // 手动/混合模式：先把两维落到设备，再由闭环负责"自动"的那一维
+        //
+        // 切进手动档时**以设备此刻的真实值为准**去填滑块。
+        // 否则 `iso` 还停在上一次手调的 100，而闭环已经把现场推到 1600，
+        // 一按「全手动」画面就被拉暗一大截——看着就像曝光跳了一下。
+        suppressWrites = true
+        if mode.isoIsManual, device.iso > 0 {
+            iso = min(max(device.iso, isoRange.lowerBound), isoRange.upperBound)
+        }
+        if mode.shutterIsManual {
+            let live = CMTimeGetSeconds(device.exposureDuration)
+            if live > 0 {
+                shutterSeconds = min(max(live, shutterRange.lowerBound), shutterRange.upperBound)
+            }
+        }
+        suppressWrites = false
+
         let duration = mode.shutterIsManual ? clampDuration(shutterSeconds) : device.exposureDuration
         let targetISO = mode.isoIsManual ? clampISO(iso) : device.iso
         servo.write(duration: duration, iso: targetISO, bias: bias)
@@ -273,16 +297,16 @@ final class ExposureController: ObservableObject {
 
     private func applyEV() {
         guard let device = device else { return }
-        let clamped = min(max(ev, minEV), maxEV)
 
-        // 支持就用系统 bias（它对自动与半自动都直接生效）。
-        // 不支持时什么都不写——半自动闭环会把 ev 当作目标，
-        // 从 ISO/快门那一维补出来。
-        guard supportsExposureBias else { return }
-
-        servo?.hold(0.8)
-        servo?.writeBias(clampBias(clamped, on: device))
+        // 闭环目标变化一定要通知到——EV 是闭环的目标偏移，不管系统给不给
+        // `exposureTargetBias`。早先这里在不支持 bias 时直接 return，
+        // 顺带把 syncDrive 也跳过了，闭环永远拿不到新的 EV，滑块完全失灵。
         syncDrive()
+
+        // 系统 bias 只在系统自己的 AE 干活时才有意义：全幅档的曝光由闭环
+        // 独占，写 bias 既无效又可能和闭环打架。支持时也只用于非全幅档。
+        guard !isBayerFormat, supportsExposureBias else { return }
+        servo?.writeBias(clampBias(min(max(ev, minEV), maxEV), on: device))
     }
 
     // MARK: - 回读
