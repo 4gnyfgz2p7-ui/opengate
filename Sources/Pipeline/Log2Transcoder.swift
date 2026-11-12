@@ -160,7 +160,7 @@ final class Log2Transcoder {
         // 再套 Log 曲线是错的），所以按 codec 门控，并且先真解一帧验证。
         var codec: FourCharCode = 0
         if let fd = videoTrack.formatDescriptions.first {
-            codec = CMFormatDescriptionGetMediaSubType(fd)
+            codec = CMFormatDescriptionGetMediaSubType(fd as! CMFormatDescription)
         }
         let isRAWSource = FourCC.string(codec) == "aprn" || FourCC.string(codec) == "aprh"
 
