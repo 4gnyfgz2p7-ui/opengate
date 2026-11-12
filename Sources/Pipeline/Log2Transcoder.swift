@@ -87,6 +87,13 @@ final class Log2Transcoder {
         vec3 v = mix(toe, logPart, step(%RT%, x));
         v = mix(vec3(0.0), v, step(%R0%, x));
 
+        // 高光肩。白卡（Log 0.6946）以下一个值都不动 —— 18% 灰因此恒定
+        // 30 nits、白卡恒定 167 nits，中间调和暗部保持 LUT 的 1:1。
+        // 只有白卡到传感器满阱那一段被拉长，让削顶值正好落到 LUT 的
+        // 上限 1.0（2000 nits）。素材没饱和时这段取不到值，等于没开。
+        vec3 above = max(v - vec3(%LOGWHITE%), vec3(0.0));
+        v = min(v, vec3(%LOGWHITE%)) + above * %HIGHSCALE%;
+
         // 高光去饱和：越接近白点越向中性收，模拟相机的肩部。
         // 判定用增益前的线性值，避免增益把整幅都算成高光。
         float L0 = max(max(s.r, s.g), s.b);
@@ -142,9 +149,27 @@ final class Log2Transcoder {
             throw TranscodeError.readerFailed(error.localizedDescription)
         }
 
-        // 10-bit 优先。ProRes RAW 解出来通常是 x420；这一代 VT 若只给
-        // 8-bit，会落到 p420，报告里如实写出来。
-        let candidates: [OSType] = [
+        // ProRes RAW 先试**半浮点线性**。
+        //
+        // 10-bit YUV 的满量程就是 1.0（100% 白），而传感器乘上 GainFactor
+        // 之后能到 2.9 倍白 —— 超出部分在解码这一步就被压平，成片是一块
+        // 没有层次的死白（实测 9% 像素钉在同一条线上，显示器文字直接消失）。
+        // 半浮点没有这个天花板：>1.0 的线性值原样带出来，后面才有得映射。
+        //
+        // 这条请求只对 ProRes RAW 有意义（其它编码本来就是显示域信号，
+        // 再套 Log 曲线是错的），所以按 codec 门控，并且先真解一帧验证。
+        var codec: FourCharCode = 0
+        if let fd = videoTrack.formatDescriptions.first as? CMFormatDescription {
+            codec = CMFormatDescriptionGetMediaSubType(fd)
+        }
+        let isRAWSource = FourCC.string(codec) == "aprn" || FourCC.string(codec) == "aprh"
+
+        var candidates: [OSType] = []
+        if isRAWSource, Self.canDecode(asset: asset, track: videoTrack,
+                                       code: kCVPixelFormatType_64RGBAHalf) {
+            candidates.append(kCVPixelFormatType_64RGBAHalf)
+        }
+        candidates += [
             kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
             kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
@@ -168,8 +193,14 @@ final class Log2Transcoder {
             throw TranscodeError.readerFailed("解码器不接受任何输出格式")
         }
         report.sourceFormat = fourCC(chosen)
-        report.bitDepth = (chosen == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) ? 8 : 10
-        log("解码格式 \(report.sourceFormat) \(report.bitDepth)bit")
+        if chosen == kCVPixelFormatType_64RGBAHalf {
+            report.bitDepth = 16
+        } else if chosen == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
+            report.bitDepth = 8
+        } else {
+            report.bitDepth = 10
+        }
+        log("解码格式 \(report.sourceFormat) \(report.bitDepth)bit \(chosen == kCVPixelFormatType_64RGBAHalf ? "· 线性不削顶" : "· YUV 满量程即 100% 白")")
 
         // ---- 2. 音频：原样搬运，不做采样率/位深转换 ----
         var audioOutput: AVAssetReaderTrackOutput?
@@ -343,6 +374,26 @@ final class Log2Transcoder {
         // 过曝往白走，这是相机的肩部行为。逐通道硬截会让 R/G 先撞顶、
         // B 落在后面，于是溢出的区域变成饱和黄 —— 那不是场景的颜色。
         let desat: Float = lutFilter == nil ? 0.0 : 0.95
+
+        // ---- 高光肩 ----
+        // 白卡在 Log 域是常数（apple_log(1.0) = 0.6946）；满阱位置由帧头
+        // 的 GainFactor 决定（满阱码值乘 gain 再除回白电平，正好等于 gain）。
+        // 把 [白卡, 满阱] 这段按比例拉长到 [0.6946, 1.0]，削顶值就落在
+        // LUT 的上限 1.0 = 2000 nits，而白卡以下一个值都不动。
+        let logWhite = Float(Self.logCurve(1.0))
+        var highScale: Float = 1
+        if let g = Self.frameHeaderGain(url: rawURL), g > 1.02 {
+            let saturated = Float(Self.logCurve(g))
+            if saturated > logWhite + 0.005 {
+                highScale = (1 - logWhite) / (saturated - logWhite)
+                log(String(format: "高光肩 ×%.3f · 白卡 Log %.4f · 满阱 gain %.3f = Log %.4f → 1.0",
+                           highScale, logWhite, g, saturated))
+            } else {
+                log("高光肩 关闭 · 满阱没超过白卡（gain 太低，没有余量）")
+            }
+        } else {
+            log("高光肩 关闭 · 没读到帧头 GainFactor")
+        }
         if applyCurve {
             let source = curveKernelSource
                 .replacingOccurrences(of: "%GAMMA%", with: "\(gamma)f")
@@ -355,6 +406,8 @@ final class Log2Transcoder {
                 .replacingOccurrences(of: "%KNEE%", with: String(format: "%.4ff", knee))
                 .replacingOccurrences(of: "%WIDTH%", with: String(format: "%.4ff", kneeWidth))
                 .replacingOccurrences(of: "%DESAT%", with: String(format: "%.4ff", desat))
+                .replacingOccurrences(of: "%LOGWHITE%", with: String(format: "%.6ff", logWhite))
+                .replacingOccurrences(of: "%HIGHSCALE%", with: String(format: "%.5ff", highScale))
             kernel = CIColorKernel(source: source)
             if kernel == nil {
                 log("曲线内核编译失败，本片按直通输出")
@@ -678,6 +731,54 @@ final class Log2Transcoder {
             }
         }
         context.render(image, to: dst, bounds: frameRect, colorSpace: colorSpace)
+    }
+
+    /// Apple Log 2 曲线，与内核同参数。
+    private static func logCurve(_ r: Double) -> Double {
+        if r >= Double(rt) { return Double(gamma) * log2(max(r + Double(beta), 1e-9)) + Double(delta) }
+        if r >= Double(r0) { let d = r - Double(r0); return Double(c) * d * d }
+        return 0
+    }
+
+    /// AVAssetReader 接受某个像素格式，不代表真能吐帧 ——
+    /// ProRes RAW 对不支持的格式会 canAdd 成功然后一帧都不给。
+    /// 所以真解一帧验证，失败就当没这条候选。
+    private static func canDecode(asset: AVURLAsset, track: AVAssetTrack, code: OSType) -> Bool {
+        guard let reader = try? AVAssetReader(asset: asset) else { return false }
+        let out = AVAssetReaderTrackOutput(
+            track: track,
+            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: code]
+        )
+        out.alwaysCopiesSampleData = false
+        guard reader.canAdd(out) else { return false }
+        reader.add(out)
+        guard reader.startReading() else { return false }
+        defer { reader.cancelReading() }
+        guard let sample = out.copyNextSampleBuffer(),
+              let buffer = CMSampleBufferGetImageBuffer(sample) else { return false }
+        return CVPixelBufferGetPixelFormatType(buffer) == code
+    }
+
+    /// 从 ProRes RAW 的 `prrf` 帧头读传感器增益（GainFactor）。
+    ///
+    /// 帧头结构：'prrf' 起，宽高在 +0x0c/+0x0e，BayerPattern 在 +0x14，
+    /// 3×3 在 +0x20，GainFactor 在 +0x44（big-endian float）。首帧一定
+    /// 在前几 MB 里，读 4 MB 足够；读不到就返回 nil，肩膀自动关闭。
+    private static func frameHeaderGain(url: URL) -> Double? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        let data = handle.readData(ofLength: 4 << 20)
+        guard let range = data.range(of: Data("prrf".utf8)) else { return nil }
+        let base = range.lowerBound - data.startIndex
+        guard base >= 0, base + 0x48 <= data.count else { return nil }
+        let b0 = UInt32(data[data.startIndex + base + 0x44])
+        let b1 = UInt32(data[data.startIndex + base + 0x45])
+        let b2 = UInt32(data[data.startIndex + base + 0x46])
+        let b3 = UInt32(data[data.startIndex + base + 0x47])
+        let bits = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+        let value = Double(Float(bitPattern: bits))
+        guard value.isFinite, value > 0.05, value < 64 else { return nil }
+        return value
     }
 
     /// PQ 码值（0–1）换算成绝对亮度 nits。SMPTE ST 2084。

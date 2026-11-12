@@ -281,19 +281,65 @@ final class ExposureController: ObservableObject {
     ///
     /// 只改 ISO 是有意的——24fps 下快门最慢只能到 1/24，一旦顶到那里，
     /// 再想提亮就只能靠 ISO。两维一起动会让调子变得不可预测。
-    func nudgeISO(factor: Double) {
-        guard let device = device, factor.isFinite, factor > 0 else { return }
-        let format = device.activeFormat
-        let target = min(max(device.iso * Float(factor), format.minISO), format.maxISO)
-        guard abs(target - device.iso) / max(device.iso, 1) > 0.01 else { return }
+    /// 按 EV 增量推进一步曝光。**优先动快门，ISO 只在快门撞界时才动。**
+    ///
+    /// 这是"曝光一下一下跳"的根因所在。btp2（全幅 RAW）这条格式下，
+    /// 传感器增益（ISO）实际可设的值是量化的——按 3% 的量去推，
+    /// 写下去会被直接吞掉，等误差攒够一整档才突然生效，肉眼就是
+    /// 一格一格地切。快门没有这个问题：`exposureDuration` 是连续
+    /// CMTime，写多少就是多少，3% 的变化就是 3%。
+    ///
+    /// 所以闭环的顺序反过来：先用快门走完差额；快门到 1/24 或 1/8000
+    /// 顶住了，才把剩下的差额交给 ISO。ISO 一次至少走 1/12 档，
+    /// 免得反复写一个不会生效的值。
+    ///
+    /// - Parameter ev: 正的变亮，负的变暗。单位 EV。
+    func applyExposureStep(ev: Double) {
+        guard let device = device, ev.isFinite, abs(ev) > 0.0004 else { return }
 
-        let duration = device.exposureDuration
+        let format = device.activeFormat
+        let frameInterval = 1.0 / Double(VideoSettingsBuilder.frameRate)
+        let minDuration = max(CMTimeGetSeconds(format.minExposureDuration), 1.0 / 32000.0)
+        let maxDuration = min(CMTimeGetSeconds(format.maxExposureDuration), frameInterval)
+
+        let currentDuration = CMTimeGetSeconds(device.exposureDuration)
+        let currentISO = device.iso
+        guard currentDuration > 0, currentISO > 0 else { return }
+
+        // 曝光量 ∝ duration。先按 duration 算，超出边界的那部分留给 ISO。
+        var desiredDuration = currentDuration * pow(2.0, ev)
+        var overflowEV = 0.0
+        if desiredDuration > maxDuration {
+            overflowEV = log2(desiredDuration / maxDuration)
+            desiredDuration = maxDuration
+        } else if desiredDuration < minDuration {
+            overflowEV = log2(desiredDuration / minDuration)
+            desiredDuration = minDuration
+        }
+
+        var targetISO = currentISO
+        if abs(overflowEV) > 0.0004 {
+            let scaled = clampISO(currentISO * Float(pow(2.0, overflowEV)))
+            // 不到 1/12 档的 ISO 变化写下去不会生效，等它攒够再写。
+            if abs(log2(Double(scaled) / Double(currentISO))) >= 1.0 / 12.0 {
+                targetISO = scaled
+            }
+        }
+
+        let durationMoved = abs(desiredDuration - currentDuration) / currentDuration > 1e-5
+        let isoMoved = abs(targetISO - currentISO) / max(currentISO, 1) > 1e-3
+        guard durationMoved || isoMoved else { return }
+
         do {
             try device.lockForConfiguration()
         } catch {
             return
         }
-        device.setExposureModeCustom(duration: duration, iso: target, completionHandler: nil)
+        device.setExposureModeCustom(
+            duration: CMTime(seconds: desiredDuration, preferredTimescale: 1_000_000),
+            iso: targetISO,
+            completionHandler: nil
+        )
         device.unlockForConfiguration()
     }
 

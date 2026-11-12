@@ -171,6 +171,24 @@ final class FrameGate {
     }
 }
 
+/// 测光节拍器。**48 Hz**，与帧率解耦。
+///
+/// 早先测光是「每隔 12 帧取一次」，24 fps 下等于 2 Hz；后来改成逐帧，
+/// 又被 demosaic 之后的帧门控卡在 24–30 Hz。曝光闭环的平滑度直接由
+/// 采样率决定：同样的光线变化，48 次采样就能拆成 48 小步走完，
+/// 眼睛看到的是连续过渡。这里用一个独立的时钟，不让帧率牵着走。
+final class MeterClock {
+    private var last: CFAbsoluteTime = 0
+    private let period: CFAbsoluteTime = 1.0 / 48.0
+
+    func tick() -> Bool {
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - last >= period else { return false }
+        last = now
+        return true
+    }
+}
+
 /// 把定位、采集、编码、落盘串起来。
 @MainActor
 final class RecordingEngine: ObservableObject {
@@ -301,6 +319,7 @@ final class RecordingEngine: ObservableObject {
         let sampler = waveform
         let converter = bayerConverter
         let gate = FrameGate()
+        let meterClock = MeterClock()
         let statsBox = stats
         let wbBox = wbGains
         let liveBox = self.liveBox
@@ -314,6 +333,20 @@ final class RecordingEngine: ObservableObject {
 
             statsBox.markDelivered()
             var monitorable = imageBuffer
+
+            // 测光必须放在所有分支之前。早先它挂在 demosaic 成功之后，
+            // RAW 档根本不走那条路 —— 整段没有测光，自动曝光等于没在控。
+            if meterClock.tick() {
+                let sample: Double?
+                if CVPixelBufferGetPixelFormatType(imageBuffer) == BayerConverter.bayerFormat {
+                    sample = RecordingEngine.meanBayer(imageBuffer, converter: converter)
+                } else {
+                    sample = RecordingEngine.meanLuma(imageBuffer)
+                }
+                if let sample {
+                    Task { @MainActor in self?.applyFallbackAutoExposure(mean: sample) }
+                }
+            }
 
             // 全幅格式只吐 Bayer：先 demosaic 成 BGRA 再交给编码器。
             // 不做这一步 append 会被逐帧拒绝，文件停在 0 字节。
@@ -366,17 +399,6 @@ final class RecordingEngine: ObservableObject {
                 monitorable = converted
                 statsBox.markConverted()
 
-                // 系统 AE 不可用时的兜底测光。**每帧**都量，量的是转换后的
-                // BGRA（已含 REC.709 传递函数），目标值直接按画面观感定。
-                //
-                // 之前是每 12 帧（0.5 秒）量一次，那意味着一次亮度变化只能
-                // 靠几大步走完，每一跨就是肉眼可见的跳档。闭环频率必须跟
-                // 帧率同量级，步长才可能小到看不出台阶。
-                if let mean = RecordingEngine.meanLuma(converted) {
-                    Task { @MainActor in
-                        self?.applyFallbackAutoExposure(mean: mean)
-                    }
-                }
                 let diag = converter.lastDiagnostics
                 statsBox.markDiagnostics(diag.summary, detail: diag.metadataText)
                 if recorder?.appendImageBuffer(
@@ -672,14 +694,19 @@ final class RecordingEngine: ObservableObject {
     /// 降级后分辨率为 4032×3024（真 4:3），但录制能出片——
     /// 比留一个打不开的 0 字节文件有用。
     ///
-    /// ProRes RAW 例外：那一档本来就不做 demosaic，`converted` 恒为 0。
-    /// 若照旧用它当判据，会话会在三秒后自己切到系统 ISP，
-    /// 而 RAW 写入器只收 Bayer，于是第一次点录制必定失败。
-    /// 这一档改看「已写入帧数」。
+    /// 判据必须是「通路有没有在出货」，不能用「有没有写进文件」：
+    /// 自查跑在会话启动三秒后，那时用户还没按录制，`appended` 恒为 0。
+    /// 早先 RAW 档拿 `appended` 当判据，于是每次开会话都判定失败、
+    /// 自动切到系统 ISP，而 RAW 写入器只收 Bayer —— 表现就是
+    /// 「一打开就提示全幅转换未出帧，RAW 怎么都录不了」。
+    ///
+    /// 正确的口径：
+    /// - RAW 档不解 demosaic，看**收到多少帧**（`delivered`）
+    /// - 其它档要 demosaic，看**转换成功多少帧**（`converted`）
     private func recoverPipelineIfNeeded(force: Bool = false) async {
         guard !recovering, captureConfiguration?.isBayer == true else { return }
         let snap = stats.snapshot
-        let progress = tier.isRawBayer ? snap.appended : snap.converted
+        let progress = tier.isRawBayer ? snap.delivered : snap.converted
         guard force || progress == 0 else { return }
 
         recovering = true
@@ -1096,6 +1123,66 @@ final class RecordingEngine: ObservableObject {
     /// 写进视频文件的诊断串，录完直接从文件读，不用再截图
     /// 抽样 BGRA 画面的平均亮度（0–1，已含传递函数）。每 24 像素取一个点，
     /// 4224×3024 约 2.2 万点，够稳且不影响帧率。
+    /// 从 btp2 原始平面取一个亮度样本。
+    ///
+    /// RAW 档不做 demosaic，手上只有打包的 12-bit 传感器值，所以用自校准
+    /// 选出的排法（`unpackMode`）稀疏取样：横向每 12 个像素、纵向每 12 行，
+    /// 4224×3024 大约两万个点，一次调用不到 1 毫秒。
+    ///
+    /// 返回的是 `sqrt(线性值)`：把 0–1 的线性反射率折到接近显示域，
+    /// 18% 灰正好落在 0.42，与 BGRA 那条路的 0.42 目标同口径。
+    /// 没有标定就没有可信的排法，这时返回 nil，宁可不测光也不要喂垃圾。
+    nonisolated static func meanBayer(_ buffer: CVPixelBuffer, converter: BayerConverter?) -> Double? {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+
+        // 有标定就按标定出来的位序逐像素解，最准。
+        if let mode = converter?.calibration?.unpackMode {
+            var sum = 0.0
+            var count = 0
+            var y = 0
+            while y < height {
+                let row = base.advanced(by: y * rowBytes).assumingMemoryBound(to: UInt8.self)
+                var x = 0
+                while x < width {
+                    sum += BayerCalibration.unpack(row, x, mode: Int(mode))
+                    count += 1
+                    x += 12
+                }
+                y += 12
+            }
+            if count > 0 {
+                let linear = min(max(sum / Double(count) / 4095.0, 0), 1)
+                return sqrt(linear)
+            }
+            return nil
+        }
+
+        // 没有标定：btp2 每 12 字节装 8 个像素，前 8 字节是各像素的高 8 位
+        // （12-bit 值的 raw>>4）。只读这 8 个字节就够测光用 —— 闭环只需要
+        // 一个**随照度单调**的量，绝对值由目标自己收敛，不必等 demosaic 标定。
+        var sum = 0.0
+        var count = 0
+        var y = 0
+        while y < height {
+            let row = base.advanced(by: y * rowBytes).assumingMemoryBound(to: UInt8.self)
+            var i = 0
+            while i + 12 <= rowBytes {
+                for k in 0..<8 { sum += Double(row[i + k]) }
+                count += 8
+                i += 12 * 16
+            }
+            y += 16
+        }
+        guard count > 0 else { return nil }
+        let linear = min(max(sum / Double(count) / 255.0, 0), 1)
+        return sqrt(linear)
+    }
+
     nonisolated static func meanLuma(_ buffer: CVPixelBuffer) -> Double? {
         guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA else { return nil }
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
@@ -1128,35 +1215,46 @@ final class RecordingEngine: ObservableObject {
     /// 否则 ISO 会跟着画面里的高频细节抖出一层呼吸。
     private var smoothedLuma: Double?
 
-    /// 系统 AE 不可用时的兜底：按画面平均亮度调 ISO。
+    /// 自动曝光的闭环。
     ///
-    /// 只在两件事同时成立时动手：
-    /// 1. 曝光模式是「自动」（用户没选手动，就不该抢他的 ISO）
-    /// 2. `device.exposureMode` 实际不是 `continuousAutoExposure` —— 这条格式下
-    ///    写系统 AE 会被静默忽略，画面停在默认曝光上，正是 0EV 偏暗的来源
+    /// **48 Hz 采样、单步 ≤0.025 EV、反馈量走 EV 而不是 ISO。**
     ///
-    /// **平滑靠两件事**：
-    /// - 频率：逐帧（24 Hz）。半秒一次的闭环无论步长怎么调都会跳——
-    ///   一次 1 EV 的变化只剩两次机会走完，每次就是半档。
-    /// - 步长：单步上限 0.045 EV（亮度差约 3.2%）。24 Hz 下每秒最多 1.1 EV，
-    ///   够跟上光线变化，又小到看不出台阶。
+    /// 三个数字各自解决一件事：
+    /// - 48 Hz：采样率决定平滑度上限。同样的光线变化拆成 48 小步，
+    ///   看到的是渐变；2 Hz 时一次变化只剩两小步，怎么调都是跳。
+    /// - 0.025 EV（亮度差 1.7%）：单步小到看不出台阶，48 Hz 下每秒
+    ///   仍能走 1.2 EV，跟得上场景切换。
+    /// - EV 而不是 ISO：btp2 的 ISO 是量化的，按百分比推会被吞掉，
+    ///   攒够一档才生效 —— 那正是「一格一格切」的来源。改为先动快门
+    ///   （连续量），只在快门撞界时才落到 ISO，见 `applyExposureStep`。
     ///
-    /// 输入先过一阶低通（α=0.22），免得画面里的纹理和噪点被当成曝光变化。
-    /// 死区 0.012 是为了在目标附近彻底停手，否则会持续微抖。
+    /// 输入先过一阶低通（α=0.25），滤掉单帧噪点；死区 0.006 让它在
+    /// 目标附近彻底停手，不然会一直微抖。
     @MainActor
     private func applyFallbackAutoExposure(mean: Double) {
         guard exposure.mode == .autoBoth else { return }
         guard let device = capture.videoDevice else { return }
-        guard device.exposureMode != .continuousAutoExposure else { return }
 
-        let smoothed = (smoothedLuma ?? mean) * 0.78 + mean * 0.22
+        // btp2 绕开 ISP，系统 AE 实际上不干活（写 continuousAutoExposure
+        // 会被静默忽略），但 `exposureMode` 仍可能读回 continuousAutoExposure。
+        // 拿这个值当判据，闭环永远启动不了 —— 于是 RAW 档要么曝光冻住，
+        // 要么只剩系统那条粗粒度的在动，看着就是一格一格切。
+        // 所以全幅 Bayer 档不看这个标志，直接由本闭环接管。
+        if captureConfiguration?.isBayer != true,
+           device.exposureMode == .continuousAutoExposure {
+            return
+        }
+
+        let smoothed = (smoothedLuma ?? mean) * 0.75 + mean * 0.25
         smoothedLuma = smoothed
 
         let error = 0.42 - smoothed
-        guard abs(error) > 0.012 else { return }
+        guard abs(error) > 0.006 else { return }
 
-        let step = min(max(error * 0.45, -0.045), 0.045)
-        exposure.nudgeISO(factor: pow(2.0, step))
+        // 0.14 ≈ 中灰处 1 EV 对应的观感亮度变化（实测拟合）。
+        let ev = error / 0.14
+        let step = min(max(ev * 0.5, -0.025), 0.025)
+        exposure.applyExposureStep(ev: step)
     }
 
     var pipelineDiagnosticsText: String {
