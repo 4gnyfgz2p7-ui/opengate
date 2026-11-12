@@ -366,12 +366,13 @@ final class RecordingEngine: ObservableObject {
                 monitorable = converted
                 statsBox.markConverted()
 
-                // 系统 AE 不可用时的兜底测光。每半秒取一帧，量的是**转换后的
-                // BGRA**（已含 REC.709 传递函数），所以目标值直接按画面观感定，
-                // 不用再折算线性 raw。
-                let stamp = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(buffer))
-                if Int((stamp * 24).rounded()) % 12 == 0,
-                   let mean = RecordingEngine.meanLuma(converted) {
+                // 系统 AE 不可用时的兜底测光。**每帧**都量，量的是转换后的
+                // BGRA（已含 REC.709 传递函数），目标值直接按画面观感定。
+                //
+                // 之前是每 12 帧（0.5 秒）量一次，那意味着一次亮度变化只能
+                // 靠几大步走完，每一跨就是肉眼可见的跳档。闭环频率必须跟
+                // 帧率同量级，步长才可能小到看不出台阶。
+                if let mean = RecordingEngine.meanLuma(converted) {
                     Task { @MainActor in
                         self?.applyFallbackAutoExposure(mean: mean)
                     }
@@ -1123,29 +1124,39 @@ final class RecordingEngine: ObservableObject {
         return sum / Double(count) / 255.0
     }
 
+    /// 平滑后的亮度读数。闭环每帧都跑，单帧噪点必须滤掉，
+    /// 否则 ISO 会跟着画面里的高频细节抖出一层呼吸。
+    private var smoothedLuma: Double?
+
     /// 系统 AE 不可用时的兜底：按画面平均亮度调 ISO。
     ///
     /// 只在两件事同时成立时动手：
     /// 1. 曝光模式是「自动」（用户没选手动，就不该抢他的 ISO）
-    /// 2. `activeFormat.isAutoExposureSupported == false` —— 这条格式下
-    ///    写 `exposureMode = .continuousAutoExposure` 会被静默忽略，
-    ///    画面于是停在默认曝光上，正是「0EV 偏暗」的来源
+    /// 2. `device.exposureMode` 实际不是 `continuousAutoExposure` —— 这条格式下
+    ///    写系统 AE 会被静默忽略，画面停在默认曝光上，正是 0EV 偏暗的来源
     ///
-    /// 目标 0.42 是画面平均亮度：正常曝光的中灰大约落在 0.4–0.5。
-    /// 步长限在 ±40%，半秒一次，避免在灯光边沿来回过冲。
+    /// **平滑靠两件事**：
+    /// - 频率：逐帧（24 Hz）。半秒一次的闭环无论步长怎么调都会跳——
+    ///   一次 1 EV 的变化只剩两次机会走完，每次就是半档。
+    /// - 步长：单步上限 0.045 EV（亮度差约 3.2%）。24 Hz 下每秒最多 1.1 EV，
+    ///   够跟上光线变化，又小到看不出台阶。
+    ///
+    /// 输入先过一阶低通（α=0.22），免得画面里的纹理和噪点被当成曝光变化。
+    /// 死区 0.012 是为了在目标附近彻底停手，否则会持续微抖。
     @MainActor
     private func applyFallbackAutoExposure(mean: Double) {
         guard exposure.mode == .autoBoth else { return }
         guard let device = capture.videoDevice else { return }
-        // 判断「系统 AE 到底有没有真的在跑」，只能看实测状态：
-        // 已经在 continuousAutoExposure 就交给它，不抢；
-        // 我们请求过却仍不在这条模式上，说明这条格式下它被静默忽略了，
-        // 这时才接管。一旦接管（写 custom），这个条件会一直成立，控制权稳定。
         guard device.exposureMode != .continuousAutoExposure else { return }
-        let error = 0.42 - mean
-        guard abs(error) > 0.04 else { return }
-        let factor = min(max(1 + error * 1.3, 0.65), 1.5)
-        exposure.nudgeISO(factor: factor)
+
+        let smoothed = (smoothedLuma ?? mean) * 0.78 + mean * 0.22
+        smoothedLuma = smoothed
+
+        let error = 0.42 - smoothed
+        guard abs(error) > 0.012 else { return }
+
+        let step = min(max(error * 0.45, -0.045), 0.045)
+        exposure.nudgeISO(factor: pow(2.0, step))
     }
 
     var pipelineDiagnosticsText: String {
