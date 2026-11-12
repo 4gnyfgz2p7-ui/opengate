@@ -63,7 +63,7 @@ final class DeviceServo: @unchecked Sendable {
                 device.unlockForConfiguration()
             }
             self.device = nil
-            self.autoEnabled = false
+            self.drive = .off
         }
     }
 
