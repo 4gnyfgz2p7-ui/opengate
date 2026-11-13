@@ -96,6 +96,33 @@ final class MovieRecorder {
         return firstAppendFailure
     }
 
+    /// 录制中可轮询的失败状态。
+    ///
+    /// 「文件坏了但 App 不报错」反复出现，根源就在这里：失败只被写进收尾时
+    /// 的 `Outcome.note`，而收尾界面从来不看那条 note。把状态暴露成属性，
+    /// 让计时器每秒查一次，就能在故障发生的那一刻停下并把原因弹到画面上，
+    /// 而不是等到录完才发现文件打不开。
+    var liveFailure: String? {
+        guard writer.status == .failed else { return nil }
+        return writer.error?.localizedDescription ?? "写入器失败"
+    }
+
+    /// 磁盘上此刻的真实字节数。
+    /// 录制进度不能再按「码率 × 秒数」估算：估算值在写入失败时照样往上走，
+    /// 界面上显示几百 MB、实际文件只有几 MB，正是「显示录了但文件是 0KB」的来源。
+    var currentFileSize: Int64 { Self.fileSize(at: outputURL) }
+
+    var writerStatusText: String {
+        switch writer.status {
+        case .unknown: return "unknown"
+        case .writing: return "writing"
+        case .completed: return "completed"
+        case .failed: return "failed"
+        case .cancelled: return "cancelled"
+        @unknown default: return "?\(writer.status.rawValue)"
+        }
+    }
+
     private static let frameTimescale: CMTimeScale = 24
 
     // MARK: - 构造
@@ -561,6 +588,20 @@ final class MovieRecorder {
     static func availableCapacity(at url: URL) -> Int64 {
         let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
         return values?.volumeAvailableCapacityForImportantUsage ?? 0
+    }
+
+    /// 同上，但读不到时返回 nil 而不是 0。
+    ///
+    /// 这两个必须分开：0 既可能真的没空间，也可能是这个键没读到。
+    /// 早先统一按 0 处理，于是「读不到」被当成「满了」——
+    /// 开录检查放行、计时器立刻判定「空间将满」并收手，一帧都录不下去。
+    static func availableBytes(at url: URL? = nil) -> Int64? {
+        let target = url ?? recordingDirectory()
+        let values = try? target.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        guard let bytes = values?.volumeAvailableCapacityForImportantUsage, bytes > 0 else {
+            return nil
+        }
+        return bytes
     }
 
     /// 剩余可录时长（秒）。按该档真实写入速率折算，读不到容量时返回 0。

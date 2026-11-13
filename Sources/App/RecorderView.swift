@@ -1167,10 +1167,9 @@ struct SettingsSheet: View {
 
     private var storageSection: some View {
         section("存储") {
+            row("可用空间", engine.availableSpaceText)
             row("本档可录", RecorderView.durationText(engine.remainingSeconds))
             row("已写入", String(format: "%.1f MB", Double(engine.writtenBytes) / 1_000_000))
-            if engine.remainingSeconds < 60 && engine.remainingSeconds > 0 {
-            }
         }
     }
 

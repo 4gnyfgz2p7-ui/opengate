@@ -828,6 +828,12 @@ final class RecordingEngine: ObservableObject {
         let rotationLabel = rotation.label
         autoStopReason = nil
 
+        // 落盘日志从按下录制的那一刻开始。文件没有 moov 就说明进程没能走到
+        // 收尾，那样容器里的元数据一个字节都读不到——只有这条独立的、
+        // 每行 fsync 的日志能说明它停在哪一步。
+        Diagnostics.beginProgress("录制 · \(selectedTier.identifier) · \(width)×\(height)")
+        Diagnostics.mark("开录 档位=\(recordingTier.identifier) 直录=\(recordingTier.isRawBayer) 中转=\(relay) isBayer=\(captureConfiguration?.isBayer == true) 图幅=\(width)×\(height) 变焦=\(captureConfiguration?.pixelFormat ?? "?") 空间=\(Self.spaceText())")
+
         Task { [weak self] in
             guard let self = self else { return }
 
@@ -840,7 +846,9 @@ final class RecordingEngine: ObservableObject {
 
             // ---- 步骤 2：空间检查 ----
             self.state = .preparing("正在检查存储…")
+            Diagnostics.mark("空间检查 可用=\(Self.spaceText())")
             if let spaceError = MovieRecorder.preflightSpaceCheck(tier: recordingTier) {
+                Diagnostics.mark("空间检查拒绝：\(spaceError.localizedDescription)")
                 self.state = .failed(spaceError.localizedDescription)
                 return
             }
@@ -855,6 +863,7 @@ final class RecordingEngine: ObservableObject {
             var rawMetadata: [AVMetadataItem]?
             if recordingTier.isRawBayer {
                 let prep = self.capture.prepareProResRAW()
+                Diagnostics.mark("RAW 前置 " + (prep.reason.map { "失败：\($0)" } ?? "通过"))
                 if let reason = prep.reason {
                     self.state = .failed("ProRes RAW 无法开录：\(reason)")
                     return
@@ -914,6 +923,7 @@ final class RecordingEngine: ObservableObject {
                     rawMetadata: rawMetadata
                 )
                 self.recorderBox.set(recorder)
+                Diagnostics.mark("写入器建立 降级层级=\(recorder.settingsLevel) 状态=\(recorder.writerStatusText) 输出=\(outputURL.lastPathComponent)")
 
                 // 只录 RAW。之前那套「同一份 btp2 在内存里再解一份成品」实测
                 // VT 会话创建失败（-12906），成品从来没写成功过，还占着解码
@@ -929,6 +939,7 @@ final class RecordingEngine: ObservableObject {
                 // 位序算得再对，后面那套调色也只是在系统结果上二次加工。
                 BayerDump.clear()
             } catch {
+                Diagnostics.mark("写入器建立失败：\(error.localizedDescription)")
                 self.state = .failed(error.localizedDescription)
                 return
             }
@@ -940,6 +951,7 @@ final class RecordingEngine: ObservableObject {
             self.droppedFrames = 0
             self.state = .recording
             self.startTicking()
+            Diagnostics.mark("进入录制")
         }
     }
 
@@ -997,6 +1009,8 @@ final class RecordingEngine: ObservableObject {
                         try? FileManager.default.removeItem(at: relay.final)
                     }
                     TranscodeLog.write("转码中止：\(error.localizedDescription)")
+                    Diagnostics.mark("中转转码失败：\(error.localizedDescription)，已保留 RAW")
+                    self.autoStopReason = "转码失败，已保留 ProRes RAW"
                     // 失败时把 RAW 交回给用户，并把原因写进记录
                     outcome = MovieRecorder.Outcome(
                         url: relay.raw,
@@ -1015,7 +1029,15 @@ final class RecordingEngine: ObservableObject {
                 }
             }
 
+            Diagnostics.mark("收尾 帧=\(outcome.writtenVideoFrames) 弃=\(outcome.droppedVideoFrames) 大小=\(outcome.fileSize) 时长=\(String(format: "%.2f", outcome.duration))s clean=\(outcome.finishedCleanly) note=\(outcome.note)")
+
             self.history.insert(outcome, at: 0)
+            // 收尾不干净（写入器失败、一帧都没落盘）必须当场说出来。
+            // 早先这条原因只写进 history 的 note，而界面从来不看它——
+            // 于是「文件坏了」和「App 没报错」可以同时成立。
+            if !outcome.finishedCleanly {
+                self.autoStopReason = outcome.note
+            }
             self.state = .finished
             self.refreshWrittenBytes()
             // 计时归零：上一段的时长留在 history 里，屏幕上不该继续挂着
@@ -1046,38 +1068,54 @@ final class RecordingEngine: ObservableObject {
                     if let start = self.recordingStart {
                         self.elapsed = Date().timeIntervalSince(start)
                     }
-                    // 真实丢帧来自写入器，不能靠墙钟与理论帧率推算
-                    if let recorder = self.recorderBox.get() {
-                        self.droppedFrames = recorder.liveDroppedFrames
-
-                        // 两秒还没有一帧落进写入器 = 编码器拒收画面。
-                        // 继续计时只会得到一个 0 字节文件，不如立刻收手并说明原因。
-                        if self.elapsed > 2.0, recorder.liveWrittenFrames == 0 {
-                            let snap = self.stats.snapshot
-                            let detail = recorder.appendFailureDescription ?? "编码器未接受该画面格式"
-                            self.autoStopReason = "画面未能写入（收帧 \(snap.delivered) · 转换 \(snap.converted) · 写入 \(snap.appended)）：\(detail)"
-                            // ProRes RAW 只认 Bayer：切到系统 ISP 也喂不进去，
-                            // 降级只会把同一个错误重演一遍，不如原地报明原因。
-                            let needsFallback = self.captureConfiguration?.isBayer == true
-                                && snap.appended == 0
-                                && !self.tier.isRawBayer
-                            self.stopRecording()
-                            // 全幅通路写不进去：这次收尾之后直接换成系统 ISP，
-                            // 下一次按录制键就能出片，而不是再失败一遍。
-                            if needsFallback {
-                                Task { [weak self] in
-                                    try? await Task.sleep(nanoseconds: 800_000_000)
-                                    await self?.recoverPipelineIfNeeded(force: true)
-                                }
-                            }
-                            return
-                        }
-                    }
                     self.refreshWrittenBytes()
+
+                    // 真实丢帧来自写入器，不能靠墙钟与理论帧率推算
+                    guard let recorder = self.recorderBox.get() else { return }
+                    self.droppedFrames = recorder.liveDroppedFrames
+                    self.flightLog(recorder)
+
+                    // 写入器自己失败了（磁盘满、编码器崩）：继续跑只会得到一个
+                    // 没有 moov 的残片，而且不会给出任何提示。当场收手并报原因。
+                    if let failure = recorder.liveFailure {
+                        Diagnostics.mark("写入器失败 @\(String(format: "%.1f", self.elapsed))s：\(failure) 文件=\(recorder.currentFileSize)")
+                        self.autoStopReason = "写入失败：\(failure)"
+                        self.stopRecording()
+                        return
+                    }
+
+                    // 两秒还没有一帧落进写入器 = 编码器拒收画面。
+                    // 继续计时只会得到一个 0 字节文件，不如立刻收手并说明原因。
+                    if self.elapsed > 2.0, recorder.liveWrittenFrames == 0 {
+                        let snap = self.stats.snapshot
+                        let detail = recorder.appendFailureDescription ?? "编码器未接受该画面格式"
+                        Diagnostics.mark("两秒零写入 状态=\(recorder.writerStatusText) 原因=\(detail) 文件=\(recorder.currentFileSize)")
+                        self.autoStopReason = "画面未能写入（收帧 \(snap.delivered) · 转换 \(snap.converted) · 写入 \(snap.appended)）：\(detail)"
+                        // ProRes RAW 只认 Bayer：切到系统 ISP 也喂不进去，
+                        // 降级只会把同一个错误重演一遍，不如原地报明原因。
+                        let needsFallback = self.captureConfiguration?.isBayer == true
+                            && snap.appended == 0
+                            && !self.tier.isRawBayer
+                        self.stopRecording()
+                        // 全幅通路写不进去：这次收尾之后直接换成系统 ISP，
+                        // 下一次按录制键就能出片，而不是再失败一遍。
+                        if needsFallback {
+                            Task { [weak self] in
+                                try? await Task.sleep(nanoseconds: 800_000_000)
+                                await self?.recoverPipelineIfNeeded(force: true)
+                            }
+                        }
+                        return
+                    }
 
                     // 空间见底时主动收尾，而不是让 writer 在半路失败：
                     // 正常收尾能保住文件与 moov，失败只会留下无法播放的残片。
-                    if self.remainingSeconds < 20 {
+                    //
+                    // 只有真的读到容量才判断。读不到时早先按 0 处理，等于把
+                    // 「未知」当成「满了」——计时器第一次触发就收手，一帧都录不完。
+                    if let bytes = MovieRecorder.availableBytes(),
+                       Double(bytes) < self.tier.estimatedMegabytesPerSecond * 1_000_000 * 20 {
+                        Diagnostics.mark("空间将满自动停止 可用=\(bytes)")
                         self.autoStopReason = "存储空间将满，已自动停止并保存"
                         self.stopRecording()
                     }
@@ -1091,14 +1129,47 @@ final class RecordingEngine: ObservableObject {
         tickTask = nil
     }
 
-    /// 录制中按已写帧数估算当前体积（真实文件大小要等封盘才准确）
+    /// 录制中按磁盘上真实的文件大小更新体积。
+    ///
+    /// 早先按「码率 × 秒数」估算，写入失败时估算值照样往上走：
+    /// 界面显示录了几百 MB，实际文件只有几 MB。那个数字本身就是误导。
     private func refreshWrittenBytes() {
         if case .recording = state {
-            let seconds = elapsed
-            writtenBytes = Int64(tier.estimatedMegabytesPerSecond * seconds * 1_000_000)
+            writtenBytes = recorderBox.get()?.currentFileSize ?? 0
         } else if let last = history.first {
             writtenBytes = last.fileSize
         }
+    }
+
+    /// 每秒一行落盘日志：写入进度、曝光实际值、剩余空间、写入器状态。
+    ///
+    /// 容器没有 moov 时元数据全部读不到，只有这条独立日志能还原现场。
+    private func flightLog(_ recorder: MovieRecorder) {
+        let iso = String(format: "%.0f", exposure.liveISO)
+        let shutter = exposure.formatShutter(exposure.liveShutterSeconds)
+        let offset = String(format: "%+.2f", exposure.liveOffsetEV)
+        let luma = smoothedLuma.map { String(format: "%.3f", $0) } ?? "—"
+        Diagnostics.mark(String(
+            format: "%.1fs 写%lld 弃%lld 文件%lldKB ISO%@ %@ %@EV luma%@ 空间%@ 状态%@ 拒帧%@",
+            elapsed,
+            recorder.liveWrittenFrames,
+            recorder.liveDroppedFrames,
+            recorder.currentFileSize / 1024,
+            iso,
+            shutter,
+            offset,
+            luma,
+            Self.spaceText(),
+            recorder.writerStatusText,
+            recorder.appendFailureDescription ?? "无"
+        ))
+    }
+
+    /// 可用空间的展示文本。读不到时明确写「未知」，
+    /// 而不是显示成 0——那会让人以为磁盘满了。
+    static func spaceText() -> String {
+        guard let bytes = MovieRecorder.availableBytes() else { return "未知" }
+        return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 
     // MARK: - 派生信息
@@ -1322,16 +1393,14 @@ final class RecordingEngine: ObservableObject {
     }
 
     var availableSpaceText: String {
-        let bytes = MovieRecorder.availableCapacity(at: MovieRecorder.recordingDirectory())
-        guard bytes > 0 else { return "—" }
-        return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+        Self.spaceText()
     }
 
-    /// 在当前档位下，可用空间还能录多久（秒）
+    /// 在当前档位下，可用空间还能录多久（秒）。读不到容量时返回 0，界面显示成「—」。
     var remainingSeconds: Double {
-        let bytes = Double(MovieRecorder.availableCapacity(at: MovieRecorder.recordingDirectory()))
+        guard let bytes = MovieRecorder.availableBytes() else { return 0 }
         let rate = tier.estimatedMegabytesPerSecond * 1_000_000
-        guard rate > 0, bytes > 0 else { return 0 }
-        return bytes / rate
+        guard rate > 0 else { return 0 }
+        return Double(bytes) / rate
     }
 }

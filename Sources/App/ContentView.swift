@@ -95,6 +95,8 @@ struct ContentView: View {
 
                     if let crash = crashText {
                         crashCard(crash)
+                    } else if let progress = progressText {
+                        runLogCard(progress)
                     }
 
                     if let report = model.report {
@@ -337,8 +339,52 @@ struct ContentView: View {
 
     /// 只在检测到上次异常时出现。内容直接来自 App 自己写下的两份文件，
     /// 不需要去系统「分析数据」里翻 .ips，也不用连电脑。
-    private func crashCard(_ crash: String) -> some View {
-        Card(title: "上次异常") {
+    // MARK: 录制运行日志
+
+    /// 最近一次录制的运行日志。没有崩溃时也会出现。
+    ///
+    /// 录制中途断开（进程被杀、写入器失败）会留下一个没有 moov 的 .mov，
+    /// 容器里的元数据、诊断串一个字节都读不到，界面上也不会有任何提示。
+    /// 这份每行 fsync 的日志是唯一的现场，所以给它一个独立的分享入口。
+    private func runLogCard(_ progress: String) -> some View {
+        Card(title: "最近一次录制") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(progress)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.orange.opacity(0.9))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .lineLimit(20)
+
+                HStack(spacing: 10) {
+                    ShareLink(item: progress) {
+                        Text("分享日志")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(Color(white: 0.17))
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+
+                    Button {
+                        Diagnostics.clear()
+                        crashText = nil
+                        progressText = nil
+                    } label: {
+                        Text("清除")
+                            .font(.caption.weight(.semibold))
+                            .frame(width: 64)
+                            .padding(.vertical, 8)
+                            .background(Color(white: 0.17))
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
+                .foregroundStyle(.white)
+            }
+        }
+    }
+
+    private func crashCard(_ crash: String) -> some View {        Card(title: "上次异常") {
             VStack(alignment: .leading, spacing: 10) {
                 Text(crash)
                     .font(.caption2.monospaced())
