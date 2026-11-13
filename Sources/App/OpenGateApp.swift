@@ -28,7 +28,18 @@ struct OpenGateApp: App {
 /// 根视图 transform 卡死，整层控件横躺（实测截图里的 90° 错乱来源）。
 final class AppDelegate: NSObject, UIApplicationDelegate {
 
-    static var supportedMask: UIInterfaceOrientationMask = .portrait
+    /// 运行期支持面的初值必须和落盘的选择一致。
+    /// 先设成 portrait 再靠 requestGeometryUpdate 转过去，会在启动瞬间闪一帧竖屏，
+    /// 甚至被根 VC 的缓存判成「不支持横屏」——这就是之前「怎么都切不到横屏」的来源。
+    static var supportedMask: UIInterfaceOrientationMask = InterfaceMode.saved.mask
+
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        Self.supportedMask = InterfaceMode.saved.mask
+        return true
+    }
 
     func application(
         _ application: UIApplication,

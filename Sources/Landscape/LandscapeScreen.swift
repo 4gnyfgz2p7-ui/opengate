@@ -5,6 +5,9 @@ import SwiftUI
 /// 版式全部由 `LandscapeLayout` 解算，这里只负责摆放与绑定，不写死坐标。
 /// 交互与采集的耦合压到最低：只读 `RecordingEngine` 的公开属性，
 /// 只调它的公开方法，不碰 `Sources/Capture` 内部状态。
+///
+/// 参数面板的行为（选中 / 自动 / 拖拽映射）与竖屏共用 `CameraDeck`，
+/// 这里只决定画成什么形状——两份界面各写一套逻辑，迟早会漂。
 struct LandscapeScreen: View {
 
     @ObservedObject var engine: RecordingEngine
@@ -14,10 +17,7 @@ struct LandscapeScreen: View {
     let insets: EdgeInsets
     var onSettings: () -> Void
 
-    /// 当前选中的参数。选中只影响颜色与拖拽条指向，不改设备。
-    @State private var selection: LandscapeParameter = .shutter
-    /// 曝光的「自动」是本层语义：自动＝补偿归零且不接受拖拽。
-    @State private var exposureManual = false
+    @State private var deck = CameraDeck()
 
     var body: some View {
         GeometryReader { geo in
@@ -28,6 +28,7 @@ struct LandscapeScreen: View {
 
                 previewPane(layout)
                 lensRail(layout)
+                orientationButton(layout)
                 parameterRail(layout)
                 sideBar(layout)
                 recordOrb(layout)
@@ -73,10 +74,11 @@ struct LandscapeScreen: View {
         GlassEffectContainer(spacing: LandscapeLayout.lensGap) {
             VStack(spacing: LandscapeLayout.lensGap) {
                 ForEach(engine.lenses) { lens in
-                    LandscapeLensButton(
+                    CameraLensButton(
                         label: lens.label,
                         isActive: lens.id == engine.activeLensID,
-                        isAvailable: !engine.state.isBusy
+                        isAvailable: !engine.state.isBusy,
+                        size: LandscapeLayout.lensSize
                     ) {
                         engine.selectLens(lens)
                     }
@@ -88,40 +90,41 @@ struct LandscapeScreen: View {
         .position(x: layout.lensRail.midX, y: layout.lensRail.midY)
     }
 
+    /// 横竖切换：镜头列里、齿轮上方，比 44pt 的镜头钮小一档
+    private func orientationButton(_ layout: LandscapeLayout) -> some View {
+        CameraOrientationButton(
+            size: LandscapeLayout.orientationSize,
+            targetTitle: engine.rotation.target.title
+        ) {
+            engine.toggleInterfaceMode()
+        }
+        .position(x: layout.orientation.midX, y: layout.orientation.midY)
+    }
+
     // MARK: - 参数轨
 
     private func parameterRail(_ layout: LandscapeLayout) -> some View {
         GlassEffectContainer(spacing: LandscapeLayout.knobGap) {
             VStack(spacing: LandscapeLayout.knobGap) {
-            ForEach(LandscapeParameter.allCases) { parameter in
-                LandscapeKnob(
-                    title: parameter.title,
-                    value: knobValue(parameter),
-                    detail: isAuto(parameter) ? "AUTO" : "手动",
-                    isAuto: isAuto(parameter),
-                    isSelected: selection == parameter
-                ) {
-                    tap(parameter)
+                ForEach(CameraParameter.allCases) { parameter in
+                    CameraKnob(
+                        title: parameter.title,
+                        value: deck.knobValue(parameter, engine),
+                        detail: deck.isAuto(parameter, engine) ? "AUTO" : "手动",
+                        isAuto: deck.isAuto(parameter, engine),
+                        isSelected: deck.selection == parameter,
+                        size: LandscapeLayout.knobSize
+                    ) {
+                        deck.tap(parameter, engine)
+                    }
                 }
-            }
 
-            // A 钮：只把**当前选中**的那个参数交还系统，不动其它四项
-            Button {
-                setAuto(selection)
-            } label: {
-                VStack(spacing: 1) {
-                    Text("A")
-                        .font(.system(size: 18, weight: .semibold))
-                    Text("自动")
-                        .font(.system(size: 7))
-                        .opacity(0.7)
+                CameraAutoKnob(
+                    size: LandscapeLayout.knobSize,
+                    isEnabled: !deck.isAuto(deck.selection, engine)
+                ) {
+                    deck.setAuto(deck.selection, engine)
                 }
-                .foregroundStyle(.white)
-                .frame(width: LandscapeLayout.knobSize, height: LandscapeLayout.knobSize)
-                .contentShape(Circle())
-                .liquidGlass(Circle(), tint: .white.opacity(0.14))
-            }
-            .buttonStyle(.plain)
             }
         }
         .frame(width: layout.rail.width, height: layout.rail.height, alignment: .top)
@@ -137,22 +140,21 @@ struct LandscapeScreen: View {
     /// 旋转不改变布局尺寸，所以必须外套一个显式 frame，否则会溢出胶囊。
     private func sideBar(_ layout: LandscapeLayout) -> some View {
         VStack(spacing: 6) {
-            Text(selection.title)
+            Text(deck.selection.title)
                 .font(.system(size: 9))
                 .foregroundStyle(.white.opacity(0.62))
                 .lineLimit(1)
 
-            // 竖向滑块用系统 Slider 旋转 −90°：交互与惯性仍是系统的。
             // 长度跟着条高走——条撑满屏幕高度，滑块就跟着变长。
             Slider(value: sliderBinding, in: 0...1)
                 .tint(.white)
                 .frame(width: sideBarTrackLength(layout))
                 .rotationEffect(.degrees(-90))
                 .frame(width: 30, height: sideBarTrackLength(layout))
-                .disabled(isAuto(selection))
-                .opacity(isAuto(selection) ? 0.4 : 1)
+                .disabled(deck.isAuto(deck.selection, engine))
+                .opacity(deck.isAuto(deck.selection, engine) ? 0.4 : 1)
 
-            Text(readout(selection))
+            Text(deck.readout(deck.selection, engine))
                 .font(.system(size: 10, weight: .medium, design: .monospaced))
                 .foregroundStyle(.white)
                 .lineLimit(1)
@@ -167,27 +169,17 @@ struct LandscapeScreen: View {
     // MARK: - 录制键 / 设置
 
     private func recordOrb(_ layout: LandscapeLayout) -> some View {
-        Button {
+        CameraRecordOrb(
+            size: layout.record.width,
+            isRecording: engine.state == .recording,
+            isBusy: !engine.state.canStart && engine.state != .recording
+        ) {
             if engine.state == .recording {
                 engine.stopRecording()
             } else {
                 engine.startRecording()
             }
-        } label: {
-            Circle()
-                .fill(engine.state == .recording ? Color.white : Color.red)
-                .frame(
-                    width: LandscapeLayout.recordSize * (engine.state == .recording ? 0.34 : 0.4),
-                    height: LandscapeLayout.recordSize * (engine.state == .recording ? 0.34 : 0.4)
-                )
-                .frame(width: LandscapeLayout.recordSize, height: LandscapeLayout.recordSize)
-                .contentShape(Circle())
-                // 录制键压在画面上，玻璃越淡越不挡构图
-                .liquidGlass(Circle(), tint: .white.opacity(0.03))
         }
-        .buttonStyle(.plain)
-        .disabled(!engine.state.canStart && engine.state != .recording)
-        .opacity(engine.state.isBusy && engine.state != .recording ? 0.45 : 1)
         .position(x: layout.record.midX, y: layout.record.midY)
     }
 
@@ -204,195 +196,28 @@ struct LandscapeScreen: View {
         .position(x: layout.gear.midX, y: layout.gear.midY)
     }
 
-    /// 顶部信息：压在画面左上角，横向一行
+    /// 状态读数：左列顶部，不在画面上
     private func chipsRow(_ layout: LandscapeLayout) -> some View {
-        HStack(spacing: 8) {
-            if engine.state == .recording {
-                chip(timecode(engine.elapsed), tint: .red.opacity(0.9), dot: true)
-            }
-            chip("剩 \(Self.duration(engine.remainingSeconds))", tint: .white.opacity(0.10))
-            Spacer(minLength: 0)
-        }
+        CameraStatusStack(
+            timecode: engine.state == .recording ? CameraFormat.timecode(engine.elapsed) : nil,
+            remaining: CameraFormat.duration(engine.remainingSeconds)
+        )
         .padding(.leading, layout.chipsOrigin.x)
         .padding(.top, layout.chipsOrigin.y)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    private func chip(_ text: String, tint: Color, dot: Bool = false) -> some View {
-        HStack(spacing: 5) {
-            if dot {
-                Circle().fill(Color.red).frame(width: 6, height: 6)
-            }
-            Text(text)
-                .font(.system(size: 9.5, weight: .medium, design: .monospaced))
-                .foregroundStyle(.white)
-                .lineLimit(1)
-        }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 4)
-        .liquidGlass(Capsule(), tint: tint, interactive: false)
-    }
+    // MARK: - 拖拽条取值
 
-    // MARK: - 参数状态
-
-    private func isAuto(_ parameter: LandscapeParameter) -> Bool {
-        switch parameter {
-        case .shutter:
-            return engine.exposure.mode != .manualShutter && engine.exposure.mode != .manualBoth
-        case .iso:
-            return engine.exposure.mode != .manualISO && engine.exposure.mode != .manualBoth
-        case .focus:
-            return engine.focus.mode != .manual
-        case .exposure:
-            return !exposureManual
-        case .whiteBalance:
-            return engine.whiteBalance.mode != .manual
-        }
-    }
-
-    /// 第一次按只选中；已选中的再按一次切自动 / 手动。
-    private func tap(_ parameter: LandscapeParameter) {
-        guard selection == parameter else {
-            selection = parameter
-            return
-        }
-        toggleAuto(parameter)
-    }
-
-    private func toggleAuto(_ parameter: LandscapeParameter) {
-        let targetAuto = !isAuto(parameter)
-        switch parameter {
-        case .shutter:
-            let isoAuto = isAuto(.iso)
-            switch (targetAuto, isoAuto) {
-            case (true, true): engine.exposure.mode = .autoBoth
-            case (true, false): engine.exposure.mode = .manualISO
-            case (false, true): engine.exposure.mode = .manualShutter
-            case (false, false): engine.exposure.mode = .manualBoth
-            }
-        case .iso:
-            let shutterAuto = isAuto(.shutter)
-            switch (targetAuto, shutterAuto) {
-            case (true, true): engine.exposure.mode = .autoBoth
-            case (true, false): engine.exposure.mode = .manualShutter
-            case (false, true): engine.exposure.mode = .manualISO
-            case (false, false): engine.exposure.mode = .manualBoth
-            }
-        case .focus:
-            engine.focus.mode = targetAuto ? .continuous : .manual
-        case .exposure:
-            exposureManual = !targetAuto
-            if targetAuto { engine.exposure.ev = 0 }
-        case .whiteBalance:
-            engine.whiteBalance.mode = targetAuto ? .auto : .manual
-        }
-    }
-
-    /// A 钮只作用于当前选中的参数：已经是自动就不动，手动就切回自动。
-    /// 刻意不做「全部自动」——五个参数一起跳，画面会同时变亮、变焦、变色。
-    private func setAuto(_ parameter: LandscapeParameter) {
-        guard !isAuto(parameter) else { return }
-        toggleAuto(parameter)
+    private var sliderBinding: Binding<Double> {
+        Binding(
+            get: { deck.position(deck.selection, engine) },
+            set: { deck.apply(deck.selection, position: $0, engine) }
+        )
     }
 
     /// 竖向滑块的长度：条内减去标签、读数与上下留白。
     private func sideBarTrackLength(_ layout: LandscapeLayout) -> CGFloat {
         max(120, layout.bar.height - 96)
-    }
-
-    // MARK: - 拖拽条取值
-
-    private var sliderBinding: Binding<Double> {
-        Binding(get: { position }, set: { apply(position: $0) })
-    }
-
-    private var position: Double {
-        switch selection {
-        case .shutter: return engine.exposure.shutterSliderPosition
-        case .iso: return engine.exposure.isoSliderPosition
-        case .focus: return Double(engine.focus.lensPosition)
-        case .exposure: return normalize(Double(engine.exposure.ev), -3, 3)
-        case .whiteBalance: return normalize(Double(engine.whiteBalance.temperature), 2000, 9000)
-        }
-    }
-
-    private func apply(position t: Double) {
-        switch selection {
-        case .shutter:
-            engine.exposure.shutterSliderPosition = t
-        case .iso:
-            engine.exposure.isoSliderPosition = t
-        case .focus:
-            engine.focus.mode = .manual
-            engine.focus.lensPosition = Float(t)
-        case .exposure:
-            exposureManual = true
-            engine.exposure.ev = Float(denormalize(t, -3, 3))
-        case .whiteBalance:
-            engine.whiteBalance.mode = .manual
-            engine.whiteBalance.temperature = Float(denormalize(t, 2000, 9000))
-        }
-    }
-
-    private func normalize(_ value: Double, _ low: Double, _ high: Double) -> Double {
-        guard high > low else { return 0 }
-        return min(max((value - low) / (high - low), 0), 1)
-    }
-
-    private func denormalize(_ position: Double, _ low: Double, _ high: Double) -> Double {
-        low + (high - low) * min(max(position, 0), 1)
-    }
-
-    // MARK: - 读数
-
-    private func knobValue(_ parameter: LandscapeParameter) -> String {
-        switch parameter {
-        case .shutter:
-            return engine.exposure.formatShutter(
-                engine.exposure.liveShutterSeconds > 0
-                    ? engine.exposure.liveShutterSeconds
-                    : engine.exposure.shutterSeconds
-            )
-        case .iso:
-            let live = engine.exposure.liveISO
-            return String(format: "%.0f", live > 0 ? live : engine.exposure.iso)
-        case .focus:
-            return String(format: "%.2f", engine.focus.liveLensPosition)
-        case .exposure:
-            return String(format: "%+.1f", engine.exposure.ev)
-        case .whiteBalance:
-            let live = engine.whiteBalance.liveTemperature
-            return String(format: "%.0f", live > 0 ? live : engine.whiteBalance.temperature)
-        }
-    }
-
-    private func readout(_ parameter: LandscapeParameter) -> String {
-        switch parameter {
-        case .shutter:
-            return engine.exposure.formatShutter(engine.exposure.liveShutterSeconds)
-        case .iso:
-            return String(format: "ISO %.0f", engine.exposure.liveISO)
-        case .focus:
-            return String(format: "%.2f", engine.focus.liveLensPosition)
-        case .exposure:
-            return String(format: "%+.1f EV", engine.exposure.ev)
-        case .whiteBalance:
-            let live = engine.whiteBalance.liveTemperature
-            return String(format: "%.0fK", live > 0 ? live : engine.whiteBalance.temperature)
-        }
-    }
-
-    // MARK: - 格式化
-
-    private func timecode(_ seconds: TimeInterval) -> String {
-        let total = max(0, Int(seconds.rounded(.down)))
-        return String(format: "%02d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
-    }
-
-    static func duration(_ seconds: Double) -> String {
-        guard seconds.isFinite, seconds > 0 else { return "—" }
-        if seconds >= 3600 { return String(format: "%.1fh", seconds / 3600) }
-        if seconds >= 60 { return String(format: "%d:%02d", Int(seconds) / 60, Int(seconds) % 60) }
-        return String(format: "0:%02d", Int(seconds))
     }
 }

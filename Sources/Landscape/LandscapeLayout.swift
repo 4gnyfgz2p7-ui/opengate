@@ -26,6 +26,7 @@ struct LandscapeLayout {
     static let barWidth: CGFloat = 52
     static let recordSize: CGFloat = 56
     static let gearSize: CGFloat = 38
+    static let orientationSize: CGFloat = 30
     static let gap: CGFloat = 12
     /// 焦距列与画面之间的缝。压到 6 让画面再往左一点，同时不贴到镜头钮。
     static let lensGapToPreview: CGFloat = 6
@@ -41,6 +42,8 @@ struct LandscapeLayout {
     let bar: CGRect
     let record: CGRect
     let gear: CGRect
+    /// 横竖切换：放在镜头列里、齿轮上方，比镜头钮小一档
+    let orientation: CGRect
     let chipsOrigin: CGPoint
 
     init(size: CGSize, insets: EdgeInsets) {
@@ -57,6 +60,12 @@ struct LandscapeLayout {
             y: size.height - insets.bottom - Self.margin - Self.gearSize,
             width: Self.gearSize,
             height: Self.gearSize
+        )
+        orientation = CGRect(
+            x: lensRail.midX - Self.orientationSize / 2,
+            y: lensRail.maxY + 10,
+            width: Self.orientationSize,
+            height: Self.orientationSize
         )
 
         // ---- 取景：高度撑满，左侧让开焦距列 ----
@@ -97,6 +106,8 @@ struct LandscapeLayout {
             height: Self.recordSize
         )
 
-        chipsOrigin = CGPoint(x: preview.minX + 10, y: insets.top + 10)
+        // 状态读数放在左列顶部：镜头列上方那段空黑区，完全不压画面。
+        // 宽度只有列宽 44 + 到画面的缝 6，所以读数做成两行窄文本（见 CameraStatusStack）。
+        chipsOrigin = CGPoint(x: lensRail.minX, y: max(insets.top, 0) + 12)
     }
 }

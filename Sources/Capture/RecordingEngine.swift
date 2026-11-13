@@ -310,6 +310,16 @@ final class RecordingEngine: ObservableObject {
         forwardRotation()
     }
 
+    /// 界面方向。切换会重排布局并落盘，下次打开沿用。
+    func setInterfaceMode(_ mode: InterfaceMode) {
+        rotation.setMode(mode)
+    }
+
+    /// 横竖切换（画面上的小按钮走这里）。
+    func toggleInterfaceMode() {
+        rotation.toggle()
+    }
+
     /// 把手动设定的角度转发成引擎状态。
     /// 主界面只需观察 `rotationDegrees`，不必自己订阅旋转控制器。
     private func forwardRotation() {
