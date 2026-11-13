@@ -1,27 +1,25 @@
-# macOS / Xcode
-.DS_Store
-build/
-DerivedData/
-*.xcarchive
-*.ipa
 
 # XcodeGen 生成物
+# macOS / Xcode
+# 本地凭据，绝不提交
+# 本地分析产物
+# 本地装机工具与产物，体积大且不入库
+# 编辑器
+*.ipa
+*.swp
+*.token
+*.xcarchive
+.DS_Store
+.commitmsg
+.idea/
+.token
+.vscode/
+DerivedData/
 OpenGate.xcodeproj/
 OpenGate.xcworkspace/
-project.pbxproj
-
-# 编辑器
-.vscode/
-.idea/
-*.swp
-
-# 本地凭据，绝不提交
-.token
-*.token
-
-# 本地装机工具与产物，体积大且不入库
-_local/
-
-# 本地分析产物
 _analysis/
-.commitmsg
+_design/*.log
+_design/.b*/
+_local/
+build/
+project.pbxproj
