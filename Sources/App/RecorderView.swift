@@ -252,6 +252,7 @@ struct SettingsSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     interfaceSection
+                    exposureSection
                     captureSection
                     tierSection
                     storageSection
@@ -329,6 +330,15 @@ struct SettingsSheet: View {
             Text("默认横屏。切换后会立即重排，选择会被记住，下次打开沿用。")
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    /// 曝光方案：自建闭环 / 系统 AE。
+    /// 这是一个二选一的实验开关：bayer 全幅格式下系统 AE 可能写了不生效，
+    /// 所以把「谁在管曝光」摆到明面上，由用户按画面判断。
+    private var exposureSection: some View {
+        section("曝光方案") {
+            ExposureEngineCard(exposure: engine.exposure)
         }
     }
 
@@ -630,6 +640,86 @@ struct SettingsSheet: View {
                 .font(.system(size: 12, design: .monospaced))
                 .foregroundStyle(.white)
                 .multilineTextAlignment(.trailing)
+        }
+    }
+}
+
+// MARK: - 曝光方案卡片
+
+/// 曝光方案的二选一，外加这条格式下的实际能力。
+///
+/// 之所以把这些数值摆出来：bayer 全幅格式（btp2）下 `exposureMode` 可能
+/// 读回 `.continuousAutoExposure` 而系统 AE 其实没在干活，光看标志位会被骗。
+/// 「支持 / 实际模式 / 目标偏差」三个数放在一起，再对着画面看一眼，就能判断
+/// 系统 AE 到底有没有接管。
+private struct ExposureEngineCard: View {
+
+    @ObservedObject var exposure: ExposureController
+
+    private let accent = Color(red: 0.42, green: 0.85, blue: 0.82)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                ForEach(ExposureController.Engine.allCases) { engine in
+                    Button {
+                        exposure.engine = engine
+                    } label: {
+                        VStack(spacing: 2) {
+                            Text(engine.title)
+                                .font(.system(size: 12, weight: .medium))
+                            Text(engine == .system ? "交给 iOS" : "逐帧测光")
+                                .font(.system(size: 9))
+                                .opacity(0.62)
+                        }
+                        .foregroundStyle(exposure.engine == engine ? Color.black : Color.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .background(
+                            Capsule().fill(
+                                exposure.engine == engine ? accent : Color.white.opacity(0.08)
+                            )
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            Text(exposure.engine.detail)
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+
+            VStack(spacing: 6) {
+                line("连续 AE", exposure.supportsContinuousAuto ? "支持" : "不支持",
+                     warn: !exposure.supportsContinuousAuto)
+                line("设备曝光模式", exposure.systemExposureModeText)
+                line("曝光补偿范围", exposure.supportsExposureBias ? exposure.biasRangeText : "不可用（0…0）",
+                     warn: !exposure.supportsExposureBias)
+                line("目标偏差", String(format: "%+.2f EV", exposure.liveOffsetEV))
+                if let error = exposure.writerError {
+                    line("最近写入", error, warn: true)
+                }
+            }
+
+            if exposure.engine == .system && !exposure.supportsContinuousAuto {
+                Text("这条格式不支持连续 AE，选系统 AE 画面会冻住。切回自建闭环。")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private func line(_ title: String, _ value: String, warn: Bool = false) -> some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+            Text(value)
+                .font(.system(size: 10.5, design: .monospaced))
+                .foregroundStyle(warn ? Color.orange : Color.white.opacity(0.85))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
         }
     }
 }

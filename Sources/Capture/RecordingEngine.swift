@@ -308,6 +308,24 @@ final class RecordingEngine: ObservableObject {
         wireCapture()
         observeThermalState()
         forwardRotation()
+        forwardChildChanges()
+    }
+
+    /// 把子控制器的变化转成引擎的变化。
+    ///
+    /// 界面只观察 `RecordingEngine`，而曝光/白平衡/对焦是各自独立的
+    /// `ObservableObject`。不转发的话，knob 上的实时值要等引擎别的事件
+    /// （比如录制计时）才刷新一次——静止时看着像「调了没反应」。
+    private func forwardChildChanges() {
+        exposure.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+        whiteBalance.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+        focus.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
     }
 
     /// 界面方向。切换会重排布局并落盘，下次打开沿用。
@@ -1404,23 +1422,18 @@ final class RecordingEngine: ObservableObject {
     /// 目标附近彻底停手，不然会一直微抖。
     @MainActor
     private func applyFallbackAutoExposure(mean: Double) {
-        guard exposure.mode == .autoBoth else { return }
-        guard let device = capture.videoDevice else { return }
-
-        // btp2 绕开 ISP，系统 AE 实际上不干活（写 continuousAutoExposure
-        // 会被静默忽略），但 `exposureMode` 仍可能读回 continuousAutoExposure。
-        // 拿这个值当判据，闭环永远启动不了 —— 于是 RAW 档要么曝光冻住，
-        // 要么只剩系统那条粗粒度的在动，看着就是一格一格切。
-        // 所以全幅 Bayer 档不看这个标志，直接由本闭环接管。
-        if captureConfiguration?.isBayer != true,
-           device.exposureMode == .continuousAutoExposure {
-            return
-        }
+        // 只有「两维都自动 + 选了自建闭环」才走这里。
+        // 选了系统 AE 就完全放手，画面不动就是该格式不支持——那是用户在设置里
+        // 主动选的实验项，不能偷偷用闭环去盖。
+        guard exposure.mode == .autoBoth, exposure.engine == .builtIn else { return }
 
         let smoothed = (smoothedLuma ?? mean) * 0.75 + mean * 0.25
         smoothedLuma = smoothed
 
-        let error = 0.42 - smoothed
+        // EV 直接折进目标亮度：+1 EV 目标亮一档，-1 EV 目标暗一档。
+        // 测光是 sqrt 刻度，所以按 2 的 (ev/2) 次方折算。
+        let aim = 0.42 * pow(2.0, Double(exposure.ev) / 2)
+        let error = aim - smoothed
         guard abs(error) > 0.006 else { return }
 
         // 0.14 ≈ 中灰处 1 EV 对应的观感亮度变化（实测拟合）。
@@ -1460,6 +1473,10 @@ final class RecordingEngine: ObservableObject {
             let seconds = CMTimeGetSeconds(device.exposureDuration)
             text += seconds > 0 ? "·dur1/\(Int((1 / seconds).rounded()))" : "·dur?"
             text += String(format: "·ofs%.2f", device.exposureTargetOffset)
+            text += "·ee\(exposure.engine == .system ? "S" : "B")"
+            if let error = exposure.writerError {
+                text += "·ew\(error.prefix(20))"
+            }
             text += "·fm\(device.focusMode.rawValue)"
             text += String(format: "·lp%.2f", device.lensPosition)
             if let error = focus.lastError {
