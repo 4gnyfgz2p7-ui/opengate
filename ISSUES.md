@@ -473,3 +473,14 @@ launch 时的支持面，第一次申请常被拒。现在：
 
 参数面板的选中 / 自动 / 拖拽映射抽成 `CameraDeck`，横竖屏共用一份——
 两份界面各写一套逻辑，迟早会漂，上一轮「A 钮只作用选中项」就是漂出来的。
+
+### 12.5 首次构建挂掉的两处（已修）
+
+| 报错 | 根因 | 修法 |
+|---|---|---|
+| `main actor-isolated property 'mode' can not be referenced from a nonisolated context`（46 处） | `CameraDeck` 是普通 struct，不是 View，编译器不会为它推断 `@MainActor`；它读 `engine.exposure.mode` 这类主线程属性 | 给 `CameraDeck` 标 `@MainActor`。调用点都在 View 里，闭包继承 MainActor 隔离，不用改 |
+| `value of type 'CaptureRotation' has no member 'label' / 'isLandscape'`（3 处） | 方向收敛成两档时删了这两个属性，但录制元数据与 `captureAspect` 还在用 | 补回：`label = mode.title`、`isLandscape = mode == .landscape` |
+
+**沉淀**：SwiftUI 里 `View` 协议本身是 `@MainActor`，所以 View 内部方法能直接摸主线程控制器；
+一旦把同样的逻辑抽到普通 struct（共用层），必须显式标 `@MainActor`，
+否则整片代码在 Swift 5 模式下也是硬错误，不是警告。
