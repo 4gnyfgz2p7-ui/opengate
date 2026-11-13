@@ -29,8 +29,10 @@ struct LandscapeScreen: View {
                 previewPane(layout)
                 lensRail(layout)
                 parameterRail(layout)
-                bottomBar(layout)
-                topStrip(layout)
+                sideBar(layout)
+                recordOrb(layout)
+                settingsOrb(layout)
+                chipsRow(layout)
 
                 if let banner {
                     Text(banner)
@@ -42,7 +44,7 @@ struct LandscapeScreen: View {
                         .padding(.vertical, 8)
                         .liquidGlass(Capsule(), tint: .white.opacity(0.16), interactive: false)
                         .frame(maxWidth: layout.preview.width * 0.8)
-                        .position(x: layout.preview.midX, y: layout.preview.minY + 34)
+                        .position(x: layout.preview.midX, y: layout.preview.minY + 72)
                         .transition(.opacity)
                 }
             }
@@ -124,39 +126,43 @@ struct LandscapeScreen: View {
         .position(x: layout.rail.midX, y: layout.rail.midY)
     }
 
-    // MARK: - 底栏：录制 + 唯一一条拖拽条
+    // MARK: - 拖拽条：全屏唯一一条，贴最右边
 
-    private func bottomBar(_ layout: LandscapeLayout) -> some View {
-        HStack(spacing: LandscapeLayout.trackGap) {
-            recordButton
+    /// 竖向拖拽条。
+    ///
+    /// SwiftUI 没有原生竖向滑块，这里用系统 `Slider` 旋转 -90° 实现：
+    /// 交互、惯性与无障碍全部是系统的，只是摆成竖的。
+    /// 旋转不改变布局尺寸，所以必须外套一个显式 frame，否则会溢出胶囊。
+    private func sideBar(_ layout: LandscapeLayout) -> some View {
+        VStack(spacing: 6) {
+            Text(selection.title)
+                .font(.system(size: 9))
+                .foregroundStyle(.white.opacity(0.62))
+                .lineLimit(1)
 
-            HStack(spacing: 10) {
-                Text(selection.title)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.white.opacity(0.55))
-                    .frame(width: 40, alignment: .leading)
+            Slider(value: sliderBinding, in: 0...1)
+                .tint(.white)
+                .frame(width: 150)
+                .rotationEffect(.degrees(-90))
+                .frame(width: 30, height: 150)
+                .disabled(isAuto(selection))
+                .opacity(isAuto(selection) ? 0.4 : 1)
 
-                Slider(value: sliderBinding, in: 0...1)
-                    .tint(.white)
-                    .disabled(isAuto(selection))
-                    .opacity(isAuto(selection) ? 0.45 : 1)
-
-                Text(readout(selection))
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
-                    .frame(width: 56, alignment: .trailing)
-            }
-            .padding(.horizontal, 14)
-            .frame(width: layout.track.width, height: layout.track.height)
-            .liquidGlass(Capsule(), tint: .white.opacity(0.10))
+            Text(readout(selection))
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
         }
-        .frame(width: layout.bar.width, height: layout.bar.height, alignment: .leading)
+        .padding(.vertical, 14)
+        .frame(width: layout.bar.width, height: layout.bar.height)
+        .liquidGlass(Capsule(), tint: .white.opacity(0.10))
         .position(x: layout.bar.midX, y: layout.bar.midY)
     }
 
-    private var recordButton: some View {
+    // MARK: - 录制键 / 设置
+
+    private func recordOrb(_ layout: LandscapeLayout) -> some View {
         Button {
             if engine.state == .recording {
                 engine.stopRecording()
@@ -164,46 +170,44 @@ struct LandscapeScreen: View {
                 engine.startRecording()
             }
         } label: {
-            ZStack {
-                Circle()
-                    .fill(engine.state == .recording ? Color.white : Color.red)
-                    .frame(
-                        width: LandscapeLayout.recordSize * (engine.state == .recording ? 0.34 : 0.4),
-                        height: LandscapeLayout.recordSize * (engine.state == .recording ? 0.34 : 0.4)
-                    )
-            }
-            .frame(width: LandscapeLayout.recordSize, height: LandscapeLayout.recordSize)
-            .liquidGlass(Circle(), tint: .white.opacity(0.10))
+            Circle()
+                .fill(engine.state == .recording ? Color.white : Color.red)
+                .frame(
+                    width: LandscapeLayout.recordSize * (engine.state == .recording ? 0.34 : 0.4),
+                    height: LandscapeLayout.recordSize * (engine.state == .recording ? 0.34 : 0.4)
+                )
+                .frame(width: LandscapeLayout.recordSize, height: LandscapeLayout.recordSize)
+                .liquidGlass(Circle(), tint: .white.opacity(0.10))
         }
         .buttonStyle(.plain)
+        .position(x: layout.record.midX, y: layout.record.midY)
     }
 
-    // MARK: - 顶栏
-
-    private func topStrip(_ layout: LandscapeLayout) -> some View {
-        ZStack(alignment: .topLeading) {
-            HStack(spacing: 8) {
-                if engine.state == .recording {
-                    chip(timecode(engine.elapsed), tint: .red.opacity(0.9), dot: true)
-                }
-                chip("\(engine.tier.displayName) · 24fps", tint: .white.opacity(0.10))
-                chip("剩 \(Self.duration(engine.remainingSeconds))", tint: .white.opacity(0.10))
-                Spacer(minLength: 0)
-            }
-            .frame(width: layout.preview.width, height: 24, alignment: .leading)
-            .position(x: layout.preview.midX, y: layout.preview.minY + 12)
-
-            // 设置入口放在画面左侧的空白里，不压取景
-            Button(action: onSettings) {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(.white)
-                    .frame(width: 38, height: 38)
-                    .liquidGlass(Circle(), tint: .white.opacity(0.10))
-            }
-            .buttonStyle(.plain)
-            .position(x: layout.lensRail.minX - 28, y: layout.preview.minY + 19)
+    private func settingsOrb(_ layout: LandscapeLayout) -> some View {
+        Button(action: onSettings) {
+            Image(systemName: "gearshape")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(.white)
+                .frame(width: layout.gear.width, height: layout.gear.height)
+                .liquidGlass(Circle(), tint: .white.opacity(0.10))
         }
+        .buttonStyle(.plain)
+        .position(x: layout.gear.midX, y: layout.gear.midY)
+    }
+
+    /// 顶部信息：压在画面左上角，横向一行
+    private func chipsRow(_ layout: LandscapeLayout) -> some View {
+        HStack(spacing: 8) {
+            if engine.state == .recording {
+                chip(timecode(engine.elapsed), tint: .red.opacity(0.9), dot: true)
+            }
+            chip("\(engine.tier.displayName) · 24fps", tint: .white.opacity(0.10))
+            chip("剩 \(Self.duration(engine.remainingSeconds))", tint: .white.opacity(0.10))
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, layout.chipsOrigin.x)
+        .padding(.top, layout.chipsOrigin.y)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private func chip(_ text: String, tint: Color, dot: Bool = false) -> some View {
