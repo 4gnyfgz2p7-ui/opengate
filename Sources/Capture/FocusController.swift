@@ -71,15 +71,12 @@ final class FocusController: ObservableObject {
     // MARK: - 内部
 
     private weak var device: AVCaptureDevice?
-    /// 设备写入器：所有 lockForConfiguration 都在它的后台队列上做
-    private var servo: DeviceServo?
     private var readbackTask: Task<Void, Never>?
 
     // MARK: - 绑定
 
-    func attach(to device: AVCaptureDevice, servo: DeviceServo) {
+    func attach(to device: AVCaptureDevice) {
         self.device = device
-        self.servo = servo
         supportsManualFocus = device.isLockingFocusWithCustomLensPositionSupported
 
         // 接管当前设备的真实位置，等于「手动档一进来就是现在这个焦点」，
@@ -105,10 +102,12 @@ final class FocusController: ObservableObject {
     func detach() {
         readbackTask?.cancel()
         readbackTask = nil
-        servo?.perform { device in
+        if let device = device {
+            try? device.lockForConfiguration()
             if device.isFocusModeSupported(.continuousAutoFocus) {
                 device.focusMode = .continuousAutoFocus
             }
+            device.unlockForConfiguration()
         }
         device = nil
     }
@@ -120,13 +119,13 @@ final class FocusController: ObservableObject {
 
         switch mode {
         case .continuous:
-            servo?.perform { device in
-                if device.isFocusModeSupported(.continuousAutoFocus) {
-                    device.focusMode = .continuousAutoFocus
-                } else if device.isFocusModeSupported(.autoFocus) {
-                    device.focusMode = .autoFocus
-                }
+            try? device.lockForConfiguration()
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            } else if device.isFocusModeSupported(.autoFocus) {
+                device.focusMode = .autoFocus
             }
+            device.unlockForConfiguration()
 
         case .manual:
             applyManual()
@@ -134,27 +133,36 @@ final class FocusController: ObservableObject {
     }
 
     private func applyManual() {
-        guard device != nil else { return }
+        guard let device = device else { return }
 
         let target = min(max(lensPosition, 0), 1)
-        let supported = device?.isLockingFocusWithCustomLensPositionSupported == true
-        if !supported { lastError = "该格式不支持按位置锁定焦距" }
 
-        // 写入交给设备队列。拖动时每个事件都会调到这里，
-        // 在主线程上加锁会把滑块本身卡住——那正是「拖了没反应」的来源。
-        servo?.perform { device in
-            if device.isLockingFocusWithCustomLensPositionSupported {
-                // 只有这个方法会真正把镜头移过去
-                device.setFocusModeLocked(lensPosition: target, completionHandler: nil)
-            } else if device.isFocusModeSupported(.locked) {
-                // 退路：冻结当前位置，手动档给不出位移
-                device.focusMode = .locked
-            }
+        // 这里原来写的是 `try? device.lockForConfiguration()`：锁不住时错误被
+        // 吞掉，函数照常往下走、读数照常更新，于是表现为「滑块在动、镜头不动」。
+        // 必须把失败显式记下来。
+        do {
+            try device.lockForConfiguration()
+        } catch {
+            lastError = "对焦锁定失败：" + error.localizedDescription
+            return
         }
-        supportsManualFocus = supported
+
+        if device.isLockingFocusWithCustomLensPositionSupported {
+            // 只有这个方法会真正把镜头移过去。attach 里已经确认过支持，
+            // 但 attach 之后设备可能被换掉（切通路会重建会话），所以再判一次。
+            device.setFocusModeLocked(lensPosition: target, completionHandler: nil)
+            supportsManualFocus = true
+        } else if device.isFocusModeSupported(.locked) {
+            // 退路：冻结当前位置。此时手动档给不出位移。
+            device.focusMode = .locked
+            supportsManualFocus = false
+            lastError = "该格式不支持按位置锁定焦距"
+        }
+
         // 不把目标值写成「实测值」——镜头可能根本没动。
-        // 真实位置由 startReadback 每 400ms 从设备回读。
-        if supported { lastError = nil }
+        // 真实位置由 startReadback 每 400ms 从设备读回。
+        device.unlockForConfiguration()
+        if supportsManualFocus { lastError = nil }
     }
 
     // MARK: - 回读

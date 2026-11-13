@@ -7,6 +7,12 @@ import Darwin
 
 /// 把已录好的 ProRes RAW 转成 HEVC + Apple Log 2。
 ///
+/// **边界（`Sources/Color/` 的唯一规矩）**：这里的代码只做色彩还原，
+/// 不许引用 `Sources/Capture/` 里的任何类型（采集、曝光、录制器都不行）。
+/// 颜色映射是被反复验证过、要长期保持不变的一段；拍摄算法改坏了不能
+/// 顺带把它拖下水。`tools/check_isolation.sh` 会在 CI 里逐条查这条规矩。
+/// 反方向可以有依赖：拍摄、界面都可以调这里的接口。
+///
 /// 与 PC 端 `tools/opengate_log2.py` 同一条思路：解出画面 → 套 Apple Log 2
 /// 曲线 → 编码 → 注入 colr(9/2/9) 与 logs 标识。
 ///

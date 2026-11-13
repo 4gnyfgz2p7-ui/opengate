@@ -26,6 +26,9 @@ jobs:
           xcodebuild -version
           xcode-select -p
 
+      - name: Check isolation (Color vs Capture)
+        run: bash tools/check_isolation.sh
+
       - name: Install XcodeGen
         run: |
           brew install xcodegen
