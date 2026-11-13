@@ -83,7 +83,8 @@ struct LandscapeScreen: View {
                 }
             }
         }
-        .frame(width: layout.lensRail.width, height: layout.lensRail.height, alignment: .top)
+        // 居中而不是顶部对齐：只有三个镜头时（系统不报 8×）不会一堆挤在上边
+        .frame(width: layout.lensRail.width, height: layout.lensRail.height)
         .position(x: layout.lensRail.midX, y: layout.lensRail.midY)
     }
 
@@ -104,19 +105,20 @@ struct LandscapeScreen: View {
                 }
             }
 
-            // 唯一的 A 钮：一次把所有参数交还系统
+            // A 钮：只把**当前选中**的那个参数交还系统，不动其它四项
             Button {
-                setAllAuto()
+                setAuto(selection)
             } label: {
                 VStack(spacing: 1) {
                     Text("A")
                         .font(.system(size: 18, weight: .semibold))
-                    Text("全部自动")
+                    Text("自动")
                         .font(.system(size: 7))
                         .opacity(0.7)
                 }
                 .foregroundStyle(.white)
                 .frame(width: LandscapeLayout.knobSize, height: LandscapeLayout.knobSize)
+                .contentShape(Circle())
                 .liquidGlass(Circle(), tint: .white.opacity(0.14))
             }
             .buttonStyle(.plain)
@@ -140,11 +142,13 @@ struct LandscapeScreen: View {
                 .foregroundStyle(.white.opacity(0.62))
                 .lineLimit(1)
 
+            // 竖向滑块用系统 Slider 旋转 −90°：交互与惯性仍是系统的。
+            // 长度跟着条高走——条撑满屏幕高度，滑块就跟着变长。
             Slider(value: sliderBinding, in: 0...1)
                 .tint(.white)
-                .frame(width: 150)
+                .frame(width: sideBarTrackLength(layout))
                 .rotationEffect(.degrees(-90))
-                .frame(width: 30, height: 150)
+                .frame(width: 30, height: sideBarTrackLength(layout))
                 .disabled(isAuto(selection))
                 .opacity(isAuto(selection) ? 0.4 : 1)
 
@@ -177,9 +181,13 @@ struct LandscapeScreen: View {
                     height: LandscapeLayout.recordSize * (engine.state == .recording ? 0.34 : 0.4)
                 )
                 .frame(width: LandscapeLayout.recordSize, height: LandscapeLayout.recordSize)
-                .liquidGlass(Circle(), tint: .white.opacity(0.10))
+                .contentShape(Circle())
+                // 录制键压在画面上，玻璃越淡越不挡构图
+                .liquidGlass(Circle(), tint: .white.opacity(0.03))
         }
         .buttonStyle(.plain)
+        .disabled(!engine.state.canStart && engine.state != .recording)
+        .opacity(engine.state.isBusy && engine.state != .recording ? 0.45 : 1)
         .position(x: layout.record.midX, y: layout.record.midY)
     }
 
@@ -189,6 +197,7 @@ struct LandscapeScreen: View {
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(.white)
                 .frame(width: layout.gear.width, height: layout.gear.height)
+                .contentShape(Circle())
                 .liquidGlass(Circle(), tint: .white.opacity(0.10))
         }
         .buttonStyle(.plain)
@@ -201,7 +210,6 @@ struct LandscapeScreen: View {
             if engine.state == .recording {
                 chip(timecode(engine.elapsed), tint: .red.opacity(0.9), dot: true)
             }
-            chip("\(engine.tier.displayName) · 24fps", tint: .white.opacity(0.10))
             chip("剩 \(Self.duration(engine.remainingSeconds))", tint: .white.opacity(0.10))
             Spacer(minLength: 0)
         }
@@ -280,12 +288,16 @@ struct LandscapeScreen: View {
         }
     }
 
-    private func setAllAuto() {
-        engine.exposure.mode = .autoBoth
-        engine.exposure.ev = 0
-        exposureManual = false
-        engine.focus.mode = .continuous
-        engine.whiteBalance.mode = .auto
+    /// A 钮只作用于当前选中的参数：已经是自动就不动，手动就切回自动。
+    /// 刻意不做「全部自动」——五个参数一起跳，画面会同时变亮、变焦、变色。
+    private func setAuto(_ parameter: LandscapeParameter) {
+        guard !isAuto(parameter) else { return }
+        toggleAuto(parameter)
+    }
+
+    /// 竖向滑块的长度：条内减去标签、读数与上下留白。
+    private func sideBarTrackLength(_ layout: LandscapeLayout) -> CGFloat {
+        max(120, layout.bar.height - 96)
     }
 
     // MARK: - 拖拽条取值

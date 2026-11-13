@@ -73,6 +73,9 @@ struct LandscapeKnob: View {
             // 黄色玻璃上必须是深色字，否则对比度不足
             .foregroundStyle(isAuto ? Color.black.opacity(0.86) : Color.white)
             .frame(width: LandscapeLayout.knobSize, height: LandscapeLayout.knobSize)
+            // 命中区必须显式给成整颗圆：命中测试默认走渲染内容，
+            // 只有文字大小的话，手指落在圆边会打空。
+            .contentShape(Circle())
             .liquidGlass(Circle(), tint: tint)
             .overlay {
                 if isSelected {
@@ -102,6 +105,7 @@ struct LandscapeLensButton: View {
                 .minimumScaleFactor(0.7)
                 .foregroundStyle(isAvailable ? Color.white : Color.white.opacity(0.38))
                 .frame(width: LandscapeLayout.lensSize, height: LandscapeLayout.lensSize)
+                .contentShape(Circle())
                 .liquidGlass(
                     Circle(),
                     tint: isActive ? .white.opacity(0.34) : .white.opacity(0.04)

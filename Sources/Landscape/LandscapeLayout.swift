@@ -10,9 +10,11 @@ import SwiftUI
 /// 1. **取景高度撑满整屏**，宽度按 Open Gate 画幅 1.397 推导，
 ///    绝不为了给控件腾地方而缩高度；
 /// 2. **拖拽条贴最右边**，竖向，全屏只有这一条，跟着选中的参数走；
-/// 3. 焦距切换浮在画面左边缘，「靠画面」而不是另起一列。
+/// 3. **画面左侧要给焦距切换留出整列空间**，镜头钮不压在画面上。
 ///
-/// 约束顺序决定了其余位置：先撑满取景 → 条贴右 → 参数列贴条 → 录制键贴参数列。
+/// 约束顺序决定了其余位置：先留左列 → 取景撑满高度 → 条贴右 → 参数列贴条。
+/// 录制键因此只能浮在画面右下角：左列被镜头占用、右侧被参数列与竖条占满，
+/// 硬要再挤一列就得缩取景高度，与第 1 条冲突。
 /// 与 `_design/render_layout.py` 用的是同一组数字，改动必须两边同步。
 struct LandscapeLayout {
 
@@ -22,10 +24,11 @@ struct LandscapeLayout {
     static let lensSize: CGFloat = 44
     static let lensGap: CGFloat = 8
     static let barWidth: CGFloat = 52
-    static let barHeight: CGFloat = 240
     static let recordSize: CGFloat = 56
     static let gearSize: CGFloat = 38
     static let gap: CGFloat = 12
+    /// 焦距列与画面之间的缝。压到 6 让画面再往左一点，同时不贴到镜头钮。
+    static let lensGapToPreview: CGFloat = 6
     /// Open Gate 画幅：4224 / 3024
     static let aspect: CGFloat = 4224.0 / 3024.0
     /// 控件区至少要留出的宽度占比。取景按画幅撑满高度后若把右侧挤没，
@@ -41,7 +44,22 @@ struct LandscapeLayout {
     let chipsOrigin: CGPoint
 
     init(size: CGSize, insets: EdgeInsets) {
-        // ---- 取景：高度撑满 ----
+        // ---- 焦距列：先占位，画面从它右侧开始 ----
+        let lensHeight = Self.lensSize * 4 + Self.lensGap * 3
+        lensRail = CGRect(
+            x: insets.leading + Self.margin,
+            y: (size.height - lensHeight) / 2,
+            width: Self.lensSize,
+            height: lensHeight
+        )
+        gear = CGRect(
+            x: lensRail.minX,
+            y: size.height - insets.bottom - Self.margin - Self.gearSize,
+            width: Self.gearSize,
+            height: Self.gearSize
+        )
+
+        // ---- 取景：高度撑满，左侧让开焦距列 ----
         var height = size.height
         var width = height * Self.aspect
         let maxWidth = size.width * Self.previewMaxWidthRatio
@@ -49,16 +67,15 @@ struct LandscapeLayout {
             width = maxWidth
             height = width / Self.aspect
         }
-        preview = CGRect(x: 0, y: 0, width: width, height: height)
+        let previewX = lensRail.maxX + Self.lensGapToPreview
+        preview = CGRect(x: previewX, y: 0, width: width, height: height)
 
-        // ---- 拖拽条：贴最右 ----
+        // ---- 拖拽条：贴最右，纵向撑满可用高度 ----
+        // 只有一条，就把它做长：竖向空间越多，同一像素对应越细的调整量。
         let barX = size.width - insets.trailing - Self.margin - Self.barWidth
-        bar = CGRect(
-            x: barX,
-            y: (size.height - Self.barHeight) / 2,
-            width: Self.barWidth,
-            height: Self.barHeight
-        )
+        let barY = insets.top + Self.margin
+        let barHeight = max(160, size.height - insets.top - insets.bottom - Self.margin * 2)
+        bar = CGRect(x: barX, y: barY, width: Self.barWidth, height: barHeight)
 
         // ---- 参数列：贴条的左侧 ----
         let knobX = barX - Self.gap - Self.knobSize
@@ -70,31 +87,16 @@ struct LandscapeLayout {
             height: columnHeight
         )
 
-        // ---- 录制键：贴参数列左侧、靠底 ----
+        // ---- 录制键：画面右下角 ----
+        // 左列给了镜头、右侧给了参数列与竖条，再挤一列就得缩取景高度，
+        // 那与「高度撑满」直接冲突。放到画面右下角是唯一不违背约束的位置。
         record = CGRect(
-            x: knobX - Self.gap - Self.recordSize,
+            x: preview.maxX - Self.margin * 2 - Self.recordSize,
             y: size.height - insets.bottom - Self.margin - Self.recordSize,
             width: Self.recordSize,
             height: Self.recordSize
         )
 
-        // ---- 设置：与录制键同列，靠顶 ----
-        gear = CGRect(
-            x: record.minX,
-            y: insets.top + Self.margin,
-            width: Self.gearSize,
-            height: Self.gearSize
-        )
-
-        // ---- 焦距：浮在画面左边缘 ----
-        let lensHeight = Self.lensSize * 4 + Self.lensGap * 3
-        lensRail = CGRect(
-            x: insets.leading + Self.margin,
-            y: (size.height - lensHeight) / 2,
-            width: Self.lensSize,
-            height: lensHeight
-        )
-
-        chipsOrigin = CGPoint(x: insets.leading + Self.margin, y: insets.top + 10)
+        chipsOrigin = CGPoint(x: preview.minX + 10, y: insets.top + 10)
     }
 }

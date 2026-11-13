@@ -13,32 +13,37 @@ ASPECT = 4224 / 3024
 
 KNOB, KNOB_GAP = 56, 8
 LENS, LENS_GAP = 44, 8
-BAR_W, BAR_H = 52, 240
+BAR_W = 52
+LGAP = 6
 REC = 56
 GEAR = 38
 GAP = 12
 
 # ---------- 解算 ----------
+# 1) 左侧先给焦距切换留整列
+LENS_COL = (INSET_L + MARGIN, (H - (LENS * 4 + LENS_GAP * 3)) / 2, LENS, LENS * 4 + LENS_GAP * 3)
+GEAR_BOX = (LENS_COL[0], H - INSET_B - MARGIN - GEAR, GEAR, GEAR)
+
+# 2) 取景从焦距列右侧开始，高度撑满
+PREVIEW_X = LENS_COL[0] + LENS + LGAP
 PREVIEW_H = float(H)
 PREVIEW_W = PREVIEW_H * ASPECT
 max_preview_w = W * 0.78
 if PREVIEW_W > max_preview_w:
     PREVIEW_W = max_preview_w
     PREVIEW_H = PREVIEW_W / ASPECT
+PREVIEW = (PREVIEW_X, 0.0, PREVIEW_W, PREVIEW_H)
 
-PREVIEW = (0.0, 0.0, PREVIEW_W, PREVIEW_H)
-
+# 3) 竖条贴最右，参数列贴条左侧
 rail_x = W - INSET_R - MARGIN - BAR_W
-BAR = (rail_x, (H - BAR_H) / 2, BAR_W, BAR_H)
-
+BAR = (rail_x, INSET_T + MARGIN, BAR_W, H - INSET_B - 2 * MARGIN)
 knob_x = rail_x - GAP - KNOB
 KNOB_COL = (knob_x, (H - (KNOB * 6 + KNOB_GAP * 5)) / 2, KNOB, KNOB * 6 + KNOB_GAP * 5)
 
-REC_BOX = (knob_x - GAP - REC, H - INSET_B - MARGIN - REC, REC, REC)
-GEAR_BOX = (knob_x - GAP - GEAR, INSET_T + MARGIN, GEAR, GEAR)
-
-LENS_COL = (INSET_L + MARGIN, (H - (LENS * 4 + LENS_GAP * 3)) / 2, LENS, LENS * 4 + LENS_GAP * 3)
-CHIPS = (INSET_L + MARGIN, INSET_T + 10)
+# 4) 录制键只能浮在画面右下角
+REC_BOX = (PREVIEW_X + PREVIEW_W - 2 * MARGIN - REC,
+           H - INSET_B - MARGIN - REC, REC, REC)
+CHIPS = (PREVIEW_X + 10, INSET_T + 10)
 
 YELLOW = (255, 206, 40, 232)
 YELLOW_RING = (255, 232, 140, 200)
@@ -111,7 +116,7 @@ fd = ImageDraw.Draw(frame, "RGBA")
 for i in (1, 2):
     fd.line([(pw * i / 3, 0), (pw * i / 3, ph)], fill=(255, 255, 255, 26), width=S)
     fd.line([(0, ph * i / 3), (pw, ph * i / 3)], fill=(255, 255, 255, 26), width=S)
-img.paste(frame, (0, 0))
+img.paste(frame, (px(PREVIEW_X), 0))
 d = ImageDraw.Draw(img, "RGBA")
 
 # ---------- 左轨：焦距（浮在画面左侧） ----------
@@ -130,7 +135,7 @@ for label, on in [("0.5×", False), ("1×", True), ("4×", False), ("8×", False
 # ---------- 右轨：参数列 ----------
 params = [("1/48", "AUTO", "快门", "auto"), ("640", "ISO", "", "manual"),
           ("0.42", "手动", "焦距", "sel"), ("+0.3", "AUTO", "曝光", "auto"),
-          ("5600", "AUTO", "白平衡", "auto"), ("A", "全部自动", "", "all")]
+          ("5600", "AUTO", "白平衡", "auto"), ("A", "自动", "", "all")]
 ky = KNOB_COL[1]
 for k, v, cap, state in params:
     cyk, cxk = ky + KNOB / 2, KNOB_COL[0] + KNOB / 2
@@ -144,7 +149,7 @@ for k, v, cap, state in params:
         glass_circle(cxk, cyk, KNOB / 2, tint=(255, 255, 255, 20), ring=(255, 255, 255, 82), sh=60); fg = WHITE
     if state == "all":
         text_at(cxk, cyk - 5, "A", F_KNOB, fg)
-        text_at(cxk, cyk + 11, "全部自动", F_CAP, fg)
+        text_at(cxk, cyk + 11, "自动", F_CAP, fg)
     else:
         text_at(cxk, cyk - 8, k, F_KNOB, fg)
         text_at(cxk, cyk + 4, v, F_VAL, fg if state != "manual" else (255, 255, 255, 205))
@@ -157,12 +162,12 @@ bx, by, bw, bh = BAR
 glass_round(bx, by, bw, bh, bw / 2, tint=(255, 255, 255, 26), ring=(255, 255, 255, 88), sh=90)
 text_at(bx + bw / 2, by + 26, "焦距", F_NAME, (255, 255, 255, 165))
 tx = bx + bw / 2
-ty0, ty1 = by + 52, by + bh - 52
+ty0, ty1 = by + 34, by + bh - 34
 d.rounded_rectangle([px(tx - 3), px(ty0), px(tx + 3), px(ty1)], radius=px(3), fill=(255, 255, 255, 46))
 fy = ty1 - (ty1 - ty0) * 0.58
 d.rounded_rectangle([px(tx - 3), px(fy), px(tx + 3), px(ty1)], radius=px(3), fill=(255, 255, 255, 200))
 glass_circle(tx, fy, 11, tint=(255, 255, 255, 245), ring=(255, 255, 255, 255), sh=95)
-text_at(tx, by + bh - 26, "0.42", F_NUM, WHITE)
+text_at(tx, by + bh - 20, "0.42", F_NUM, WHITE)
 
 # ---------- 录制键 / 设置 ----------
 gx, gy, gw, gh = GEAR_BOX
@@ -170,12 +175,12 @@ glass_circle(gx + gw / 2, gy + gh / 2, gw / 2, tint=(255, 255, 255, 26), ring=(2
 text_at(gx + gw / 2, gy + gh / 2, "⚙", font(14), (255, 255, 255, 235))
 
 rx, ry, rw, rh = REC_BOX
-glass_circle(rx + rw / 2, ry + rh / 2, rw / 2, tint=(255, 255, 255, 36), ring=(255, 255, 255, 120), sh=95)
+glass_circle(rx + rw / 2, ry + rh / 2, rw / 2, tint=(255, 255, 255, 10), ring=(255, 255, 255, 90), sh=60)
 d.ellipse([px(rx + rw / 2 - 11), px(ry + rh / 2 - 11), px(rx + rw / 2 + 11), px(ry + rh / 2 + 11)], fill=(255, 59, 48))
 
 # ---------- 顶部信息：压在画面左上角 ----------
 cx_chip, cy_chip = CHIPS
-for label, fg in [("● 00:00:07", (255, 96, 84)), ("ProRes RAW · 24fps", WHITE), ("剩 1:12", WHITE)]:
+for label, fg in [("● 00:00:07", (255, 96, 84)), ("剩 1:12", WHITE)]:
     wch = d.textlength(label, font=F_CHIP) / S + 18
     glass_round(cx_chip, cy_chip, wch, 23, 11.5, tint=(255, 255, 255, 26), ring=(255, 255, 255, 70), sh=45)
     text_at(cx_chip + wch / 2, cy_chip + 11.5, label, F_CHIP, fg)
@@ -198,7 +203,7 @@ for i in range(len(names)):
     for j in range(i + 1, len(names)):
         a, b = boxes[names[i]], boxes[names[j]]
         hit = not (a[0] + a[2] <= b[0] or b[0] + b[2] <= a[0] or a[1] + a[3] <= b[1] or b[1] + b[3] <= a[1])
-        intentional = {names[i], names[j]} == {"preview", "lens"}
+        intentional = {names[i], names[j]} in ({"preview", "rec"},)
         if hit and not intentional:
             ok = False
         tag = "重叠（设计如此）" if hit and intentional else ("重叠 ✗" if hit else "不重叠 ✓")
