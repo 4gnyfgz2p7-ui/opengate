@@ -31,7 +31,17 @@ jobs:
 
       - name: Install XcodeGen
         run: |
-          brew install xcodegen
+          # 直接下固定版本，跳过 brew 的索引更新：那一步在冷机器上要 40~90 秒，
+          # 而 macOS runner 本来就紧，能省的等待都要省。
+          curl -sL -o /tmp/xcodegen.zip \
+            https://github.com/yonaskolb/XcodeGen/releases/download/2.44.1/xcodegen.zip
+          unzip -q /tmp/xcodegen.zip -d /tmp
+          sudo cp -R /tmp/xcodegen/*.bundle /tmp/xcodegen/xcodegen /usr/local/bin/ 2>/dev/null || true
+          if [ ! -x /usr/local/bin/xcodegen ]; then
+            find /tmp/xcodegen -maxdepth 2 -type f | head
+            export PATH="/tmp/xcodegen:$PATH"
+            echo "/tmp/xcodegen" >> "$GITHUB_PATH"
+          fi
           xcodegen --version
 
       - name: Generate Xcode project
