@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>OpenGate 横屏版式</title>
+<style>
+  /* 画布 = iPhone 17 Pro Max 横屏逻辑尺寸 956 × 440 pt */
+  html, body { margin: 0; padding: 0; background: #000; }
+  #screen {
+    position: relative; width: 956px; height: 440px; overflow: hidden;
+    background: #0a0a0c;
+    font-family: -apple-system, "SF Pro Text", "PingFang SC", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* 取景画面占位：真实场景示意 */
+  .frame {
+    position: absolute; overflow: hidden; border-radius: 6px;
+    background:
+      radial-gradient(120% 90% at 60% 30%, #3c4a5e 0%, #202834 45%, #12161c 100%);
+  }
+  .frame .scene {
+    position: absolute; inset: 0;
+    background:
+      radial-gradient(60% 50% at 62% 34%, rgba(255,214,140,.55), transparent 60%),
+      radial-gradient(40% 30% at 30% 70%, rgba(90,140,200,.35), transparent 65%),
+      linear-gradient(180deg, #1b222c 0%, #0e1218 100%);
+  }
+  .frame .grid { position: absolute; inset: 0; opacity: .10; }
+
+  /* ---------- 液态玻璃 ---------- */
+  .glass {
+    position: relative;
+    background: linear-gradient(150deg, rgba(255,255,255,.20), rgba(255,255,255,.07) 55%, rgba(255,255,255,.13));
+    -webkit-backdrop-filter: blur(18px) saturate(180%);
+    backdrop-filter: blur(18px) saturate(180%);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.55),
+      inset 0 -1px 0 rgba(255,255,255,.16),
+      0 6px 18px rgba(0,0,0,.42);
+    border: .5px solid rgba(255,255,255,.30);
+  }
+  .glass.auto {
+    background: linear-gradient(150deg, rgba(255,218,60,.88), rgba(255,190,20,.62) 55%, rgba(255,206,40,.80));
+    border-color: rgba(255,232,140,.75);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.75),
+      inset 0 -1px 0 rgba(255,255,255,.35),
+      0 6px 20px rgba(255,190,20,.38);
+  }
+  .glass.sel { transform: scale(1.06); }
+  .glass.sel:not(.auto) {
+    background: linear-gradient(150deg, rgba(255,255,255,.40), rgba(255,255,255,.18) 55%, rgba(255,255,255,.28));
+    border-color: rgba(255,255,255,.62);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.85),
+      inset 0 -1px 0 rgba(255,255,255,.30),
+      0 8px 22px rgba(0,0,0,.5);
+  }
+  .glass.sel.auto {
+    background: linear-gradient(150deg, rgba(255,232,110,1), rgba(255,176,0,.82) 55%, rgba(255,214,60,.95));
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.9),
+      0 8px 24px rgba(255,180,10,.55);
+  }
+
+  /* ---------- 右侧参数列 ---------- */
+  #rail {
+    position: absolute; right: 59px; top: 32px; width: 56px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .knob {
+    width: 56px; height: 56px; border-radius: 50%;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 1px; color: #fff;
+  }
+  .knob .k {
+    font-size: 15px; line-height: 1; font-weight: 600;
+    font-family: "SF Pro Display", -apple-system, sans-serif;
+  }
+  .knob .v {
+    font-size: 8.5px; line-height: 1; opacity: .92;
+    font-variant-numeric: tabular-nums; letter-spacing: .1px;
+  }
+  .knob.auto .v, .knob.auto .k { color: #1a1300; }
+  .knob .cap {
+    font-size: 7px; line-height: 1; opacity: .62; margin-top: 1px; letter-spacing: .2px;
+  }
+  .knob.auto .cap { opacity: .58; }
+
+  #abtn {
+    position: absolute; right: 59px; top: 32px;
+  }
+
+  /* ---------- 左侧焦距切换 ---------- */
+  #lenses {
+    position: absolute; left: 67px; top: 120px; width: 44px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .lens {
+    width: 44px; height: 44px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-size: 11px; font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .lens.on {
+    background: linear-gradient(150deg, rgba(255,255,255,.52), rgba(255,255,255,.24));
+    border-color: rgba(255,255,255,.8);
+  }
+  .lens.dim { color: rgba(255,255,255,.38); }
+  .lens small { font-size: 7px; opacity: .6; margin-left: .5px; }
+
+  /* ---------- 底部：录制 + 唯一一条拖拽条 ---------- */
+  #bottom { position: absolute; left: 123px; bottom: 21px; width: 690px; height: 52px; }
+
+  #rec {
+    position: absolute; left: 0; bottom: 0; width: 52px; height: 52px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #rec .dot { width: 22px; height: 22px; border-radius: 50%; background: #ff3b30; }
+
+  #track {
+    position: absolute; left: 68px; bottom: 6px; right: 0; height: 40px;
+    border-radius: 20px;
+    display: flex; align-items: center;
+  }
+  #track .name {
+    width: 52px; text-align: center; font-size: 10px; color: rgba(255,255,255,.55);
+  }
+  #track .rail {
+    position: relative; flex: 1; height: 6px; border-radius: 3px;
+    background: rgba(255,255,255,.16);
+  }
+  #track .fill {
+    position: absolute; left: 0; top: 0; bottom: 0; width: 58%; border-radius: 3px;
+    background: linear-gradient(90deg, rgba(255,255,255,.45), rgba(255,255,255,.8));
+  }
+  #track .thumb {
+    position: absolute; left: 58%; top: 50%; width: 22px; height: 22px;
+    margin-left: -11px; margin-top: -11px; border-radius: 50%;
+  }
+  #track .val {
+    width: 62px; text-align: right; padding-right: 12px;
+    font-size: 11px; color: #fff; font-variant-numeric: tabular-nums;
+  }
+
+  /* ---------- 顶部信息 ---------- */
+  #top {
+    position: absolute; left: 123px; top: 10px; right: 152px;
+    display: flex; align-items: center; gap: 8px;
+    color: #fff;
+  }
+  .chip {
+    border-radius: 14px; padding: 3px 9px; font-size: 10px;
+    color: #fff; display: flex; align-items: center; gap: 5px;
+  }
+  .chip .red { width: 6px; height: 6px; border-radius: 50%; background: #ff3b30; }
+  .chip.mono { font-variant-numeric: tabular-nums; font-family: "SF Mono", ui-monospace, monospace; }
+  .spacer { flex: 1; }
+
+  /* 角标：用于核对几何 */
+  .mark { position: absolute; font-size: 7px; color: rgba(120,200,255,.75); font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<div id="screen">
+
+  <!-- 取景：x=217.5 y=8 w=501 h=359 -->
+  <div class="frame" style="left:217.5px; top:8px; width:501px; height:359px;">
+    <div class="scene"></div>
+    <svg class="grid" viewBox="0 0 501 359" preserveAspectRatio="none">
+      <path d="M167.7 0V359 M335.3 0V359 M0 119.7H501 M0 239.3H501" stroke="#fff" stroke-width="1"/>
+    </svg>
+  </div>
+
+  <!-- 左侧焦距 -->
+  <div id="lenses">
+    <div class="lens glass dim">0.5<small>×</small></div>
+    <div class="lens glass on">1<small>×</small></div>
+    <div class="lens glass dim">4<small>×</small></div>
+    <div class="lens glass dim">8<small>×</small></div>
+  </div>
+
+  <!-- 右侧参数列：5 个参数 + 1 个 A -->
+  <div id="rail">
+    <div class="knob glass auto">
+      <span class="k">1/48</span>
+      <span class="v">AUTO</span>
+      <span class="cap">快门</span>
+    </div>
+    <div class="knob glass">
+      <span class="k">640</span>
+      <span class="v">ISO</span>
+      <span class="cap">&nbsp;</span>
+    </div>
+    <div class="knob glass sel">
+      <span class="k">0.42</span>
+      <span class="v">手动</span>
+      <span class="cap">焦距</span>
+    </div>
+    <div class="knob glass auto">
+      <span class="k">+0.3</span>
+      <span class="v">AUTO</span>
+      <span class="cap">曝光</span>
+    </div>
+    <div class="knob glass auto">
+      <span class="k">5600</span>
+      <span class="v">AUTO</span>
+      <span class="cap">白平衡</span>
+    </div>
+    <div class="knob glass" style="background:linear-gradient(150deg,rgba(255,255,255,.30),rgba(255,255,255,.12));">
+      <span class="k" style="font-size:19px;">A</span>
+      <span class="v" style="font-size:7px;">全部自动</span>
+      <span class="cap">&nbsp;</span>
+    </div>
+  </div>
+
+  <!-- 顶部信息 -->
+  <div id="top">
+    <div class="chip glass mono"><span class="red"></span>00:00:07</div>
+    <div class="chip glass mono">ProRes RAW · 24fps</div>
+    <div class="spacer"></div>
+    <div class="chip glass mono">剩 1:12</div>
+  </div>
+
+  <!-- 底部 -->
+  <div id="bottom">
+    <div id="rec" class="glass"><div class="dot"></div></div>
+    <div id="track" class="glass">
+      <div class="name">焦距</div>
+      <div class="rail">
+        <div class="fill"></div>
+        <div class="thumb glass"></div>
+      </div>
+      <div class="val">0.42</div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

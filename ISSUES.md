@@ -333,3 +333,53 @@ EV 滑块完全失效」，三个都极度严重。
 | `Xs 写1 …` 之后不再有行 | 进程在写第一帧前后死掉 |
 | `写入器失败 @Xs：…` | 写入器报错，错误文本就是答案 |
 | 有 `收尾 … clean=false` | 收尾失败，note 里是原因 |
+
+## 十一、横屏重绘（0.5.74）：右轨参数 + 左轨镜头 + 一条共用拖拽条
+
+### 11.1 版式
+
+顺时针 90° 横屏，956×440pt，安全区 左 59 / 右 59 / 底 21：
+
+| 区域 | 位置 | 内容 |
+|---|---|---|
+| 取景 | 居中，479×343（1.397 Open Gate） | 不裁切，宽高按画幅算 |
+| 左轨（贴画面） | 画面左侧 12pt | 焦距切换：0.5× / 1× / 长焦 / 8×（系统报 8× 换挡点时才出） |
+| 右轨 | 贴右安全区，宽 56 | 快门 / ISO / 焦距 / 曝光 / 白平衡 + 一个「A 全部自动」 |
+| 底栏 | 与取景左对齐 | 录制键 + **唯一一条**拖拽条 |
+
+几何自检脚本 `_design/render_layout.py`：用与 Swift 同一套约束解出矩形，
+逐对判重叠、逐块判是否出安全区，并离屏渲染成图。当前四项（取景/右轨/左轨/底栏）
+加设置钮，五者两两不重叠、全部在安全区内。
+
+### 11.2 交互
+
+- 圆钮：第一次按**只选中**（颜色加深、拖拽条指向它）；已选中的再按一次切自动/手动。
+- 自动 = 系统液态玻璃黄色着色 + 深色字；手动 = 默认白玻璃。
+- 「A」钮一次把快门/ISO/焦距/曝光/白平衡全部交还系统。
+- 拖拽条始终只有一条，跟着选中的参数走；自动档置灰不可拖。
+
+### 11.3 液态玻璃全部走系统
+
+不自己画模糊、渐变、高光：统一用 `glassEffect(.regular.tint().interactive(), in:)`，
+相邻圆钮放进 `GlassEffectContainer` 让它们按系统规则融合。
+全 App 只有 `Sources/Landscape/LandscapeControls.swift` 里一处调用，API 变动只改那一行。
+
+### 11.4 隔离
+
+`Sources/Landscape/` 自成目录，只通过 `RecordingEngine` 与三个控制器的公开接口
+表达意图。`tools/check_landscape_isolation.sh` 是构建门禁：扫
+`lockForConfiguration / setExposureModeCustom / setWhiteBalanceModeLocked /
+setFocusModeLocked / AVAssetWriter / MovieRecorder / startRunning / stopRunning`，
+命中即构建失败。界面不许直接摸设备。
+
+### 11.5 镜头切换
+
+原来只 discovery `.builtInWideAngleCamera`，所以**根本没有别的镜头可切**。
+现在按 `.builtInUltraWide / .builtInWideAngle / .builtInTelephoto` 枚举物理设备，
+按类型贴 0.5× / 1× / 长焦，长焦倍数取虚拟设备的换挡点最大值（拿不到就写「长焦」，不编数字）。
+
+刻意用**物理设备**而不是 `builtInTripleCamera`：虚拟设备的格式集不含
+4224×3024 的 btp2，换成虚拟设备会直接丢掉 ProRes RAW 通路。代价是切镜头要重建会话。
+
+8×：只有在 `virtualDeviceSwitchOverVideoZoomFactors` 里真的出现 8 时才给这一档，
+因为 `maxAvailableVideoZoomFactor` 全系都在 100 以上，那是数字放大，不是光学档。

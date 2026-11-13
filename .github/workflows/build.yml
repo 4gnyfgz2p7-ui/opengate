@@ -26,6 +26,9 @@ jobs:
           xcodebuild -version
           xcode-select -p
 
+      - name: Check landscape isolation
+        run: bash tools/check_landscape_isolation.sh
+
       - name: Install XcodeGen
         run: |
           brew install xcodegen

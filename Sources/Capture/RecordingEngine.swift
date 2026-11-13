@@ -234,6 +234,10 @@ final class RecordingEngine: ObservableObject {
     @Published private(set) var lastLocationDegraded = false
     @Published private(set) var history: [MovieRecorder.Outcome] = []
     @Published private(set) var sessionReady = false
+    /// 可切换的后置镜头。超广 / 主摄一定有，长焦由系统是否报告决定。
+    @Published private(set) var lenses: [LensOption] = []
+    /// 当前镜头。数字变焦档（8×）不改变这个值，只改设备的 `videoZoomFactor`。
+    @Published private(set) var activeLensID: String?
     /// 录制中被空间逼停的原因，用于界面提示
     @Published private(set) var autoStopReason: String?
 
@@ -491,7 +495,8 @@ final class RecordingEngine: ObservableObject {
         let config = capture.configure(
             path: .bayerDirect,
             audioEnabled: true,
-            canProcessBayer: bayerConverter != nil
+            canProcessBayer: bayerConverter != nil,
+            lensID: activeLensID
         )
         captureConfiguration = config
         capture.start()
@@ -657,11 +662,16 @@ final class RecordingEngine: ObservableObject {
             let config = self.capture.configure(
                 path: .systemProcessed,
                 audioEnabled: true,
-                canProcessBayer: self.bayerConverter != nil
+                canProcessBayer: self.bayerConverter != nil,
+                lensID: self.activeLensID
             )
             self.captureConfiguration = config
             self.capture.start()
             self.sessionReady = self.capture.isRunning
+            self.refreshLenses()
+            if self.activeLensID == nil {
+                self.activeLensID = self.capture.videoDevice?.uniqueID
+            }
 
             // 会话跑起来之后再接管曝光与白平衡：此时 activeFormat 已生效，
             // ISO 与快门范围才是这台设备真正可用的范围。
@@ -690,6 +700,83 @@ final class RecordingEngine: ObservableObject {
         focus.detach()
         capture.stop()
         sessionReady = false
+    }
+
+    // MARK: - 镜头
+
+    /// 重新枚举后置镜头。会话重建后设备与格式都可能变，列表要跟着刷新。
+    func refreshLenses() {
+        lenses = LensCatalog.backLenses()
+    }
+
+    /// 切换镜头：重建会话。
+    ///
+    /// 为什么必须重建而不是调 `videoZoomFactor`：格式集、ISO/快门范围、
+    /// 是否提供全幅 Bayer、白平衡增益的可设范围，全部**跟着设备**走。
+    /// 改倍数只是数字裁切，画质和进光量都不一样。
+    ///
+    /// 录制中不允许切——写入器的输入尺寸与格式已经按旧设备定死了。
+    func selectLens(_ lens: LensOption) {
+        guard !state.isBusy else { return }
+
+        // 数字变焦档（8×）：不动会话，只推设备倍数
+        if let zoom = lens.zoomFactor {
+            applyZoom(zoom)
+            return
+        }
+
+        guard lens.id != activeLensID else { return }
+
+        let previous = activeLensID
+        activeLensID = lens.id
+        state = .preparing("正在切换镜头…")
+
+        capture.stop()
+        exposure.detach()
+        whiteBalance.detach()
+        focus.detach()
+
+        let config = capture.configure(
+            path: tier.isRawBayer ? .bayerDirect : .systemProcessed,
+            audioEnabled: true,
+            canProcessBayer: bayerConverter != nil,
+            lensID: lens.id
+        )
+        captureConfiguration = config
+        capture.start()
+        sessionReady = capture.isRunning
+
+        if let device = capture.videoDevice {
+            exposure.attach(to: device)
+            whiteBalance.attach(to: device)
+            focus.attach(to: device)
+            refreshWhiteBalanceGains()
+            activeLensID = device.uniqueID
+        } else {
+            // 换不过去就退回原镜头，不留一个空会话
+            activeLensID = previous
+        }
+
+        stats.reset()
+        if !config.isBayer, tier.isRawBayer {
+            pipelineNote = "\(lens.label) 不提供全幅 Bayer 通路，ProRes RAW 无法录制"
+        } else {
+            pipelineNote = ""
+        }
+        state = .idle
+    }
+
+    private func applyZoom(_ factor: CGFloat) {
+        guard let device = capture.videoDevice else { return }
+        let clamped = min(max(factor, device.minAvailableVideoZoomFactor),
+                          device.maxAvailableVideoZoomFactor)
+        do {
+            try device.lockForConfiguration()
+            device.videoZoomFactor = clamped
+            device.unlockForConfiguration()
+        } catch {
+            pipelineNote = "变焦失败：\(error.localizedDescription)"
+        }
     }
 
     /// 全幅通路没跑通时自动降级到系统 ISP。

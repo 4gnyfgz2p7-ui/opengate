@@ -111,7 +111,8 @@ final class CaptureController: NSObject {
         audioEnabled: Bool,
         lockWhiteBalance: Bool = false,
         canProcessBayer: Bool = true,
-        requestLogColorSpace: Bool = true
+        requestLogColorSpace: Bool = true,
+        lensID: String? = nil
     ) -> Configuration {
 
         var result = Configuration()
@@ -125,7 +126,9 @@ final class CaptureController: NSObject {
         session.sessionPreset = .inputPriority
 
         // ---- 视频输入 ----
-        guard let device = Self.backWideCamera() else {
+        // 指定了镜头就用它，否则回默认主摄。切镜头会重建整个会话，
+        // 因为格式、ISO/快门范围、Bayer 与否都跟着设备走。
+        guard let device = Self.camera(for: lensID) ?? Self.backWideCamera() else {
             result.notes.append("找不到后置广角相机")
             session.commitConfiguration()
             configuration = result
@@ -671,6 +674,24 @@ final class CaptureController: NSObject {
             position: .back
         )
         return discovery.devices.first
+    }
+
+    /// 按镜头标识取物理设备。
+    ///
+    /// 先在后置三摄里按 `uniqueID` 找；找不到再用 `AVCaptureDevice(uniqueID:)`
+    /// 兜一次（会话重建期间 discovery 偶发拿不到）。两者都失败就返回 nil，
+    /// 由调用方退回默认主摄——切镜头失败不应该让整个会话起不来。
+    static func camera(for lensID: String?) -> AVCaptureDevice? {
+        guard let lensID else { return nil }
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInUltraWideCamera, .builtInWideAngleCamera, .builtInTelephotoCamera],
+            mediaType: .video,
+            position: .back
+        )
+        if let match = discovery.devices.first(where: { $0.uniqueID == lensID }) {
+            return match
+        }
+        return AVCaptureDevice(uniqueID: lensID)
     }
 
     /// 优先 4224×3024（Open Gate）；否则退到面积最大的视频格式。

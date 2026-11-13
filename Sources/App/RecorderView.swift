@@ -171,15 +171,27 @@ struct RecorderView: View {
     /// 正常态用当前 zones，过渡态用缓存的 zones。
     @ViewBuilder
     private func layoutContent(zones: Zones, landscape: Bool, degrees: CGFloat? = nil) -> some View {
-        previewPane(rect: zones.preview, degrees: degrees ?? engine.rotationDegrees)
-
-        if let lens = zones.lens {
-            lensRail(rect: lens)
+        if landscape {
+            // 横屏整体交给 LandscapeScreen：右轨参数 + 左轨镜头 +
+            // 底部唯一一条拖拽条。版式与交互都在 Sources/Landscape 里，
+            // 这里只做入口，不掺任何布局数字。
+            let insets = windowInsets
+            LandscapeScreen(
+                engine: engine,
+                banner: banner,
+                insets: EdgeInsets(
+                    top: insets.top,
+                    leading: insets.left,
+                    bottom: insets.bottom,
+                    trailing: insets.right
+                ),
+                onSettings: { showSettings = true }
+            )
         } else {
+            previewPane(rect: zones.preview, degrees: degrees ?? engine.rotationDegrees)
             topBarPane(rect: zones.bar, landscape: false)
+            controlsPane(rect: zones.controls, landscape: false)
         }
-
-        controlsPane(rect: zones.controls, landscape: landscape)
     }
 
     /// 窗口安全区：横屏时刘海/灵动岛在侧边，不能再按固定 14pt 贴边
