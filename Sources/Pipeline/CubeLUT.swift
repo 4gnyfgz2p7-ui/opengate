@@ -3,8 +3,6 @@ import CoreImage
 
 /// `.cube` 3D LUT 的解析与应用。
 ///
-/// 同 `Log2Transcoder`：本目录只管色彩，不引用 `Sources/Capture/` 的任何类型。
-///
 /// 只支持最常见的 3D 形式（`LUT_3D_SIZE n`）。1D LUT 是另一套语义
 /// （逐通道曲线），混进来会让结果不可预期，这里直接拒收并给出原因。
 ///
@@ -152,9 +150,7 @@ struct CubeLUT {
 enum LUTStore {
 
     static var directory: URL {
-        // 这里**不能**再借录制目录来推导：那会把颜色链路和采集链路绑在一起，
-        // 改拍摄那边的目录规则就会悄悄影响 LUT 的位置。Documents/LUTs 直接算。
-        let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let base = MovieRecorder.recordingDirectory().deletingLastPathComponent()
         return base.appendingPathComponent("LUTs", isDirectory: true)
     }
 
