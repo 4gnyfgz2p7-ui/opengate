@@ -85,6 +85,11 @@ final class CaptureRotation: ObservableObject {
         (degrees == 90 || degrees == 270) ? .portrait : .landscape
     }
 
+    var isLandscape: Bool { mode == .landscape }
+
+    /// 写入文件元数据与界面提示用
+    var label: String { mode.title }
+
     var target: InterfaceMode { mode.opposite }
 
     /// 写入 `AVAssetWriterInput.transform` 用。

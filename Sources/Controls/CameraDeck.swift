@@ -27,6 +27,7 @@ enum CameraParameter: String, CaseIterable, Identifiable {
 /// 「第一次按只选中、已选中的再按切自动/手动、A 钮只把选中项交还系统、
 /// 拖拽写设备」——这些规则上一轮在横屏里逐条修过，
 /// 如果竖屏再抄一遍，两份迟早会漂，而且漂了不容易发现。
+@MainActor
 struct CameraDeck {
 
     /// 当前选中的参数。选中只影响颜色与拖拽条指向，不改设备。
