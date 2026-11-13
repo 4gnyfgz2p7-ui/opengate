@@ -137,22 +137,6 @@ final class ExposureController: ObservableObject {
     /// 单次调整的幅度上限（EV），防止光线突变时画面猛跳
     private let maxStepEV: Float = 0.6
 
-    /// 无闪烁快门档（秒）。
-    ///
-    /// 50 Hz 电网下照明以 100 Hz 起伏，一个周期 10 ms。传感器只有**积分满整周期**，
-    /// 明暗才会互相抵消；不是整周期，每帧剩下的那截波纹会随帧相位漂移，
-    /// 表现就是画面持续明暗闪。24 fps 下最慢快门 1/24 = 41.7 ms 恰好是 4.17 个
-    /// 周期——多出来的 0.17 个周期正是「一直闪」的来源，而且它随帧率拍频，
-    /// 看上去是一段一段地跳。
-    ///
-    /// 档位取 5 / 10 / 20 / 40 ms（1/200、1/100、1/50、1/25），分别是半个、
-    /// 1、2、4 个周期。半周期档只在很亮时兜底：日光下没有 100 Hz 纹波。
-    private static let flickerFreeShutters: [Double] = [0.005, 0.01, 0.02, 0.04]
-
-    /// 快门换档时，ISO 要来补的那点零头。ISO 是量化量，写小了会被吞掉，
-    /// 所以攒够 1/12 档再写——不攒的话，快门定住之后小误差永远推不动画面。
-    private var isoCarry: Double = 0
-
     // MARK: - 绑定设备
 
     func attach(to device: AVCaptureDevice) {
@@ -163,18 +147,14 @@ final class ExposureController: ObservableObject {
         let maxISO = max(format.maxISO, minISO)
         isoRange = minISO...maxISO
 
-        // 最慢快门不能超过帧间隔，否则 24 fps 直接掉帧。
-        // 另外**不取 1/24 这一档**：41.7 ms 对 100 Hz 光源是 4.17 个周期，
-        // 多出的 0.17 个周期会随帧相位漂移，画面就一直明暗闪。慢端封在
-        // 40 ms（整数 4 个周期）上，低光只差 4%，换来的是完全不闪。
+        // 最慢快门不能超过帧间隔，否则 24 fps 直接掉帧
         let frameInterval = 1.0 / Double(VideoSettingsBuilder.frameRate)
         let minShutter = max(CMTimeGetSeconds(format.minExposureDuration), 1.0 / 32000.0)
-        let ladderTop = Self.flickerFreeShutters.last(where: { $0 <= frameInterval }) ?? frameInterval
-        let maxShutter = min(CMTimeGetSeconds(format.maxExposureDuration), ladderTop)
+        let maxShutter = min(CMTimeGetSeconds(format.maxExposureDuration), frameInterval)
         if minShutter < maxShutter {
             shutterRange = minShutter...maxShutter
         } else {
-            shutterRange = minShutter...minShutter
+            shutterRange = frameInterval...frameInterval
         }
 
         // 把当前设备值接管为用户设定值，避免一进来就跳
@@ -222,7 +202,6 @@ final class ExposureController: ObservableObject {
 
     private func applyMode() {
         guard let device = device else { return }
-        isoCarry = 0
 
         if mode.usesNativeAuto {
             servoTask?.cancel(); servoTask = nil
@@ -254,7 +233,6 @@ final class ExposureController: ObservableObject {
 
     private func applyManualISO() {
         guard let device = device, mode.isoIsManual, !mode.usesNativeAuto else { return }
-        isoCarry = 0
 
         let newISO = clampISO(iso)
         try? device.lockForConfiguration()
@@ -279,7 +257,6 @@ final class ExposureController: ObservableObject {
 
     private func applyManualShutter() {
         guard let device = device, mode.shutterIsManual, !mode.usesNativeAuto else { return }
-        isoCarry = 0
 
         let duration = clampDuration(shutterSeconds)
         var targetISO = clampISO(device.iso)
@@ -312,77 +289,40 @@ final class ExposureController: ObservableObject {
     /// 一格一格地切。快门没有这个问题：`exposureDuration` 是连续
     /// CMTime，写多少就是多少，3% 的变化就是 3%。
     ///
-    /// 所以闭环的顺序是：先用快门走完差额；快门到慢端或 1/8000 顶住了，
-    /// 才把剩下的差额交给 ISO。ISO 一次至少走 1/12 档，
+    /// 所以闭环的顺序反过来：先用快门走完差额；快门到 1/24 或 1/8000
+    /// 顶住了，才把剩下的差额交给 ISO。ISO 一次至少走 1/12 档，
     /// 免得反复写一个不会生效的值。
-    ///
-    /// **快门不再连续**：它的可取值被钉在 `flickerFreeShutters` 上（100 Hz
-    /// 光源的整数个周期），否则画面会持续明暗闪。被快门放弃的那点零头
-    /// 全部由 ISO 吸收，所以落到画面上的亮度仍然是连续的。
     ///
     /// - Parameter ev: 正的变亮，负的变暗。单位 EV。
     func applyExposureStep(ev: Double) {
         guard let device = device, ev.isFinite, abs(ev) > 0.0004 else { return }
 
-        // 上下界直接取 attach 时算好的这条格式的真实范围（已含无闪烁上限）
-        let minDuration = shutterRange.lowerBound
-        let maxDuration = shutterRange.upperBound
+        let format = device.activeFormat
+        let frameInterval = 1.0 / Double(VideoSettingsBuilder.frameRate)
+        let minDuration = max(CMTimeGetSeconds(format.minExposureDuration), 1.0 / 32000.0)
+        let maxDuration = min(CMTimeGetSeconds(format.maxExposureDuration), frameInterval)
 
         let currentDuration = CMTimeGetSeconds(device.exposureDuration)
         let currentISO = device.iso
         guard currentDuration > 0, currentISO > 0 else { return }
 
-        // 曝光量 ∝ duration。先算「想要的等效时长」，再决定这一档快门够不够。
-        let desiredTotal = currentDuration * pow(2.0, ev)
-
-        // ---- 快门吸附到无闪烁档 ----
-        //
-        // 这是「画面一直闪」的正解：让每一帧都积分整数个 100 Hz 周期。
-        // 快门被吸附之后，它定不了的那点零头交给 ISO 补，亮度照样连续，
-        // 只是快门会在 1 档的边界上换档（换档时 ISO 同步反向补偿，看不出来）。
-        var desiredDuration = min(max(desiredTotal, minDuration), maxDuration)
-        let ladder = Self.flickerFreeShutters.filter { $0 >= minDuration && $0 <= maxDuration }
-        if !ladder.isEmpty {
-            let onLadder = ladder.contains { abs($0 - currentDuration) / currentDuration < 0.02 }
-            if !onLadder {
-                // 起点不在档上（刚开机常见是 1/48、1/60）：先吸附到最近的一档。
-                // 这一下就能把「一直闪」压掉，其余交给 ISO。
-                if let nearest = ladder.min(by: {
-                    abs(log2($0 / desiredTotal)) < abs(log2($1 / desiredTotal))
-                }) {
-                    desiredDuration = nearest
-                }
-            } else if ev > 0, currentISO >= isoRange.upperBound * 0.98,
-                      let slower = ladder.first(where: { $0 > currentDuration * 1.02 }) {
-                // ISO 顶到头还要更亮 → 快门放慢一档
-                desiredDuration = slower
-            } else if ev < 0, currentISO <= isoRange.lowerBound * 1.02,
-                      let faster = ladder.last(where: { $0 < currentDuration * 0.98 }) {
-                // ISO 到底还要更暗 → 快门收快一档
-                desiredDuration = faster
-            } else {
-                // 留在这一档，零头全给 ISO。换档会让快门在相邻两档间来回跳，
-                // 而 ISO 顶到端头才换，换完 ISO 被反向补偿一档，天然回不到端头。
-                desiredDuration = currentDuration
-            }
+        // 曝光量 ∝ duration。先按 duration 算，超出边界的那部分留给 ISO。
+        var desiredDuration = currentDuration * pow(2.0, ev)
+        var overflowEV = 0.0
+        if desiredDuration > maxDuration {
+            overflowEV = log2(desiredDuration / maxDuration)
+            desiredDuration = maxDuration
+        } else if desiredDuration < minDuration {
+            overflowEV = log2(desiredDuration / minDuration)
+            desiredDuration = minDuration
         }
 
-        // 快门吃掉之后剩下的那部分，全部由 ISO 承担
-        let residualEV = log2(desiredTotal / desiredDuration)
         var targetISO = currentISO
-        if abs(residualEV) > 0.0004 {
-            let scaled = clampISO(currentISO * Float(pow(2.0, residualEV)))
-            if abs(desiredDuration - currentDuration) / currentDuration > 1e-5 {
-                // 换档这一下必须立刻补，攒着就会看到一档的亮度跳
+        if abs(overflowEV) > 0.0004 {
+            let scaled = clampISO(currentISO * Float(pow(2.0, overflowEV)))
+            // 不到 1/12 档的 ISO 变化写下去不会生效，等它攒够再写。
+            if abs(log2(Double(scaled) / Double(currentISO))) >= 1.0 / 12.0 {
                 targetISO = scaled
-                isoCarry = 0
-            } else {
-                if residualEV * isoCarry < 0 { isoCarry = 0 }
-                isoCarry = min(max(isoCarry + residualEV, -1.0), 1.0)
-                if abs(isoCarry) >= 1.0 / 12.0 {
-                    targetISO = clampISO(currentISO * Float(pow(2.0, isoCarry)))
-                    isoCarry = 0
-                }
             }
         }
 
